@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+.venv-win/
+env/
+venv/
+
+# Build and release artifacts
+build/
+dist/
+release/
+*.spec~
+
+# Test and automation output
+test-results/
+playwright-report/
+
+# Local notes and handoff files
+HANDOFF_NEXT_SESSION.md
+
+# User/project data must never be committed
+raw_inputs/
+annotation_app/annotations/*.sqlite
+annotation_app/annotations/*.sqlite-*
+annotation_app/annotations/exports/
+data/interim/
+results/
+reports/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
