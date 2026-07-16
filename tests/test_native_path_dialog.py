@@ -6,14 +6,15 @@ from annotation_app.app import native_path_dialog_response
 
 class NativePathDialogResponseTest(unittest.TestCase):
     def test_returns_selected_directory_path(self):
-        result = native_path_dialog_response("directory", lambda: Path(r"D:\LIFMSProjects\Batch03"))
+        selected = Path.cwd() / "LIFMSProjects" / "Batch03"
+        result = native_path_dialog_response("directory", lambda: selected)
 
         self.assertEqual(
             result,
             {
                 "ok": True,
                 "kind": "directory",
-                "path": r"D:\LIFMSProjects\Batch03",
+                "path": str(selected.resolve()),
                 "cancelled": False,
             },
         )

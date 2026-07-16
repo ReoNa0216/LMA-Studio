@@ -151,11 +151,12 @@ class ProjectManifestTest(unittest.TestCase):
     def test_external_reference_records_absolute_paths_without_raw_inputs(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             project_dir = Path(tmp) / "project"
+            raw_dir = Path(tmp) / "raw"
             raw_paths = {
-                "lif_g2": Path(r"E:\raw\g2.csv"),
-                "lif_r1": Path(r"E:\raw\r1.csv"),
-                "lif_r2": Path(r"E:\raw\r2.csv"),
-                "ms": Path(r"E:\raw\ms.txt"),
+                "lif_g2": raw_dir / "g2.csv",
+                "lif_r1": raw_dir / "r1.csv",
+                "lif_r2": raw_dir / "r2.csv",
+                "ms": raw_dir / "ms.txt",
             }
 
             rows, manifest_inputs, _layout = build_raw_input_project_records(
@@ -174,11 +175,12 @@ class ProjectManifestTest(unittest.TestCase):
     def test_copy_records_use_project_relative_raw_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp) / "project"
+            raw_dir = Path(tmp) / "raw"
             raw_paths = {
-                "lif_g2": Path(r"E:\raw\g2.csv"),
-                "lif_r1": Path(r"E:\raw\r1.csv"),
-                "lif_r2": Path(r"E:\raw\r2.csv"),
-                "ms": Path(r"E:\raw\ms.txt"),
+                "lif_g2": raw_dir / "g2.csv",
+                "lif_r1": raw_dir / "r1.csv",
+                "lif_r2": raw_dir / "r2.csv",
+                "ms": raw_dir / "ms.txt",
             }
 
             rows, manifest_inputs, _layout = build_raw_input_project_records(
@@ -200,7 +202,12 @@ class ProjectManifestTest(unittest.TestCase):
             write_project_manifest(
                 project_dir=project_dir,
                 raw_input_mode=RAW_INPUT_MODE_EXTERNAL,
-                raw_inputs={"lif_g2": {"path": r"E:\raw\g2.csv", "path_mode": RAW_INPUT_MODE_EXTERNAL}},
+                raw_inputs={
+                    "lif_g2": {
+                        "path": str(Path(tmp) / "raw" / "g2.csv"),
+                        "path_mode": RAW_INPUT_MODE_EXTERNAL,
+                    }
+                },
                 channel_identity_prior={"G2": "Day0", "R1": "Day9", "R2": "Day3"},
             )
 
@@ -301,15 +308,16 @@ class ProjectManifestTest(unittest.TestCase):
     def test_build_raw_input_records_accepts_configured_lif_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp) / "project"
+            raw_dir = Path(tmp) / "raw"
             lif_inputs = [
-                {"key": "lif_1", "path": Path(r"E:\raw\g1.csv"), "channel": "G1", "identity_prior": "Day1"},
-                {"key": "lif_2", "path": Path(r"E:\raw\g2.csv"), "channel": "G2", "identity_prior": "Day0"},
-                {"key": "lif_3", "path": Path(r"E:\raw\r1.csv"), "channel": "R1", "identity_prior": "Day3"},
+                {"key": "lif_1", "path": raw_dir / "g1.csv", "channel": "G1", "identity_prior": "Day1"},
+                {"key": "lif_2", "path": raw_dir / "g2.csv", "channel": "G2", "identity_prior": "Day0"},
+                {"key": "lif_3", "path": raw_dir / "r1.csv", "channel": "R1", "identity_prior": "Day3"},
             ]
 
             rows, manifest_inputs, layout = build_raw_input_project_records(
                 project_dir=project_dir,
-                raw_paths={"ms": Path(r"E:\raw\ms.txt")},
+                raw_paths={"ms": raw_dir / "ms.txt"},
                 raw_input_mode=RAW_INPUT_MODE_EXTERNAL,
                 identities={},
                 lif_inputs=lif_inputs,
@@ -320,13 +328,13 @@ class ProjectManifestTest(unittest.TestCase):
             self.assertEqual([row["input_id"] for row in lif_rows], ["lif_1_raw", "lif_2_raw", "lif_3_raw"])
             self.assertEqual([row["channel"] for row in lif_rows], ["G1", "G2", "R1"])
             self.assertEqual([row["detector"] for row in lif_rows], ["green", "green", "red"])
-            self.assertEqual(manifest_inputs["lif_1"]["path"], str(Path(r"E:\raw\g1.csv")))
+            self.assertEqual(manifest_inputs["lif_1"]["path"], str((raw_dir / "g1.csv").resolve()))
             self.assertEqual(layout["qc_anchor_channels"], ["G1", "G2", "R1"])
 
             with self.assertRaises(BadRequest):
                 build_raw_input_project_records(
                     project_dir=project_dir,
-                    raw_paths={"ms": Path(r"E:\raw\ms.txt")},
+                    raw_paths={"ms": raw_dir / "ms.txt"},
                     raw_input_mode=RAW_INPUT_MODE_EXTERNAL,
                     identities={},
                     lif_inputs=lif_inputs,
@@ -334,9 +342,11 @@ class ProjectManifestTest(unittest.TestCase):
                 )
 
     def test_project_dir_defaults_raw_data_dir_to_project_raw_inputs(self):
-        project = ProjectPaths.from_args(project_dir=r"D:\LIFMSProjects\Batch03")
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "Batch03"
+            project = ProjectPaths.from_args(project_dir=project_dir)
 
-        self.assertEqual(project.raw_data_dir, Path(r"D:\LIFMSProjects\Batch03\raw_inputs"))
+            self.assertEqual(project.raw_data_dir, project_dir / "raw_inputs")
 
     def test_bootstrap_meta_hides_project_when_none_selected(self):
         data = BootstrapAppData(project=ProjectPaths.from_args(), load_error="", project_selected=False)
@@ -349,7 +359,7 @@ class ProjectManifestTest(unittest.TestCase):
 
     def test_export_filename_uses_safe_project_name_and_timestamp(self):
         filename = export_filename_for_project(
-            Path(r"D:\LIFMSProjects\Batch:03 Test"),
+            Path("projects") / "Batch:03 Test",
             datetime(2026, 7, 1, 22, 5, 6),
         )
 
