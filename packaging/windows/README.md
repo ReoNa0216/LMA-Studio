@@ -24,6 +24,8 @@ dist\LMAStudio\LMAStudio.exe
 
 Distribute the whole `dist\LMAStudio` directory or a zip made from that directory. Do not distribute only the single exe; the onedir build also needs bundled DLLs and runtime resources.
 
+The build copies `LMAStudio.exe.config` beside the executable and probes the packaged pythonnet/CLR bridge both normally and with simulated Internet-zone download markers. This guards the common GitHub-download-and-extract startup path.
+
 ## Run
 
 ```powershell

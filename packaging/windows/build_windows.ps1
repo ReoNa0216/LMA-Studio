@@ -64,6 +64,41 @@ if (!(Test-Path $BuiltExe)) {
     throw "PyInstaller returned success but did not create $BuiltExe."
 }
 
+$RuntimeConfigSource = Join-Path $RepoRoot "packaging\windows\LMAStudio.exe.config"
+$RuntimeConfigTarget = Join-Path $RepoRoot "dist\LMAStudio\LMAStudio.exe.config"
+Copy-Item -LiteralPath $RuntimeConfigSource -Destination $RuntimeConfigTarget -Force
+
+function Invoke-PackagedRuntimeProbe {
+    $Probe = Start-Process -FilePath $BuiltExe -ArgumentList "--check-runtime" -WindowStyle Hidden -Wait -PassThru
+    if ($Probe.ExitCode -ne 0) {
+        throw "The packaged Windows desktop runtime failed its import probe (exit code $($Probe.ExitCode))."
+    }
+}
+
+Invoke-PackagedRuntimeProbe
+
+$MotwTargets = @(
+    (Join-Path $RepoRoot "dist\LMAStudio\_internal\pythonnet\runtime\Python.Runtime.dll"),
+    (Join-Path $RepoRoot "dist\LMAStudio\_internal\clr_loader\ffi\dlls\amd64\ClrLoader.dll")
+)
+foreach ($Target in $MotwTargets) {
+    if (!(Test-Path -LiteralPath $Target)) {
+        throw "The packaged Windows runtime is missing $Target."
+    }
+    Set-Content -LiteralPath $Target -Stream Zone.Identifier -Encoding Ascii -Value @(
+        "[ZoneTransfer]",
+        "ZoneId=3"
+    )
+}
+try {
+    Invoke-PackagedRuntimeProbe
+}
+finally {
+    foreach ($Target in $MotwTargets) {
+        Unblock-File -LiteralPath $Target
+    }
+}
+
 Write-Host ""
 Write-Host "Build complete: dist\LMAStudio\LMAStudio.exe"
 Write-Host "Run: powershell -ExecutionPolicy Bypass -File packaging\windows\run_exe.ps1"

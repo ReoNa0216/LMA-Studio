@@ -155,6 +155,7 @@ class DesktopArgumentsTest(unittest.TestCase):
         self.assertIsNone(args.raw_data_dir)
         self.assertIsNone(args.annotation_db)
         self.assertFalse(args.debug)
+        self.assertFalse(args.check_runtime)
 
 
 if __name__ == "__main__":

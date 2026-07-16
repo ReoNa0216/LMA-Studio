@@ -229,7 +229,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--raw-data-dir", default=None)
     parser.add_argument("--annotation-db", default=None)
     parser.add_argument("--debug", action="store_true", help="启用 WebView 开发工具，仅用于开发调试。")
+    parser.add_argument("--check-runtime", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
+
+
+def check_desktop_runtime() -> None:
+    if sys.platform == "win32":
+        if webview2_runtime_version() is None:
+            raise RuntimeError("未检测到 Microsoft Edge WebView2 Runtime。")
+        import webview.platforms.winforms  # noqa: F401
+        return
+    if sys.platform == "darwin":
+        import webview.platforms.cocoa  # noqa: F401
 
 
 def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) -> None:
@@ -284,10 +295,14 @@ def main(argv: list[str] | None = None) -> int:
     log_path = configure_logging()
     guard = SingleInstanceGuard()
     try:
+        args = parse_args(argv)
+        if args.check_runtime:
+            check_desktop_runtime()
+            return 0
         if not guard.acquire():
             show_native_message("LMA Studio 已经在运行。请切换到现有窗口。")
             return 2
-        run_desktop(parse_args(argv))
+        run_desktop(args)
         return 0
     except Exception as exc:
         LOGGER.exception("Desktop startup failed")
