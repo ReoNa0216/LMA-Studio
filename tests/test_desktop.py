@@ -4,7 +4,6 @@ from pathlib import Path
 import socket
 import sys
 import unittest
-from unittest.mock import patch
 from urllib.request import urlopen
 import uuid
 
@@ -130,22 +129,22 @@ class SingleInstanceGuardTest(unittest.TestCase):
             third.release()
 
 
+@unittest.skipIf(sys.platform == "win32", "POSIX file-lock semantics")
 class PortableSingleInstanceGuardTest(unittest.TestCase):
     def test_non_windows_guard_rejects_second_instance_until_release(self):
         name = f"LMAStudio.PortableTest.{uuid.uuid4().hex}"
         first = SingleInstanceGuard(name)
         second = SingleInstanceGuard(name)
         third = SingleInstanceGuard(name)
-        with patch("annotation_app.desktop.sys.platform", "darwin"):
-            try:
-                self.assertTrue(first.acquire())
-                self.assertFalse(second.acquire())
-                first.release()
-                self.assertTrue(third.acquire())
-            finally:
-                first.release()
-                second.release()
-                third.release()
+        try:
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+            first.release()
+            self.assertTrue(third.acquire())
+        finally:
+            first.release()
+            second.release()
+            third.release()
 
 
 class DesktopArgumentsTest(unittest.TestCase):

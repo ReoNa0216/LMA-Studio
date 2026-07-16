@@ -13,7 +13,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
-import socket
 import sys
 import threading
 from typing import Any
@@ -98,7 +97,7 @@ class SingleInstanceGuard:
     def __init__(self, name: str = "LMAStudio.Desktop") -> None:
         self.name = name
         self._handle: Any = None
-        self._socket: socket.socket | None = None
+        self._lock_file: Any = None
 
     def acquire(self) -> bool:
         if sys.platform == "win32":
@@ -118,15 +117,18 @@ class SingleInstanceGuard:
             self._handle = (kernel32, handle)
             return True
 
-        port = 41000 + (int.from_bytes(self.name.encode("utf-8"), "little") % 20000)
-        instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        import fcntl
+
+        lock_dir = user_state_dir()
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_id = uuid.uuid5(uuid.NAMESPACE_URL, self.name).hex
+        lock_file = (lock_dir / f"instance-{lock_id}.lock").open("a+b")
         try:
-            instance_socket.bind(("127.0.0.1", port))
-            instance_socket.listen(1)
-        except OSError:
-            instance_socket.close()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            lock_file.close()
             return False
-        self._socket = instance_socket
+        self._lock_file = lock_file
         return True
 
     def release(self) -> None:
@@ -134,9 +136,14 @@ class SingleInstanceGuard:
             kernel32, handle = self._handle
             kernel32.CloseHandle(handle)
             self._handle = None
-        if self._socket is not None:
-            self._socket.close()
-            self._socket = None
+        if self._lock_file is not None:
+            import fcntl
+
+            try:
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._lock_file.close()
+                self._lock_file = None
 
     def __enter__(self) -> "SingleInstanceGuard":
         if not self.acquire():
