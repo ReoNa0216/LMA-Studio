@@ -167,10 +167,10 @@ class ProjectManifestTest(unittest.TestCase):
             )
 
             self.assertFalse((project_dir / "raw_inputs").exists())
-            self.assertEqual(rows[0]["path"], str(raw_paths["lif_g2"]))
-            self.assertEqual(rows[3]["path"], str(raw_paths["ms"]))
+            self.assertEqual(rows[0]["path"], str(raw_paths["lif_g2"].resolve()))
+            self.assertEqual(rows[3]["path"], str(raw_paths["ms"].resolve()))
             self.assertEqual(manifest_inputs["ms"]["path_mode"], RAW_INPUT_MODE_EXTERNAL)
-            self.assertEqual(manifest_inputs["ms"]["path"], str(raw_paths["ms"]))
+            self.assertEqual(manifest_inputs["ms"]["path"], str(raw_paths["ms"].resolve()))
 
     def test_copy_records_use_project_relative_raw_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,7 +346,7 @@ class ProjectManifestTest(unittest.TestCase):
             project_dir = Path(tmp) / "Batch03"
             project = ProjectPaths.from_args(project_dir=project_dir)
 
-            self.assertEqual(project.raw_data_dir, project_dir / "raw_inputs")
+            self.assertEqual(project.raw_data_dir, project_dir.resolve() / "raw_inputs")
 
     def test_bootstrap_meta_hides_project_when_none_selected(self):
         data = BootstrapAppData(project=ProjectPaths.from_args(), load_error="", project_selected=False)
