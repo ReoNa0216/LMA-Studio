@@ -18,6 +18,9 @@ build/
 dist/
 release/
 *.spec~
+packaging/windows/LMAStudio.ico
+packaging/macos/LMAStudio.icns
+packaging/macos/LMAStudio.iconset/
 
 # Test and automation output
 test-results/

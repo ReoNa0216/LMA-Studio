@@ -30,11 +30,7 @@ Distribute the whole `dist\LMAStudio` directory or a zip made from that director
 powershell -ExecutionPolicy Bypass -File packaging\windows\run_exe.ps1
 ```
 
-Then open:
-
-```text
-http://127.0.0.1:8050/
-```
+The executable opens a native LMA Studio window. It starts an internal HTTP server on a random loopback port and stops that server when the window closes.
 
 Optional explicit project launch:
 
@@ -42,8 +38,15 @@ Optional explicit project launch:
 powershell -ExecutionPolicy Bypass -File packaging\windows\run_exe.ps1 -ProjectDir "D:\LMAProjects\Batch03"
 ```
 
+Normal double-click startup never restores the last project; it always starts at the project selection screen.
+
+## Runtime
+
+The desktop host requires Microsoft Edge WebView2 Runtime. Windows 11 normally includes it. LMA Studio detects a missing runtime before opening the application window and records startup diagnostics under `%LOCALAPPDATA%\LMA Studio\logs`.
+
 ## Release Principles
 
 - Package only the application code and required preprocessing scripts.
 - Do not package user project directories, annotation SQLite databases, exports, raw input files, author CSV files, or h5ad files.
 - User data remains under the project directory selected inside LMA Studio.
+- The packaged desktop app uses pywebview native file dialogs and does not bundle Tk/Tcl.

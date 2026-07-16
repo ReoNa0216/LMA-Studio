@@ -539,50 +539,121 @@ def median_sideband_window_count(offsets: np.ndarray, center_sec: float, half_wi
 def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     offset_rows = []
-    r1 = merged_peaks[merged_peaks["channel"].eq("R1")].sort_values("time_sec")
-    r2 = merged_peaks[merged_peaks["channel"].eq("R2")].sort_values("time_sec")
-    for phase in ["qc_start", "pre_run", "cell_run"]:
-        left = r1[r1["phase"].eq(phase)].reset_index(drop=True)
-        right = r2[r2["phase"].eq(phase)].reset_index(drop=True)
-        offsets = all_pair_offsets(left, right, RED_PAIR_MAX_ABS_OFFSET_SEC)
-        for offset in offsets:
-            offset_rows.append({"phase": phase, "r2_minus_r1_sec": float(offset)})
-        if len(offsets):
-            bins = np.arange(
-                -RED_PAIR_MAX_ABS_OFFSET_SEC,
-                RED_PAIR_MAX_ABS_OFFSET_SEC + RED_PAIR_BIN_SEC,
-                RED_PAIR_BIN_SEC,
+    if "detector" in merged_peaks.columns:
+        red = merged_peaks[merged_peaks["detector"].astype(str).str.lower().eq("red")]
+    else:
+        red = merged_peaks[merged_peaks["channel"].astype(str).str.upper().str.startswith("R")]
+    red_channels = list(dict.fromkeys(red["channel"].astype(str).tolist()))
+    channel_pairs = [
+        (red_channels[left_index], red_channels[right_index])
+        for left_index in range(len(red_channels))
+        for right_index in range(left_index + 1, len(red_channels))
+    ]
+    if not channel_pairs:
+        only_channel = red_channels[0] if red_channels else ""
+        for phase in ["qc_start", "pre_run", "cell_run"]:
+            left = red[red["phase"].eq(phase)] if only_channel else red.iloc[0:0]
+            rows.append(
+                {
+                    "phase": phase,
+                    "left_channel": only_channel,
+                    "right_channel": "",
+                    "left_peak_count": int(len(left)),
+                    "right_peak_count": 0,
+                    "r1_peak_count": int(len(left)) if only_channel == "R1" else 0,
+                    "r2_peak_count": int(len(left)) if only_channel == "R2" else 0,
+                    "all_pair_offset_count_pm30sec": 0,
+                    "offset_mode_sec": np.nan,
+                    "right_minus_left_offset_mode_sec": np.nan,
+                    "r2_minus_r1_offset_mode_sec": np.nan,
+                    "offset_mode_bin_count": 0,
+                    "near_zero_pair_count_pm0p75sec": 0,
+                    "sideband_median_pair_count_pm0p75sec": np.nan,
+                    "near_zero_over_sideband": np.nan,
+                    "median_abs_offset_sec_all_pairs": np.nan,
+                    "audit_status": "not_applicable_fewer_than_two_red_channels",
+                    "interpretation": "A same-detector offset audit requires at least two red channels.",
+                }
             )
-            hist, edges = np.histogram(offsets, bins=bins)
-            best = int(np.argmax(hist))
-            mode_offset = float((edges[best] + edges[best + 1]) / 2.0)
-            mode_count = int(hist[best])
-            near_zero = count_offsets_in_window(offsets, 0.0, RED_NEAR_ZERO_HALF_WIDTH_SEC)
-            sideband = median_sideband_window_count(offsets, 0.0, RED_NEAR_ZERO_HALF_WIDTH_SEC)
-            near_zero_over_sideband = float(near_zero / sideband) if np.isfinite(sideband) and sideband > 0 else np.nan
-            median_abs_nearest = float(np.median(np.abs(offsets))) if len(offsets) else np.nan
-        else:
-            mode_offset = np.nan
-            mode_count = 0
-            near_zero = 0
-            sideband = np.nan
-            near_zero_over_sideband = np.nan
-            median_abs_nearest = np.nan
-        rows.append(
-            {
-                "phase": phase,
-                "r1_peak_count": int(len(left)),
-                "r2_peak_count": int(len(right)),
-                "all_pair_offset_count_pm30sec": int(len(offsets)),
-                "offset_mode_sec": mode_offset,
-                "offset_mode_bin_count": mode_count,
-                "near_zero_pair_count_pm0p75sec": near_zero,
-                "sideband_median_pair_count_pm0p75sec": sideband,
-                "near_zero_over_sideband": near_zero_over_sideband,
-                "median_abs_offset_sec_all_pairs": median_abs_nearest,
-                "interpretation": "all-pair offset 会受峰密度影响；near-zero 只作为同步/串扰风险提示，需结合 sideband 背景解释，不判标签。",
-            }
+        return pd.DataFrame(rows), pd.DataFrame(
+            columns=["phase", "left_channel", "right_channel", "right_minus_left_sec", "r2_minus_r1_sec"]
         )
+
+    for left_channel, right_channel in channel_pairs:
+        left_all = red[red["channel"].eq(left_channel)].sort_values("time_sec")
+        right_all = red[red["channel"].eq(right_channel)].sort_values("time_sec")
+        for phase in ["qc_start", "pre_run", "cell_run"]:
+            left = left_all[left_all["phase"].eq(phase)].reset_index(drop=True)
+            right = right_all[right_all["phase"].eq(phase)].reset_index(drop=True)
+            offsets = all_pair_offsets(left, right, RED_PAIR_MAX_ABS_OFFSET_SEC)
+            for offset in offsets:
+                if (left_channel, right_channel) == ("R1", "R2"):
+                    r2_minus_r1 = float(offset)
+                elif (left_channel, right_channel) == ("R2", "R1"):
+                    r2_minus_r1 = -float(offset)
+                else:
+                    r2_minus_r1 = np.nan
+                offset_rows.append(
+                    {
+                        "phase": phase,
+                        "left_channel": left_channel,
+                        "right_channel": right_channel,
+                        "right_minus_left_sec": float(offset),
+                        "r2_minus_r1_sec": r2_minus_r1,
+                    }
+                )
+            if len(offsets):
+                bins = np.arange(
+                    -RED_PAIR_MAX_ABS_OFFSET_SEC,
+                    RED_PAIR_MAX_ABS_OFFSET_SEC + RED_PAIR_BIN_SEC,
+                    RED_PAIR_BIN_SEC,
+                )
+                hist, edges = np.histogram(offsets, bins=bins)
+                best = int(np.argmax(hist))
+                mode_offset = float((edges[best] + edges[best + 1]) / 2.0)
+                mode_count = int(hist[best])
+                near_zero = count_offsets_in_window(offsets, 0.0, RED_NEAR_ZERO_HALF_WIDTH_SEC)
+                sideband = median_sideband_window_count(offsets, 0.0, RED_NEAR_ZERO_HALF_WIDTH_SEC)
+                near_zero_over_sideband = float(near_zero / sideband) if np.isfinite(sideband) and sideband > 0 else np.nan
+                median_abs_nearest = float(np.median(np.abs(offsets)))
+            else:
+                mode_offset = np.nan
+                mode_count = 0
+                near_zero = 0
+                sideband = np.nan
+                near_zero_over_sideband = np.nan
+                median_abs_nearest = np.nan
+            if (left_channel, right_channel) == ("R2", "R1"):
+                compatibility_mode_offset = -mode_offset
+            else:
+                compatibility_mode_offset = mode_offset
+            r2_minus_r1_mode_offset = (
+                compatibility_mode_offset
+                if {left_channel, right_channel} == {"R1", "R2"}
+                else np.nan
+            )
+            rows.append(
+                {
+                    "phase": phase,
+                    "left_channel": left_channel,
+                    "right_channel": right_channel,
+                    "left_peak_count": int(len(left)),
+                    "right_peak_count": int(len(right)),
+                    "r1_peak_count": int(len(left)) if left_channel == "R1" else int(len(right)) if right_channel == "R1" else 0,
+                    "r2_peak_count": int(len(left)) if left_channel == "R2" else int(len(right)) if right_channel == "R2" else 0,
+                    "all_pair_offset_count_pm30sec": int(len(offsets)),
+                    "offset_mode_sec": compatibility_mode_offset,
+                    "right_minus_left_offset_mode_sec": mode_offset,
+                    "r2_minus_r1_offset_mode_sec": r2_minus_r1_mode_offset,
+                    "offset_mode_bin_count": mode_count,
+                    "near_zero_pair_count_pm0p75sec": near_zero,
+                    "sideband_median_pair_count_pm0p75sec": sideband,
+                    "near_zero_over_sideband": near_zero_over_sideband,
+                    "median_abs_offset_sec_all_pairs": median_abs_nearest,
+                    "audit_status": "pair_audited",
+                    "interpretation": "All-pair offsets are density-sensitive and are not annotation evidence.",
+                }
+            )
     return pd.DataFrame(rows), pd.DataFrame(offset_rows)
 
 
@@ -614,9 +685,10 @@ def plot_peak_qc(peaks: pd.DataFrame, red_offsets: pd.DataFrame) -> None:
     axes[1].set_xlabel("SNR, clipped at 100")
     axes[1].set_ylabel("peak count")
     if len(red_offsets):
-        axes[2].hist(red_offsets["r2_minus_r1_sec"], bins=np.arange(-30, 30.25, 0.5), color="#a855f7", alpha=0.8)
+        offset_col = "right_minus_left_sec" if "right_minus_left_sec" in red_offsets.columns else "r2_minus_r1_sec"
+        axes[2].hist(red_offsets[offset_col].dropna(), bins=np.arange(-30, 30.25, 0.5), color="#a855f7", alpha=0.8)
     axes[2].axvline(0, color="black", lw=0.8)
-    axes[2].set_xlabel("R2 - R1 offset (sec)")
+    axes[2].set_xlabel("same-detector channel offset (sec)")
     axes[2].set_ylabel("pair count")
     axes[0].legend()
     fig.suptitle("V3-01 compact LIF QC distributions", y=1.03)

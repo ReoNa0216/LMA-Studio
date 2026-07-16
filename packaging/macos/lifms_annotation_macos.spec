@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
-import sys
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 
 repo_root = Path(SPECPATH).parents[1]
+release_version = os.environ.get("LMA_STUDIO_VERSION", "0.2.0").lstrip("v")
+bundle_version = release_version.split("-", 1)[0]
 
 
 def production_submodule(name):
@@ -17,6 +19,8 @@ def production_submodule(name):
         or part.startswith("_test")
         for part in parts
     )
+
+
 datas = [
     (str(repo_root / "scripts/v3/run_v3_01_lif_trace_physical_qc.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_02_ms_event_calling.py"), "scripts/v3"),
@@ -28,16 +32,21 @@ datas += collect_data_files("webview", subdir="js")
 binaries = []
 binaries += collect_dynamic_libs("pyarrow")
 binaries += collect_dynamic_libs("scipy")
-binaries += collect_dynamic_libs("webview")
 
 hiddenimports = []
 hiddenimports += collect_submodules("pyarrow", filter=production_submodule)
 hiddenimports += collect_submodules("scipy", filter=production_submodule)
 hiddenimports += [
+    "AppKit",
+    "Foundation",
+    "Quartz",
+    "Security",
+    "UniformTypeIdentifiers",
+    "WebKit",
     "matplotlib.backends.backend_agg",
+    "objc",
     "pandas._libs.tslibs.timedeltas",
-    "webview.platforms.edgechromium",
-    "webview.platforms.winforms",
+    "webview.platforms.cocoa",
 ]
 
 
@@ -64,11 +73,13 @@ a = Analysis(
         "PyQt6",
         "PySide2",
         "PySide6",
-        "webview.platforms.cef",
         "webview.platforms.android",
-        "webview.platforms.cocoa",
+        "webview.platforms.cef",
+        "webview.platforms.edgechromium",
         "webview.platforms.gtk",
+        "webview.platforms.mshtml",
         "webview.platforms.qt",
+        "webview.platforms.winforms",
     ],
     noarchive=False,
     optimize=0,
@@ -90,21 +101,34 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=True,
     argv_emulation=False,
-    target_arch=None,
+    target_arch="arm64",
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(repo_root / "packaging/windows/LMAStudio.ico"),
+    icon=str(repo_root / "packaging/macos/LMAStudio.icns"),
 )
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
     name="LMAStudio",
+)
+app = BUNDLE(
+    coll,
+    name="LMA Studio.app",
+    icon=str(repo_root / "packaging/macos/LMAStudio.icns"),
+    bundle_identifier="io.github.reona0216.LMAStudio",
+    info_plist={
+        "CFBundleDisplayName": "LMA Studio",
+        "CFBundleShortVersionString": bundle_version,
+        "CFBundleVersion": bundle_version,
+        "LSMinimumSystemVersion": "12.0",
+        "NSHighResolutionCapable": True,
+        "NSHumanReadableCopyright": "Copyright 2026 LMA Studio contributors",
+    },
 )

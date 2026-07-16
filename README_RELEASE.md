@@ -1,63 +1,41 @@
-# LMA Studio v0.1.0 Release Notes
+# LMA Studio v0.2.0 Release Notes
 
-## Package
+LMA Studio is a local desktop application for project-based, human-assisted LIF-MS annotation review.
 
-- Product: LMA Studio
-- Meaning: LIF-MS Annotation Studio
-- Platform: Windows x64
-- Build type: PyInstaller onedir
-- Entry point: `LMAStudio\LMAStudio.exe`
-- Local URL: `http://127.0.0.1:8050/`
+## Downloads
 
-## What Is Included
+- `LMA-Studio-v0.2.0-windows-x64.zip`: fully validated Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
+- `LMA-Studio-v0.2.0-macos-arm64.zip`: Apple Silicon candidate built and structurally verified on GitHub Actions. Open `LMA Studio.app`.
+- Matching `.sha256` files are provided for integrity verification.
 
-- Local project initialization page with `新建项目` and `打开项目`.
-- Project-based workflow with `lifms_project.json`.
-- Configurable 3-channel LIF layout and configurable QC anchor pair.
-- External raw input reference mode for large MS files.
-- Four annotation workflow stages:
-  - QC calibration
-  - Local post-QC MS shift calibration
-  - QC survey
-  - Cell annotation
-- QC-pair-based local MS delta suggestion.
-- Accepted annotation CSV export using project name plus timestamp.
+The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. On first launch, macOS may require Control-clicking the app and choosing **Open**. A physical Mac GUI acceptance test has not yet been performed.
 
-## What Is Not Included
+## Highlights
 
-- No bundled user data.
-- No raw LIF/MS files.
-- No project SQLite annotation databases.
-- No author CSV or h5ad inputs.
-- No WebView wrapper yet; v0.1.0 opens the local browser intentionally for transparent debugging.
+- Native application window backed by pywebview instead of opening the system browser.
+- Initialization page always starts without silently reopening the last project.
+- Directory-based projects with `lifms_project.json` and external raw-input references.
+- Configurable three-channel LIF layout and a dynamic two-to-three-channel QC anchor set.
+- Axis-aware QC calibration, including shared green-axis timing for G1/G2.
+- Reviewed QC relations no longer reappear as overlapping pending candidates.
+- Project-level acquisition and phase configuration with frozen-model invalidation safeguards.
+- Four workflow stages: QC calibration, local post-QC MS shift calibration, QC survey, and cell annotation.
+- Accepted-annotation CSV exports named with the project and timestamp.
 
-## Install And Run
+## Data Policy
 
-1. Download `LMA-Studio-v0.1.0-windows-x64.zip`.
-2. Unzip it to a writable directory.
-3. Double-click `LMAStudio.exe`.
-4. Open `http://127.0.0.1:8050/` if the browser does not open automatically.
-5. Choose `新建项目` or `打开项目`.
+The application packages contain no user projects, raw LIF/MS files, SQLite databases, author CSV files, h5ad files, or exported annotations.
 
-## Known Notes
+## Validation
 
-- Keep the whole `LMAStudio` folder together. The single exe depends on bundled runtime files in the same folder.
-- If port `8050` is already in use, launch from PowerShell with another port:
+Windows validation completed locally:
 
-```powershell
-.\LMAStudio.exe --port 8051
-```
+- 79 automated tests.
+- Clean PyInstaller x64 build and native-window startup at the initialization page.
+- Read-only open regressions for `Batch03Test`, `CART_Exp1-3`, `CART_Exp2-1`, and `Young_HSC3`.
+- Annotation/database/project-file hashes remained unchanged during regression checks.
 
-- For large MS raw text files, use external raw input references unless a self-contained project copy is required.
+macOS ARM64 validation performed in GitHub Actions:
 
-## Validation Before Release
-
-Validated on local Windows environment:
-
-- `python -m unittest discover -s tests`
-- Windows PyInstaller build
-- Startup returns initialization page with no remembered project
-- Project open smoke tests for:
-  - `CART_Exp1-3`
-  - `CART_Exp2-1`
-  - `Batch03Test`
+- Full automated test suite on an Apple Silicon runner.
+- PyInstaller `.app` build, bundle/plist validation, ad-hoc code-signature verification, ARM64 executable inspection, and command-line startup smoke test.
