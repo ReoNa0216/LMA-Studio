@@ -21,7 +21,7 @@
 - 后段局部校正冻结前，QC 巡检和细胞标注候选不会生成，侧栏也不显示后段人工审核工具；后端同时拒绝直接 review 后段候选。
 - QC 校正段后生成 QC 巡检候选 anchor 组；这些候选在冻结的 time model 下显示，并和细胞标注保持独立语义。
 - `annotation_start_min` 后生成高保守细胞候选；只有 canonical event map 白名单内的 `ms_event_id` 能进入第三阶段候选或后端手工写入。
-- 独立 UMAP 窗口只显示 canonical 五列表的坐标。颜色完全由当前 SQLite accepted 状态投影；主窗口写入会立即同步，点击 UMAP 点会让主窗口定位到同一 `ms_event_id`。
+- 独立 UMAP 窗口只显示 canonical 五列表的坐标。颜色完全由当前 SQLite accepted 状态投影；主窗口写入会立即同步，点击 UMAP 点会让主窗口定位到同一 `ms_event_id`。窗口尺寸变化时会自动重新适配点云；UMAP1/UMAP2 轴和刻度随滚轮缩放、拖动平移同步更新。
 - 将人工审核状态和 audit log 保存到本地 SQLite。
 - 顶部“新建项目”支持动态添加/删除 2-4 个 LIF 输入、配置两类角色并选择事件坐标 CSV；“打开项目”支持加载已有 parquet + SQLite 项目。
 - 导出当前所有 `accepted + exportable` annotation CSV，并在 SQLite `export_runs` 中记录导出时间、过滤条件、行数和 CSV sha256。

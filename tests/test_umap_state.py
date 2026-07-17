@@ -13,6 +13,7 @@ from annotation_app.app import (
     ProjectPaths,
     acquisition_layout_hash,
 )
+from annotation_app.umap_page import UMAP_HTML
 
 
 def frozen_store(path: Path, layout: dict) -> AnnotationStore:
@@ -158,6 +159,20 @@ def make_app(root: Path, *, with_map: bool) -> AppData:
 
 
 class UmapAppStateTest(unittest.TestCase):
+    def test_umap_page_exposes_responsive_axes_and_plain_language_controls(self):
+        self.assertIn(">显示全部点</button>", UMAP_HTML)
+        self.assertIn("不会修改任何标注", UMAP_HTML)
+        self.assertIn("滚轮缩放 · 拖动平移 · 单击定位事件", UMAP_HTML)
+        self.assertIn("function drawAxes()", UMAP_HTML)
+        self.assertIn("ctx.fillText('UMAP1'", UMAP_HTML)
+        self.assertIn("ctx.fillText('UMAP2'", UMAP_HTML)
+        self.assertIn("points.length && (sizeChanged || !fitted)", UMAP_HTML)
+        self.assertIn("`${points.length.toLocaleString()} 个事件点`", UMAP_HTML)
+        self.assertNotIn("slice(0, 12)", UMAP_HTML)
+        self.assertIn("MS760 时间：", UMAP_HTML)
+        self.assertNotIn("<div class=\"muted\">event:", UMAP_HTML)
+        self.assertNotIn("<div class=\"muted\">scan:", UMAP_HTML)
+
     def test_backend_whitelist_and_cross_classification_conflict(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = make_app(Path(tmp), with_map=True)

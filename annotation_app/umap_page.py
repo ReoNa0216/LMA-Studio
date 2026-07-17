@@ -45,19 +45,36 @@ UMAP_HTML = r"""<!doctype html>
     .legend-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
     .swatch { width: 9px; height: 9px; border-radius: 50%; border: 1px solid rgba(0,0,0,.12); }
     button {
-      width: 34px;
       height: 32px;
       border: 1px solid var(--line);
       border-radius: 7px;
       background: var(--surface);
       color: var(--ink);
-      font-size: 16px;
       cursor: pointer;
     }
     button:hover { border-color: #98a2b3; background: #f9fafb; }
+    .fit-button {
+      width: auto;
+      padding: 0 11px;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
     .plot { min-height: 0; position: relative; }
     canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
     canvas.dragging { cursor: grabbing; }
+    .gesture-hint {
+      position: absolute;
+      right: 16px;
+      bottom: 12px;
+      padding: 5px 8px;
+      border: 1px solid rgba(152,162,179,.35);
+      border-radius: 6px;
+      background: rgba(255,255,255,.84);
+      color: var(--muted);
+      font-size: 11px;
+      pointer-events: none;
+    }
     .empty {
       position: absolute;
       inset: 0;
@@ -98,12 +115,15 @@ UMAP_HTML = r"""<!doctype html>
       <span id="identity" class="identity">正在读取项目…</span>
       <span class="spacer"></span>
       <div id="legend" class="legend"></div>
-      <button id="fit" type="button" title="适配全部点" aria-label="适配全部点">⌂</button>
+      <button id="fit" class="fit-button" type="button"
+              title="恢复缩放和位置以显示全部事件点；不会修改任何标注"
+              aria-label="显示全部事件点并重新居中，不会修改标注">显示全部点</button>
     </header>
     <section id="plot" class="plot">
       <canvas id="canvas" aria-label="单细胞事件 UMAP"></canvas>
       <div id="empty" class="empty"></div>
       <div id="tooltip" class="tooltip"></div>
+      <div class="gesture-hint">滚轮缩放 · 拖动平移 · 单击定位事件</div>
     </section>
   </main>
   <script>
@@ -135,6 +155,15 @@ UMAP_HTML = r"""<!doctype html>
     let moved = false;
     let dragStart = null;
     let hoverPoint = null;
+    let lastCanvasWidth = 0;
+    let lastCanvasHeight = 0;
+
+    const AXIS_MARGIN = {
+      left: 58,
+      right: 22,
+      top: 20,
+      bottom: 48,
+    };
 
     function escapeText(value) {
       return String(value ?? '').replace(/[&<>"']/g, char => ({
@@ -180,17 +209,28 @@ UMAP_HTML = r"""<!doctype html>
       return { minX, maxX, minY, maxY };
     }
 
+    function plotArea() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const left = Math.min(AXIS_MARGIN.left, Math.max(30, width * .24));
+      const right = Math.max(left + 1, width - Math.min(AXIS_MARGIN.right, width * .1));
+      const top = Math.min(AXIS_MARGIN.top, Math.max(8, height * .08));
+      const bottom = Math.max(top + 1, height - Math.min(AXIS_MARGIN.bottom, height * .22));
+      return { left, right, top, bottom, width: right - left, height: bottom - top };
+    }
+
     function fitView() {
       const box = bounds();
       if (!box || !canvas.clientWidth || !canvas.clientHeight) return;
-      const padding = 34;
+      const area = plotArea();
+      const padding = Math.min(22, Math.max(8, Math.min(area.width, area.height) * .06));
       const dx = Math.max(box.maxX - box.minX, 1e-6);
       const dy = Math.max(box.maxY - box.minY, 1e-6);
-      const usableW = Math.max(canvas.clientWidth - padding * 2, 1);
-      const usableH = Math.max(canvas.clientHeight - padding * 2, 1);
+      const usableW = Math.max(area.width - padding * 2, 1);
+      const usableH = Math.max(area.height - padding * 2, 1);
       view.scale = Math.min(usableW / dx, usableH / dy);
-      view.tx = canvas.clientWidth / 2 - ((box.minX + box.maxX) / 2) * view.scale;
-      view.ty = canvas.clientHeight / 2 + ((box.minY + box.maxY) / 2) * view.scale;
+      view.tx = (area.left + area.right) / 2 - ((box.minX + box.maxX) / 2) * view.scale;
+      view.ty = (area.top + area.bottom) / 2 + ((box.minY + box.maxY) / 2) * view.scale;
       fitted = true;
       draw();
     }
@@ -202,16 +242,121 @@ UMAP_HTML = r"""<!doctype html>
       };
     }
 
+    function niceTickStep(span, targetCount = 6) {
+      const rough = Math.max(Math.abs(span), 1e-12) / Math.max(targetCount, 1);
+      const magnitude = 10 ** Math.floor(Math.log10(rough));
+      const normalized = rough / magnitude;
+      const factor = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+      return factor * magnitude;
+    }
+
+    function tickValues(minimum, maximum, targetCount) {
+      const step = niceTickStep(maximum - minimum, targetCount);
+      const epsilon = step * 1e-9;
+      const first = Math.ceil((minimum - epsilon) / step) * step;
+      const values = [];
+      for (let value = first; value <= maximum + epsilon && values.length < 100; value += step) {
+        values.push(Math.abs(value) < epsilon ? 0 : value);
+      }
+      return { step, values };
+    }
+
+    function formatTick(value, step) {
+      const absolute = Math.abs(value);
+      if ((absolute > 0 && absolute < 1e-4) || absolute >= 1e5) {
+        return value.toExponential(1);
+      }
+      const decimals = Math.max(0, Math.min(6, -Math.floor(Math.log10(Math.abs(step))) + 1));
+      const formatted = value.toFixed(decimals);
+      return decimals ? formatted.replace(/\.?0+$/, '') : formatted;
+    }
+
+    function drawAxes() {
+      const area = plotArea();
+      if (!Number.isFinite(view.scale) || view.scale <= 0 || area.width <= 1 || area.height <= 1) return;
+      const xMinimum = (area.left - view.tx) / view.scale;
+      const xMaximum = (area.right - view.tx) / view.scale;
+      const yMinimum = (view.ty - area.bottom) / view.scale;
+      const yMaximum = (view.ty - area.top) / view.scale;
+      const xTicks = tickValues(xMinimum, xMaximum, Math.max(3, Math.floor(area.width / 105)));
+      const yTicks = tickValues(yMinimum, yMaximum, Math.max(3, Math.floor(area.height / 75)));
+
+      ctx.save();
+      ctx.lineWidth = 1;
+      ctx.font = '11px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+
+      ctx.strokeStyle = 'rgba(152,162,179,.16)';
+      ctx.beginPath();
+      for (const value of xTicks.values) {
+        const x = value * view.scale + view.tx;
+        ctx.moveTo(x, area.top);
+        ctx.lineTo(x, area.bottom);
+      }
+      for (const value of yTicks.values) {
+        const y = -value * view.scale + view.ty;
+        ctx.moveTo(area.left, y);
+        ctx.lineTo(area.right, y);
+      }
+      ctx.stroke();
+
+      ctx.strokeStyle = '#98a2b3';
+      ctx.beginPath();
+      ctx.moveTo(area.left, area.top);
+      ctx.lineTo(area.left, area.bottom);
+      ctx.lineTo(area.right, area.bottom);
+      ctx.stroke();
+
+      ctx.fillStyle = '#667085';
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'center';
+      for (const value of xTicks.values) {
+        const x = value * view.scale + view.tx;
+        ctx.beginPath();
+        ctx.moveTo(x, area.bottom);
+        ctx.lineTo(x, area.bottom + 4);
+        ctx.stroke();
+        ctx.fillText(formatTick(value, xTicks.step), x, area.bottom + 7);
+      }
+
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'right';
+      for (const value of yTicks.values) {
+        const y = -value * view.scale + view.ty;
+        ctx.beginPath();
+        ctx.moveTo(area.left - 4, y);
+        ctx.lineTo(area.left, y);
+        ctx.stroke();
+        ctx.fillText(formatTick(value, yTicks.step), area.left - 7, y);
+      }
+
+      ctx.fillStyle = '#344054';
+      ctx.font = '600 12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('UMAP1', (area.left + area.right) / 2, canvas.clientHeight - 5);
+      ctx.save();
+      ctx.translate(14, (area.top + area.bottom) / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText('UMAP2', 0, 0);
+      ctx.restore();
+      ctx.restore();
+    }
+
     function resizeCanvas() {
       const ratio = Math.max(1, window.devicePixelRatio || 1);
-      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
-      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      const cssWidth = Math.max(1, canvas.clientWidth);
+      const cssHeight = Math.max(1, canvas.clientHeight);
+      const sizeChanged = cssWidth !== lastCanvasWidth || cssHeight !== lastCanvasHeight;
+      lastCanvasWidth = cssWidth;
+      lastCanvasHeight = cssHeight;
+      const width = Math.max(1, Math.round(cssWidth * ratio));
+      const height = Math.max(1, Math.round(cssHeight * ratio));
       if (canvas.width !== width || canvas.height !== height) {
         canvas.width = width;
         canvas.height = height;
       }
       ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-      if (!fitted && points.length) fitView();
+      if (points.length && (sizeChanged || !fitted)) fitView();
       else draw();
     }
 
@@ -220,10 +365,19 @@ UMAP_HTML = r"""<!doctype html>
       const height = canvas.clientHeight;
       ctx.clearRect(0, 0, width, height);
       if (!points.length) return;
+      drawAxes();
+      const area = plotArea();
       const radius = Math.max(2.2, Math.min(4.2, 2.6 + Math.log10(Math.max(view.scale, 1)) * .35));
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(area.left, area.top, area.width, area.height);
+      ctx.clip();
       for (const point of points) {
         const screen = screenPoint(point);
-        if (screen.x < -10 || screen.y < -10 || screen.x > width + 10 || screen.y > height + 10) continue;
+        if (
+          screen.x < area.left - 10 || screen.y < area.top - 10
+          || screen.x > area.right + 10 || screen.y > area.bottom + 10
+        ) continue;
         ctx.beginPath();
         ctx.arc(screen.x, screen.y, radius, 0, Math.PI * 2);
         ctx.fillStyle = pointColor(point);
@@ -249,23 +403,26 @@ UMAP_HTML = r"""<!doctype html>
           ctx.stroke();
         }
       }
+      ctx.restore();
     }
 
     function statusText(point) {
       if (point.classification === 'qc') return 'QC';
       if (point.classification === 'cell') {
-        return [point.lif_channel, point.label].filter(Boolean).join(' · ') || '细胞';
+        const channelName = String(point.lif_channel || '').trim();
+        const label = String(point.label || '').trim();
+        if (channelName && label.toLowerCase().startsWith(channelName.toLowerCase())) {
+          return label;
+        }
+        return [channelName, label].filter(Boolean).join(' ') || '细胞';
       }
-      if (point.classification === 'conflict') {
-        const relations = (point.accepted_relations || []).map(row =>
-          `${row.kind === 'qc' ? 'QC' : (row.lif_channel || '细胞')}: ${row.annotation_id}`
-        );
-        return `冲突：${relations.join('；')}`;
-      }
+      if (point.classification === 'conflict') return '标注冲突';
       return '未标注';
     }
 
     function nearestPoint(x, y) {
+      const area = plotArea();
+      if (x < area.left || x > area.right || y < area.top || y > area.bottom) return null;
       let closest = null;
       let distance2 = 90;
       for (const point of points) {
@@ -289,9 +446,7 @@ UMAP_HTML = r"""<!doctype html>
         return;
       }
       tooltip.innerHTML = `
-        <strong>MS760 ${Number(point.scan_start_time).toFixed(6)} min</strong>
-        <div class="muted">event: ${escapeText(point.ms_event_id)}</div>
-        <div class="muted">scan: ${escapeText(point.scan_id)}</div>
+        <strong>MS760 时间：${Number(point.scan_start_time).toFixed(6)} min</strong>
         <div>${escapeText(statusText(point))}</div>`;
       tooltip.style.display = 'block';
       const margin = 12;
@@ -341,7 +496,7 @@ UMAP_HTML = r"""<!doctype html>
         payload = data;
         points = Array.isArray(data.points) ? data.points : [];
         revision = String(data.revision || '');
-        identity.textContent = `${points.length} points · ${String(data.project_id || '').slice(0, 12)}`;
+        identity.textContent = `${points.length.toLocaleString()} 个事件点`;
         setEmpty(points.length ? '' : '当前项目没有事件坐标点。');
         renderLegend(data);
         if (identityChanged || forceFit || !fitted) fitView();

@@ -98,7 +98,11 @@ On a project with a map:
 
 - Click `打开 UMAP`; a separate resizable native window opens, while the main synchronized-track window remains unchanged.
 - Repeated clicks restore the same UMAP window rather than creating duplicates.
-- Pan, wheel-zoom, fit, hover, resize, and high-DPI rendering remain responsive.
+- The window initially shows all points centered. Maximizing/restoring the window automatically refits the cloud to the new plot area.
+- The visible `UMAP1` / `UMAP2` axes and tick values update with wheel zoom and drag pan.
+- `显示全部点` restores all points to a centered, readable scale without changing annotations; the on-canvas hint explains wheel zoom, drag pan, and click-to-locate.
+- Hover shows only the MS760 time and current human-readable label; it does not expose internal event/scan IDs.
+- Pan, wheel-zoom, reset, hover, resize, and high-DPI rendering remain responsive.
 - Unknown points are gray, accepted QC is black, accepted cells use the corresponding LIF channel color, and conflicts have an explicit red outline/X.
 - Accept/revoke in the main window updates UMAP without reloading either window.
 - Clicking a UMAP point switches the main window to event annotation and centers the matching `ms_event_id`.
