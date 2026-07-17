@@ -1,36 +1,38 @@
 # LMA Studio Developer Notes
 
-这是一个本地浏览器原型，用于人工辅助浏览 LIF-MS 同步数据，并按“QC 校正 / 后段局部校正 / QC 巡检 / 细胞标注”阶段审核候选连线。当前版本已经支持本地 accept/reject、手动 QC anchor、后段 QC 巡检、细胞二元组标注、右键线条审核，以及导出已接受 annotation CSV。
+这是一个本地桌面应用，用于人工辅助浏览 LIF-MS 同步数据，并按“QC 校正 / 后段局部校正 / 事件标注”三个界面阶段审核候选连线。事件标注阶段用显式筛选与手工模式区分 QC 巡检和细胞标注；SQLite 仍保留两种独立语义和历史 ID，不做破坏性迁移。
 
 ## 当前范围
 
 当前版本支持以下功能：
 
-- 读取由第一性原理前处理生成的 parquet 中间表；也可以通过顶部“新建项目”从 3 个 LIF 原始文件和 1 个 MS 原始文件生成这些中间表，或通过“打开项目”加载已有项目。
+- 读取由第一性原理前处理生成的 parquet 中间表；也可以通过顶部“新建项目”从 2-4 个 LIF 原始文件、1 个 MS 原始文件和 1 个单细胞事件坐标 CSV 生成项目。
 - 按 2.5 min 同步窗口显示 LIF/MS 数据。
 - 左右翻页或输入起始时间跳转；普通浏览窗口固定为 2.5 min。
-- 右侧 5-track 图上方的“图窗起点”只控制当前浏览窗口起点；它不是项目级 `annotation_start_min`。
+- 右侧动态轨道图上方的“图窗起点”只控制当前浏览窗口起点；它不是项目级 `annotation_start_min`。
 - 在每个识别出的 LIF 峰和 MS event 峰旁显示对应时间。
 - 每条轨道都有自己的时间轴，便于后续人工 QC anchor 对齐。
 - 鼠标悬停峰点时显示该峰或 event 的源字段。
 - 自动基于 0-10.5 min 全 QC 区段估计 shift-only 时间校正，并支持“校正后/原始”时间轴切换。
-- 对自动 QC anchor 组进行 `pending / accepted / rejected` 审核。项目可配置 2-4 个 anchor 通道；当前三 LIF 输入界面实际可选择 2 或 3 个。
-- 在手动模式下建立人工连线：QC 阶段按项目配置选择覆盖全部物理时间轴的 LIF anchor 和 MS760；细胞标注阶段点击任一项目 LIF 通道峰和一个 MS760 峰建立严格二元组。
-- 通过任务阶段切换候选列表和连线显示：`QC 校正 / 后段局部校正 / QC 巡检 / 细胞标注`。
+- 对自动 QC anchor 组进行 `pending / accepted / rejected` 审核。项目可配置 2-4 个 QC anchor 通道。
+- 每条 LIF 可独立配置为 QC-only、cell-only、both 或 disabled；QC 证据和细胞二元组只消费各自角色允许的通道。
+- 在手动模式下建立人工连线：QC 模式按 anchor 配置选择 LIF 峰和 MS760；细胞模式只允许 cell 角色通道与 MS760 建立严格二元组。
+- 通过任务阶段切换候选列表和连线显示：`QC 校正 / 后段局部校正 / 事件标注`。第三阶段内可切换“全部 / QC / 细胞”。
 - 后段局部校正冻结前，QC 巡检和细胞标注候选不会生成，侧栏也不显示后段人工审核工具；后端同时拒绝直接 review 后段候选。
-- QC 校正段后生成 QC 巡检候选 anchor 组；这些候选在冻结的 time model 下显示，并和细胞标注结果隔离。
-- `annotation_start_min` 后生成高保守细胞候选；每个项目 LIF 通道分别用对应轨道颜色虚线连接到 MS760。
+- QC 校正段后生成 QC 巡检候选 anchor 组；这些候选在冻结的 time model 下显示，并和细胞标注保持独立语义。
+- `annotation_start_min` 后生成高保守细胞候选；只有 canonical event map 白名单内的 `ms_event_id` 能进入第三阶段候选或后端手工写入。
+- 独立 UMAP 窗口只显示 canonical 五列表的坐标。颜色完全由当前 SQLite accepted 状态投影；主窗口写入会立即同步，点击 UMAP 点会让主窗口定位到同一 `ms_event_id`。
 - 将人工审核状态和 audit log 保存到本地 SQLite。
-- 顶部“新建项目”支持选择项目保存路径、3 个 LIF 文件和 1 个 MS 文件，生成标注所需中间表并切换到新项目；“打开项目”支持加载已有 parquet + SQLite 项目。
+- 顶部“新建项目”支持动态添加/删除 2-4 个 LIF 输入、配置两类角色并选择事件坐标 CSV；“打开项目”支持加载已有 parquet + SQLite 项目。
 - 导出当前所有 `accepted + exportable` annotation CSV，并在 SQLite `export_runs` 中记录导出时间、过滤条件、行数和 CSV sha256。
 
 当前不做：
 
-- 不做 feature extraction、h5ad、UMAP 或下游分析。
+- 不做 feature extraction、h5ad、UMAP 降维计算、标签传播、分类器训练或下游分析；这里只消费外部 UMAP 坐标用于审核导航。
 
 ## 显示轨道
 
-当前窗口中显示五条同步轨道：项目配置的 3 条 LIF 通道，以及固定的 `MS 760 / PC34`、`MS 782 / QC`。LIF 通道名和身份先验来自 `lifms_project.json`，不再固定假设为 G2/R1/R2。
+当前窗口显示项目配置的 2-4 条 LIF 轨道，以及固定的 `MS 760 / PC34`、`MS 782 / QC`。原始 trace 不会因角色或 map 白名单被裁剪：角色只控制阶段参与，map 只控制第三阶段 MS event 的可交互性。
 
 MS 760 和 MS 782 使用线性强度显示，不使用 log 坐标。
 
@@ -141,13 +143,17 @@ MVP 阶段不单独引入 `superseded`。如果一条连线被撤销、更新或
 
 用于冲洗和阀切换后、正式细胞标注前的局部 MS 平移确认。软件从 `annotation_start_min` 后开头一段峰估计 `MS local delta`，人工可以微调并冻结 time model version。
 
-### QC 巡检
+### 事件标注
+
+第三阶段把 QC 巡检和细胞标注放在同一时间窗口中，以“全部 / QC / 细胞”筛选和“QC anchor / 细胞二元组”手工模式区分。两类审核可任意先后，但同一个 `ms_event_id` 在当前 time model 下只能有一种 active accepted 语义；改判必须先撤销原记录。第三阶段禁用整窗批量接受。
+
+#### QC 巡检
 
 用于后段局部校正冻结后继续检查 QC 事件。候选线沿用项目的动态 anchor 集合，逻辑和 QC 校正段一致，但语义不同：它们是后段 QC 证据和巡检对象，不等同于细胞 annotation。
 
 未冻结 delta 时不生成 QC 巡检候选，也不提供 accept/reject。delta 是否合适只在 `后段局部校正` 阶段通过同步图和残差统计判断。
 
-### 细胞标注
+#### 细胞标注
 
 用于 `annotation_start_min` 之后的细胞区段。高保守候选只在满足以下第一性原理条件时生成：LIF 峰 SNR 足够高、LIF 峰间距足够大、MS760 峰强度足够高、MS event 与 LIF 峰在冻结 time model 上唯一近邻、且没有 close/merge/collision/low-quality 风险。连线不使用三元组折线，而是单通道连接到 MS760：
 
@@ -155,7 +161,7 @@ MVP 阶段不单独引入 `superseded`。如果一条连线被撤销、更新或
 - `R1 / Day9 -> MS760`：紫色虚线。
 - `R2 / Day3 -> MS760`：橙色虚线。
 
-人工细胞标注是严格二元组：必须选择一个 LIF 峰（G2、R1 或 R2）和一个 MS760 PC34 primary event。若该二元组正好等于当前自动 cell candidate，软件直接接受自动候选，避免重复记录；否则保存为 `source=manual_created`、`candidate_type=manual_cell_pair`、`review_status=accepted`。细胞二元组的残差为 `MS760 校正后时间 - LIF 校正后时间`。
+人工细胞标注是严格二元组：必须选择一个具有 cell 角色的 LIF 峰和一个 map 白名单内的 MS760 PC34 primary event。若该二元组正好等于当前自动 cell candidate，软件直接接受自动候选，避免重复记录；否则保存为 `source=manual_created`、`candidate_type=manual_cell_pair`、`review_status=accepted`。细胞二元组的残差为 `MS760 校正后时间 - LIF 校正后时间`。
 
 细胞标注阶段会显示前面 QC 巡检中已经接受的 QC anchor；如果某个 MS760 event 已经在 QC 巡检中被接受为 QC，它不会再进入自动细胞候选，也不能直接手动建立为 cell pair。若需要改判，应先回到 QC 巡检清除或修改对应 QC 记录。
 
@@ -171,6 +177,8 @@ MVP 阶段不单独引入 `superseded`。如果一条连线被撤销、更新或
 - QC 行按项目 anchor 集合导出；缺失通道在兼容峰 ID 列写为 `NA`，完整动态映射写入 `qc_anchor_*_json`。
 - 细胞行是严格 LIF-MS760 二元组，包含 `lif_channel/lif_peak_id/lif_raw_time_min/lif_plot_time_min`。
 - 后段 QC 巡检和细胞标注默认只导出当前 frozen time model version 下的记录，避免重新冻结 delta 后导出旧模型结果。
+- 第三阶段行追加 `UMAP1/UMAP2/cell_event_map_sha256`；前段 QC 校正行保持空值。
+- source CSV 的 `Type/leiden/CellNumber` 从未载入 canonical map，也不会进入导出。
 - 导出的 `annotation_label` 同时配套 `label_source`。例如 `Day3 cell` 表示人工接受了 R2-MS760 二元组，`Day3` 来自原始文件名/项目配置中的通道身份先验，不是作者 CSV/h5ad 标签。
 - 导出文件同时下载到浏览器，并保存到 `annotation_app/annotations/exports/`。
 
@@ -199,17 +207,17 @@ MVP 阶段不单独引入 `superseded`。如果一条连线被撤销、更新或
 顶部“新建项目”执行以下步骤：
 
 1. 用户填写新的项目保存路径。
-2. 用户填写 3 个 LIF 原始文件路径，并为每个文件填写真实通道名和身份先验；通道不固定为 G2/R1/R2。
+2. 用户动态配置 2-4 个 LIF 原始文件，为每个文件填写真实通道名、身份先验，并独立选择 QC 与 cell 角色；通道不固定为 G2/R1/R2。
 3. 用户填写 1 个 MS 原始文件路径。
-4. 用户在动态列表中选择 QC anchor 通道。数据契约允许 2-4 个且必须覆盖所有物理时间轴；当前导入器固定 3 个 LIF 输入，所以界面实际允许选择 2 或 3 个，并至少包含一个 green_axis 和一个 red_axis 通道。
-5. 用户选择 raw inputs 管理方式：`external_reference` 不复制原始文件；`copy_into_project` 将原始文件复制到 `raw_inputs/`。
-6. 软件写入 `lifms_project.json` 和输入锁，只包含这 4 个原始输入及 `acquisition_layout`。
-7. 软件运行 LIF trace/peak calling 和 MS event calling，生成浏览标注所需的 4 个 parquet 中间表。
-8. 新建成功后，浏览器切换到新项目自己的 SQLite 和中间表。
+4. 用户选择事件坐标 CSV。导入器只读取 `scan_start_time/UMAP1/UMAP2`，以 0.01 sec 容差一对一匹配 `pc34_primary / pc34_760_max_intensity`，并把 canonical 五列表复制进项目。
+5. QC anchor 必须选择 2-4 个、覆盖所有 cell 角色使用的物理时间轴，并至少包含一个 green 和一个 red detector；至少一个通道必须具有 cell 角色。
+6. 用户选择 raw inputs 管理方式：`external_reference` 不复制原始文件；`copy_into_project` 将原始文件复制到 `raw_inputs/`。
+7. 软件在同级 staging 目录运行前处理、写入 manifest/canonical map 并验证完整性；全部成功后用单次目录重命名发布，失败不会留下半成品项目。
+8. 最终路径发布后才初始化项目 SQLite 并切换到新项目。
 
 新建过程不读取作者 CSV、h5ad、manual、V2 或 archive 输入。
 
-顶部“打开项目”按项目目录加载标准中间表和 `annotation_app/annotations/annotation.sqlite`。如果存在 `lifms_project.json`，软件会先按 manifest 指向的路径加载并校验 4 个 parquet 的全量 SHA256；随后校验 SQLite 自身保存的 `project_table_binding`，并确认 SQLite 中引用的 LIF peak_id 和 MS event_id 均存在于当前 parquet，校验通过后才写入运行态记录。没有 manifest 的旧 Linux 项目只允许走一次 legacy adoption：通过 SQLite `input_manifest` 大小记录和 ID 完整性检查后，软件会补写 `lifms_project.json` 和 SQLite binding。
+顶部“打开项目”按项目目录加载标准中间表和 `annotation_app/annotations/annotation.sqlite`。如果存在 `lifms_project.json`，软件先校验 4 个 parquet 的全量 SHA256、SQLite `project_table_binding`，并确认历史 peak/event ID 仍存在。schema-v1 项目按原布局只读解释，打开不会补写 manifest、binding、input manifest 或 time-model layout hash。没有 event map 的旧项目仍按原未过滤第三阶段工作；用户可在配置页显式执行一次性附加，附加前会确认所有已有 accepted 后段 event 都在新 map 中。
 
 当前兼容层读取的 4 个中间表：
 
@@ -226,10 +234,10 @@ MVP 阶段不单独引入 `superseded`。如果一条连线被撤销、更新或
 
 输入边界：
 
-- MVP-1 不读取作者 CSV。
-- MVP-1 不读取 h5ad。
-- MVP-1 不读取 V2、manual、override 或 archive 数据。
-- 当前候选生成不加载作者 CSV/h5ad，也不加载 V2、manual、override 或 archive 数据。
+- 四个第一性原理 parquet 仍是 trace/peak/event 的唯一数据源。
+- event-map source CSV 只允许坐标三列；`Type/leiden/CellNumber` 等额外列不载入。
+- 不读取 h5ad、V2、manual、override 或 archive 数据。
+- 所有长期关联与状态同步使用 canonical `ms_event_id`，不使用浮点时间或 UMAP 行号。
 
 当前 QC anchor 组和高保守细胞候选由 app 内基于 LIF peaks、MS events、MS scan summary 的第一性原理时间匹配生成，不读取作者 CSV/h5ad。后续如果接入外部候选 parquet，也必须只使用不依赖作者 CSV/h5ad 的第一性原理字段。
 
@@ -246,16 +254,17 @@ MVP 阶段不单独引入 `superseded`。如果一条连线被撤销、更新或
 
 ## 泄露与泛化边界
 
-当前 MVP 不涉及人工标签泄露：
+当前实现把坐标输入和标签输入严格分离：
 
-- 后端只读取 4 个第一性原理前处理中间表：LIF trace、LIF peaks、MS events、MS scan summary。
+- 后端用 4 个第一性原理中间表生成轨道、peak/event 与候选；event-map CSV 只提供三列坐标和第三阶段白名单。
 - LIF 峰来自原始 LIF trace 的 baseline/noise/peak calling，不来自作者 CSV、h5ad 或人工补峰。
-- MS event 来自原始 MS txt 中预先指定的 PC34/760.5851 和 QC support 782.5616 marker，不来自作者标签或下游 h5ad/UMAP。
+- MS event 来自原始 MS txt 中预先指定的 PC34/760.5851 和 QC support 782.5616 marker，不来自作者标签或 h5ad。
+- UMAP 初始颜色不来自 source CSV；未标注为灰、accepted QC 为黑、accepted cell 使用对应 LIF 通道色，冲突由 SQLite 当前状态显式计算。
 - shift-only 校正和 QC anchor 匹配只使用 QC 段实验事实、项目配置 anchor/MS760 的原始峰时间、物理 time axis、时间平移和残差容差。
 - `Rd0 / Day0`、`Rd1 / Day3`、`Rd3 / Day9` 是实验通道身份先验。当前 app 会优先从原始数据文件名（例如 `CAR-T_Day0-G2_Day3-R2_Day9-R1_batch03.txt` 或 LIF CSV 文件名）推断 `G2/R2/R1 -> Day0/Day3/Day9`，导出时写入 `channel_identity_prior` 和 `channel_identity_prior_source`，不从作者 CSV/h5ad 推断。
 - `phase` 字段是按时间切段生成的辅助字段，不是人工标签；当前 app 的 QC anchor 匹配不依赖该字段。
 
-因此，这套 MVP 原理上可以迁移到 G1/G2/R1 等新布局，前提是项目明确记录 3 条有效 LIF 原始轨道、QC anchor 集合与 time axis、MS 760/782 marker 和 QC 校准段，并重新运行第一性原理前处理。新数据如果更换 marker、通道数、采集窗口或 QC 时长，需要先扩展并确认这些显式实验先验，而不是导入旧人工标签。
+因此，这套流程可迁移到任意 2-4 通道布局，前提是项目明确记录通道角色、QC anchor 集合与 time axis、MS 760/782 marker、QC 校准段和 canonical event map，并重新运行第一性原理前处理。新数据如果更换 marker、采集窗口或 QC 时长，需要先扩展并确认这些显式实验先验，而不是导入旧人工标签。
 
 ## 本机启动
 

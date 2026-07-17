@@ -1,7 +1,11 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
+from scripts.v3 import run_v3_01_lif_trace_physical_qc as lif_qc
 from scripts.v3.run_v3_01_lif_trace_physical_qc import red_detector_audit
 
 
@@ -52,6 +56,66 @@ class RedDetectorAuditTest(unittest.TestCase):
         self.assertEqual(first["r2_peak_count"], 1)
         self.assertAlmostEqual(first["offset_mode_sec"], first["r2_minus_r1_offset_mode_sec"])
         self.assertAlmostEqual(first["offset_mode_sec"], -first["right_minus_left_offset_mode_sec"])
+
+
+class VariableChannelInputTest(unittest.TestCase):
+    def make_lock(self, root: Path, channels: list[str]) -> None:
+        rows = []
+        for index, channel in enumerate(channels):
+            path = root / f"{channel}.csv"
+            path.write_bytes(f"trace-{channel}-{index}".encode("ascii"))
+            fingerprint = lif_qc.file_fingerprint(path)
+            rows.append(
+                {
+                    "input_id": f"lif_{index + 1}_raw",
+                    "path": str(path),
+                    "input_class": "raw_lif_trace",
+                    "channel": channel,
+                    "label": channel,
+                    "detector": "green" if channel.startswith("G") else "red",
+                    "allowed_stage": "V3-01~V3-06 main workflow",
+                    **fingerprint,
+                }
+            )
+        lock = root / "results/tables/v3/00_allowed_inputs.csv"
+        lock.parent.mkdir(parents=True)
+        pd.DataFrame(rows).to_csv(lock, index=False)
+
+    def test_input_lock_accepts_two_and_four_lif_channels(self):
+        original_root = lif_qc.ROOT
+        try:
+            for channels in (["G1", "R1"], ["G1", "G2", "R1", "R2"]):
+                with self.subTest(channels=channels), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.make_lock(root, channels)
+                    lif_qc.configure_project_root(root)
+                    specs = lif_qc.load_channel_specs()
+                    self.assertEqual([spec.channel for spec in specs], channels)
+        finally:
+            lif_qc.configure_project_root(original_root)
+
+    def test_overview_plot_allocates_one_axis_per_channel(self):
+        traces = pd.DataFrame(
+            [
+                {"channel": channel, "time_min": time, "signal": time + index}
+                for index, channel in enumerate(["G1", "G2", "R1", "R2"])
+                for time in [0.0, 1.0]
+            ]
+        )
+        peaks = pd.DataFrame(
+            [
+                {"channel": channel, "time_min": 0.5, "height": 1.0, "peak_stage": "merged"}
+                for channel in ["G1", "G2", "R1", "R2"]
+            ]
+        )
+        captured = []
+
+        with mock.patch.object(lif_qc, "save_png", side_effect=lambda fig, _path: captured.append(fig)):
+            lif_qc.plot_trace_overview(traces, peaks)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(captured[0].axes), 4)
+        lif_qc.plt.close(captured[0])
 
 
 if __name__ == "__main__":

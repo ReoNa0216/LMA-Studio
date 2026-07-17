@@ -1,0 +1,283 @@
+import csv
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import pandas as pd
+
+from annotation_app.app import (
+    AppData,
+    AnnotationStore,
+    BadRequest,
+    ProjectPaths,
+    acquisition_layout_hash,
+)
+
+
+def frozen_store(path: Path, layout: dict) -> AnnotationStore:
+    store = AnnotationStore(path)
+    store.upsert_time_model(
+        {
+            "time_model_version": "tm-current",
+            "status": "frozen",
+            "base_model_name": "test",
+            "qc_calibration_end_min": 10.5,
+            "sample_valve_switch_min": 36.0,
+            "annotation_start_min": 40.0,
+            "local_delta_seed_window_min": 2.5,
+            "ms_local_delta_sec": 0.0,
+            "contains_cell_labels": False,
+            "max_training_time_min": 42.5,
+            "evidence_count": 2,
+            "unique_match_count": 2,
+            "conflict_count": 0,
+            "median_abs_residual_sec": 0.0,
+            "p90_abs_residual_sec": 0.0,
+            "acquisition_layout_hash": acquisition_layout_hash(layout),
+        },
+        action="test_frozen",
+    )
+    return store
+
+
+def make_app(root: Path, *, with_map: bool) -> AppData:
+    layout = {
+        "layout_version": 3,
+        "lif_channels": [
+            {
+                "input_id": "g1",
+                "channel": "G1",
+                "identity_prior": "LK",
+                "time_axis": "green_axis",
+                "detector": "green",
+                "use_for_cell_annotation": True,
+            },
+            {
+                "input_id": "r1",
+                "channel": "R1",
+                "identity_prior": "",
+                "time_axis": "red_axis",
+                "detector": "red",
+                "use_for_cell_annotation": False,
+            },
+        ],
+        "qc_anchor_channels": ["G1", "R1"],
+    }
+    event_map = (
+        pd.DataFrame(
+            [
+                {
+                    "ms_event_id": "ms-1",
+                    "scan_id": "scan-1",
+                    "scan_start_time": 41.0,
+                    "UMAP1": 1.25,
+                    "UMAP2": -2.5,
+                }
+            ]
+        )
+        if with_map
+        else None
+    )
+    manifest = {
+        "project_id": "project-test",
+        "project_schema_version": 1,
+        "acquisition_layout": layout,
+        "channel_identity_prior": {"G1": "LK", "R1": ""},
+        "intermediate_tables": {},
+    }
+    (root / "lifms_project.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return AppData(
+        project=ProjectPaths.from_args(
+            project_dir=str(root),
+            annotation_db=str(root / "annotation.sqlite"),
+        ),
+        lif_traces=pd.DataFrame(),
+        lif_peaks=pd.DataFrame(
+            [
+                {
+                    "peak_id": "g1-1",
+                    "channel": "G1",
+                    "time_min": 41.0,
+                    "time_sec": 2460.0,
+                },
+                {
+                    "peak_id": "r1-1",
+                    "channel": "R1",
+                    "time_min": 41.0,
+                    "time_sec": 2460.0,
+                },
+            ]
+        ),
+        ms_events=pd.DataFrame(
+            [
+                {
+                    "event_id": "ms-1",
+                    "scan_id": "scan-1",
+                    "time_min": 41.0,
+                    "time_sec": 2460.0,
+                    "event_strategy": "pc34_primary",
+                    "primary_signal_col": "pc34_760_max_intensity",
+                },
+                {
+                    "event_id": "ms-outside",
+                    "scan_id": "scan-outside",
+                    "time_min": 42.0,
+                    "time_sec": 2520.0,
+                    "event_strategy": "pc34_primary",
+                    "primary_signal_col": "pc34_760_max_intensity",
+                },
+            ]
+        ),
+        ms_scan=pd.DataFrame(),
+        alignment={
+            "model": "test",
+            "axis_shifts_sec": {"green_axis": 0.0, "red_axis": 0.0},
+            "green_to_ms_shift_sec": 0.0,
+            "red_to_ms_shift_sec": 0.0,
+            "qc_groups": {"groups": []},
+            "acquisition_layout_hash": acquisition_layout_hash(layout),
+        },
+        store=frozen_store(root / "annotation.sqlite", layout),
+        channel_identity_prior={
+            "G1": {"identity_prior": "LK", "identity_prior_source": "test"},
+            "R1": {"identity_prior": "", "identity_prior_source": "test"},
+        },
+        acquisition_layout=layout,
+        manifest=manifest,
+        cell_event_map=event_map,
+        cell_event_map_info=(
+            {"sha256": "map-sha", "row_count": 1}
+            if with_map
+            else None
+        ),
+    )
+
+
+class UmapAppStateTest(unittest.TestCase):
+    def test_backend_whitelist_and_cross_classification_conflict(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(Path(tmp), with_map=True)
+            with self.assertRaisesRegex(BadRequest, "白名单"):
+                app.require_third_stage_event_in_map("ms-outside")
+
+            qc_payload = {
+                "review_stage": "qc_survey",
+                "candidate_type": "manual_qc_anchor_partial",
+                "ms_event_id": "ms-1",
+                "ms_time_min": 41.0,
+                "time_model_version": "tm-current",
+                "label": "QC",
+            }
+            app.store.upsert_review(
+                annotation_id="qc-1",
+                source="manual_created",
+                review_status="accepted",
+                payload=qc_payload,
+                action="test_accept",
+            )
+            before = app.projected_cell_event_map_state()
+            self.assertEqual(before["counts"], {"cell": 0, "qc": 1, "unknown": 0, "conflict": 0})
+
+            with self.assertRaisesRegex(BadRequest, "只能有一个"):
+                app.ensure_third_stage_acceptance_allowed(
+                    {
+                        "review_stage": "cell_annotation",
+                        "candidate_type": "manual_cell_pair",
+                        "ms_event_id": "ms-1",
+                        "time_model_version": "tm-current",
+                    },
+                    annotation_id="cell-1",
+                )
+
+            app.store.upsert_review(
+                annotation_id="qc-1",
+                source="manual_created",
+                review_status="rejected",
+                payload=qc_payload,
+                action="test_revoke",
+            )
+            after = app.projected_cell_event_map_state()
+            self.assertEqual(after["counts"]["unknown"], 1)
+            self.assertNotEqual(before["revision"], after["revision"])
+
+    def test_one_time_attach_preserves_annotations_and_time_model(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            app = make_app(root, with_map=False)
+            payload = {
+                "review_stage": "cell_annotation",
+                "candidate_type": "manual_cell_pair",
+                "ms_event_id": "ms-1",
+                "ms_time_min": 41.0,
+                "time_model_version": "tm-current",
+                "lif_channel": "G1",
+            }
+            app.store.upsert_review(
+                annotation_id="cell-1",
+                source="manual_created",
+                review_status="accepted",
+                payload=payload,
+                action="test_accept",
+            )
+            source = root / "source.csv"
+            with source.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["scan_start_time", "UMAP1", "UMAP2", "Type", "leiden"])
+                writer.writerow([41.0, 3.0, 4.0, "AUTHOR_LABEL", "cluster-7"])
+
+            records_before = app.store.records()
+            model_before = app.store.active_time_model()
+            attached = app.attach_cell_event_map(source)
+
+            self.assertEqual(attached.store.records(), records_before)
+            self.assertEqual(attached.store.active_time_model(), model_before)
+            self.assertIsNotNone(attached.cell_event_map)
+            self.assertEqual(len(attached.cell_event_map), 1)
+            canonical_text = (
+                root / "data/interim/lma/cell_event_umap.csv"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("Type", canonical_text)
+            self.assertNotIn("AUTHOR_LABEL", canonical_text)
+            manifest = json.loads((root / "lifms_project.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["cell_event_map"]["row_count"], 1)
+            with self.assertRaisesRegex(BadRequest, "不支持替换"):
+                attached.attach_cell_event_map(source)
+
+    def test_export_adds_coordinates_only_for_third_stage(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(Path(tmp), with_map=True)
+            base = {
+                "annotation_id": "cell-1",
+                "source": "manual_created",
+                "review_status": "accepted",
+                "candidate_type": "manual_cell_pair",
+                "ms_event_id": "ms-1",
+                "lif_channel": "G1",
+                "lif_peak_id": "g1-1",
+            }
+
+            cell = app.export_row(
+                base,
+                stage="cell_annotation",
+                export_id="export",
+                exported_at="now",
+            )
+            early_qc = app.export_row(
+                {**base, "candidate_type": "manual_qc_triplet"},
+                stage="qc_calibration",
+                export_id="export",
+                exported_at="now",
+            )
+
+        self.assertEqual((cell["UMAP1"], cell["UMAP2"]), (1.25, -2.5))
+        self.assertEqual(cell["cell_event_map_sha256"], "map-sha")
+        self.assertIsNone(early_qc["UMAP1"])
+        self.assertNotIn("Type", app.export_columns())
+
+
+if __name__ == "__main__":
+    unittest.main()

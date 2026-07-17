@@ -38,6 +38,8 @@ RED_PAIR_BIN_SEC = 0.25
 RED_NEAR_ZERO_HALF_WIDTH_SEC = 0.75
 QC_START_MAX_MIN = 10.5
 PRE_RUN_MAX_MIN = 40.0
+MIN_LIF_INPUTS = 2
+MAX_LIF_INPUTS = 4
 PHASE_BOUNDARIES_MIN = "qc_start:0-10.5 all-QC calibration; pre_run:10.5-40 transition/quiet; cell_run:>=40 acquisition"
 
 FORBIDDEN_PATH_PARTS = [
@@ -132,8 +134,10 @@ def load_channel_specs() -> list[ChannelSpec]:
         raise FileNotFoundError(f"Run V3-00 first; missing {INPUT_LOCK}")
     allowed = pd.read_csv(INPUT_LOCK)
     lif = allowed[allowed["input_class"].eq("raw_lif_trace")].copy()
-    if len(lif) != 3:
-        raise ValueError(f"Expected 3 raw LIF inputs from V3-00, found {len(lif)}")
+    if not MIN_LIF_INPUTS <= len(lif) <= MAX_LIF_INPUTS:
+        raise ValueError(
+            f"Expected {MIN_LIF_INPUTS}-{MAX_LIF_INPUTS} raw LIF inputs from the input lock, found {len(lif)}"
+        )
     if not lif["allowed_stage"].eq("V3-01~V3-06 main workflow").all():
         bad = lif.loc[~lif["allowed_stage"].eq("V3-01~V3-06 main workflow"), ["input_id", "allowed_stage"]]
         raise ValueError(f"V3-01 received non-main-workflow inputs:\n{bad}")
@@ -659,8 +663,16 @@ def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
 
 def plot_trace_overview(traces: pd.DataFrame, peaks: pd.DataFrame) -> None:
     merged = peaks[peaks["peak_stage"].eq("merged")]
-    fig, axes = plt.subplots(3, 1, figsize=(10, 6.2), sharex=True)
-    colors = {"G2": "#2a9d55", "R2": "#c2410c", "R1": "#b91c1c"}
+    channels = list(dict.fromkeys(traces["channel"].astype(str).tolist()))
+    fig, axes = plt.subplots(
+        len(channels),
+        1,
+        figsize=(10, max(4.4, 1.9 * len(channels) + 0.5)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes = axes[:, 0]
+    colors = {"G1": "#2f6fed", "G2": "#176b45", "R1": "#6f4bb8", "R2": "#b95d18"}
     for ax, (channel, sub) in zip(axes, traces.groupby("channel", sort=False)):
         plot_sub = sub.iloc[:: max(1, len(sub) // 6000)].copy()
         ax.plot(plot_sub["time_min"], plot_sub["signal"], lw=0.55, color=colors.get(channel, "0.25"), label=channel)
@@ -707,7 +719,7 @@ def write_report(
         "",
         "## 结论",
         "",
-        "- 本步骤只读取 V3-00 的 `00_allowed_inputs.csv` 输入锁和其中允许的三个 raw LIF CSV；没有读取作者 CSV、h5ad、人工补峰或任何 V2 输出。",
+        f"- 本步骤只读取输入锁和其中允许的 {len(trace_meta)} 个 raw LIF CSV；没有读取作者 CSV、h5ad、人工补峰或任何 V2 输出。",
         "- 读取 raw LIF 前会校验 V3-00 记录的大小、首尾 1MB SHA256 和 full SHA256，避免锁定后文件变化或路径替换。",
         "- `qc_start` 明确定义为 0-10.5 min 全 QC 校准段，只能用于 QC/time-calibration 审计；不作为普通 CAR-T 细胞段解释。",
         "- 每个 channel 独立估计 baseline 和 noise，再用物理峰宽、prominence/SNR 和近邻风险生成 raw peak 与 merged peak。",

@@ -6,17 +6,20 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Current Scope
 
-- Create a new annotation project from 3 LIF raw files and 1 MS raw file.
+- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a required single-cell event-coordinate CSV.
 - Open an existing project containing preprocessing parquet tables and `annotation_app/annotations/annotation.sqlite`.
-- Configure the 3 project LIF channels and select a 2-4 channel QC anchor set that covers every physical time axis and includes at least one green and one red detector. The current 3-input UI therefore exposes 2 or 3 selections.
+- Assign each LIF channel independently to QC calibration, cell annotation, both roles, or neither role. QC anchors must cover every physical time axis and include at least one green and one red detector.
 - Estimate one calibration shift per physical axis, so same-axis channels such as G1/G2 reinforce one green-axis estimate instead of creating extra shift parameters.
-- Review four workflow stages: QC calibration, local post-QC MS shift calibration, QC survey, and cell annotation.
-- Export accepted annotations with project-name timestamped CSV filenames.
+- Review three UI stages: QC calibration, local post-QC MS shift calibration, and a merged event-annotation stage containing explicit QC/cell filters.
+- Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
+- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; clicking a point focuses the same event in the main track window.
+- Export accepted annotations with project-name timestamped CSV filenames. Third-stage rows include UMAP coordinates and the canonical map SHA; early QC rows leave those fields blank.
 - Use external raw input references to avoid copying large MS files into every project.
+- Open schema-v1 projects without rewriting them. Projects without a map keep the legacy unfiltered workflow and can attach one map exactly once after compatibility checks.
 
 ## Desktop Releases
 
-Download the package for your platform from GitHub Releases.
+The latest formal GitHub Release remains v0.2.1 until the v0.3.0 Windows candidate completes user acceptance.
 
 Windows x64:
 
@@ -40,7 +43,7 @@ The macOS ARM64 build uses the native Cocoa/WebKit backend. It is an unsigned/no
 
 LMA Studio projects are directory-based. A project contains generated intermediate parquet tables, a project manifest, and the annotation SQLite database. Raw inputs can be referenced externally, which is recommended for large MS text files.
 
-The application package does not include user raw data, project SQLite databases, exported CSV files, author CSV files, or h5ad files.
+The application package does not include user raw data, project SQLite databases, canonical/source UMAP CSV files, parquet tables, exported CSV files, author CSV files, or h5ad files.
 
 ## Developer Build
 
@@ -65,5 +68,5 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.2.0 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.3.0-rc1 bash packaging/macos/build_macos.sh
 ```

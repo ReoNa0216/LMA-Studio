@@ -173,6 +173,8 @@ class WebViewPathDialog:
             dialog_type = self.webview.FileDialog.OPEN
             if file_role == "ms":
                 file_types = ("MS raw files (*.txt;*.csv)", "All files (*.*)")
+            elif file_role == "cell_event_map":
+                file_types = ("Cell event coordinate CSV (*.csv)", "All files (*.*)")
             else:
                 file_types = ("LIF raw files (*.csv;*.txt)", "All files (*.*)")
         selected = self.window.create_file_dialog(
@@ -223,6 +225,74 @@ class DesktopServer:
         LOGGER.info("Local application server stopped")
 
 
+class DesktopApi:
+    """Small pywebview bridge that owns exactly one auxiliary UMAP window."""
+
+    def __init__(self, server: DesktopServer, webview_module: Any) -> None:
+        # pywebview recursively inspects every public attribute on ``js_api``.
+        # Keep the bridge state private so it cannot walk from the server into
+        # AppData/DataFrames while constructing the JavaScript API surface.
+        self._server = server
+        self._webview = webview_module
+        self._main_window: Any | None = None
+        self._umap_window: Any | None = None
+        self._lock = threading.RLock()
+
+    def _bind_main_window(self, window: Any) -> None:
+        self._main_window = window
+
+    def _forget_umap_window(self, window: Any) -> None:
+        with self._lock:
+            if self._umap_window is window:
+                self._umap_window = None
+
+    def open_umap_window(self) -> dict[str, Any]:
+        with self._lock:
+            existing = self._umap_window
+            if existing is not None:
+                try:
+                    existing.restore()
+                except Exception:
+                    LOGGER.debug("UMAP window restore is unavailable", exc_info=True)
+                try:
+                    existing.show()
+                    return {"ok": True, "created": False}
+                except Exception:
+                    LOGGER.info("Existing UMAP window is no longer available; recreating it")
+                    self._umap_window = None
+
+            window = self._webview.create_window(
+                f"{APP_DISPLAY_NAME} · UMAP",
+                f"{self._server.url}umap",
+                width=900,
+                height=720,
+                min_size=(560, 420),
+                resizable=True,
+                text_select=True,
+                zoomable=True,
+                background_color="#f7f8fa",
+            )
+            if window is None:
+                raise RuntimeError("无法创建 UMAP 窗口")
+            self._umap_window = window
+
+            def forget() -> None:
+                self._forget_umap_window(window)
+
+            window.events.closed += forget
+            return {"ok": True, "created": True}
+
+    def _close_umap_window(self) -> None:
+        with self._lock:
+            window = self._umap_window
+            self._umap_window = None
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                LOGGER.debug("UMAP window was already closed", exc_info=True)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"运行 {APP_DISPLAY_NAME} 桌面应用。")
     parser.add_argument("--project-dir", default=None)
@@ -258,6 +328,7 @@ def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) 
     )
     data = initial_app_data(project, project_selected=project_selected)
     server = DesktopServer(data)
+    desktop_api = DesktopApi(server, webview_module)
     webview_module.settings["ALLOW_DOWNLOADS"] = True
     webview_module.settings["SHOW_DEFAULT_MENUS"] = False
     window = webview_module.create_window(
@@ -270,10 +341,12 @@ def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) 
         text_select=True,
         zoomable=True,
         background_color="#f6f7f9",
+        js_api=desktop_api,
     )
     if window is None:
         server.stop()
         raise RuntimeError("无法创建 LMA Studio 应用窗口")
+    desktop_api._bind_main_window(window)
     server.set_path_dialog(WebViewPathDialog(window, webview_module))
 
     def block_unsafe_close() -> bool | None:
@@ -283,11 +356,13 @@ def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) 
         return False
 
     window.events.closing += block_unsafe_close
+    window.events.closed += desktop_api._close_umap_window
     server.start()
     try:
         gui = "edgechromium" if sys.platform == "win32" else None
         webview_module.start(gui=gui, debug=bool(args.debug), private_mode=True)
     finally:
+        desktop_api._close_umap_window()
         server.stop()
 
 

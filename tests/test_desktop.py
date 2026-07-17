@@ -9,6 +9,7 @@ import uuid
 
 from annotation_app.app import BootstrapAppData, ProjectPaths, RequestActivity
 from annotation_app.desktop import (
+    DesktopApi,
     DesktopServer,
     SingleInstanceGuard,
     WebViewPathDialog,
@@ -54,6 +55,14 @@ class DesktopPathDialogTest(unittest.TestCase):
         self.assertTrue(result["cancelled"])
         self.assertEqual(window.calls[0][0], FakeFileDialog.OPEN)
         self.assertIn("*.txt;*.csv", window.calls[0][1]["file_types"][0])
+
+    def test_uses_cell_event_map_csv_filter(self):
+        window = FakeWindow(None)
+
+        WebViewPathDialog(window, FakeWebView())("file", file_role="cell_event_map")
+
+        self.assertIn("*.csv", window.calls[0][1]["file_types"][0])
+        self.assertNotIn("*.txt", window.calls[0][1]["file_types"][0])
 
     def test_rejects_unknown_dialog_kind(self):
         with self.assertRaises(ValueError):
@@ -109,6 +118,95 @@ class DesktopServerTest(unittest.TestCase):
             self.assertNotEqual(probe.connect_ex((host, port)), 0)
         finally:
             probe.close()
+
+
+class FakeEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def fire(self):
+        for handler in list(self.handlers):
+            handler()
+
+
+class FakeEvents:
+    def __init__(self):
+        self.closed = FakeEvent()
+
+
+class FakeAuxWindow:
+    def __init__(self):
+        self.events = FakeEvents()
+        self.restore_count = 0
+        self.show_count = 0
+        self.destroy_count = 0
+
+    def restore(self):
+        self.restore_count += 1
+
+    def show(self):
+        self.show_count += 1
+
+    def destroy(self):
+        self.destroy_count += 1
+        self.events.closed.fire()
+
+
+class FakeWindowFactory:
+    def __init__(self):
+        self.windows = []
+
+    def create_window(self, *args, **kwargs):
+        window = FakeAuxWindow()
+        self.windows.append((args, kwargs, window))
+        return window
+
+
+class FakeServerUrl:
+    url = "http://127.0.0.1:12345/"
+
+
+class DesktopApiTest(unittest.TestCase):
+    def test_js_api_surface_does_not_expose_recursive_state(self) -> None:
+        api = DesktopApi(FakeServerUrl(), FakeWindowFactory())
+
+        self.assertTrue(all(name.startswith("_") for name in vars(api)))
+        public_methods = {
+            name
+            for name in dir(api)
+            if not name.startswith("_") and callable(getattr(api, name))
+        }
+        self.assertEqual(public_methods, {"open_umap_window"})
+
+    def test_umap_window_is_singleton_and_recreated_after_close(self):
+        webview = FakeWindowFactory()
+        api = DesktopApi(FakeServerUrl(), webview)
+
+        self.assertTrue(api.open_umap_window()["created"])
+        first = webview.windows[0][2]
+        self.assertFalse(api.open_umap_window()["created"])
+        self.assertEqual(first.restore_count, 1)
+        self.assertEqual(first.show_count, 1)
+        self.assertEqual(len(webview.windows), 1)
+
+        first.events.closed.fire()
+        self.assertTrue(api.open_umap_window()["created"])
+        self.assertEqual(len(webview.windows), 2)
+
+    def test_closing_main_owned_state_destroys_umap_only(self):
+        webview = FakeWindowFactory()
+        api = DesktopApi(FakeServerUrl(), webview)
+        api.open_umap_window()
+        auxiliary = webview.windows[0][2]
+
+        api._close_umap_window()
+
+        self.assertEqual(auxiliary.destroy_count, 1)
+        self.assertIsNone(api._umap_window)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows mutex semantics")

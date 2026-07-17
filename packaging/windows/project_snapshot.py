@@ -83,9 +83,9 @@ def project_snapshot(project: Path) -> dict[str, Any]:
             conn,
             "input_manifest",
             order_by="input_key",
-            # A regression copy is opened at a different absolute path. Identity is
-            # carried by the input key, size, and mtime; the stored path is expected
-            # to rebind to the copy.
+            # Absolute provenance paths may differ between transfer copies.
+            # Identity is carried by the key, size, and mtime; opening a legacy
+            # project must not rewrite this table merely to rebind paths.
             ignored_columns=frozenset({"relative_path", "recorded_at", "app_version"}),
         )
     finally:

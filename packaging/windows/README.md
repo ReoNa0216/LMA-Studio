@@ -49,6 +49,6 @@ The desktop host requires Microsoft Edge WebView2 Runtime. Windows 11 normally i
 ## Release Principles
 
 - Package only the application code and required preprocessing scripts.
-- Do not package user project directories, annotation SQLite databases, exports, raw input files, author CSV files, or h5ad files.
+- Do not package user project directories, annotation SQLite databases, exports, raw input files, source/canonical UMAP CSV files, parquet tables, author CSV files, or h5ad files.
 - User data remains under the project directory selected inside LMA Studio.
 - The packaged desktop app uses pywebview native file dialogs and does not bundle Tk/Tcl.

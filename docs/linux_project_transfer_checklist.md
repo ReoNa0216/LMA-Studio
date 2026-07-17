@@ -45,6 +45,17 @@ annotation_app/annotations/annotation.sqlite
 These four parquet files define the LIF peaks and MS events that the SQLite
 annotations point to.
 
+For a schema-v2 project, this canonical map is also required:
+
+```text
+data/interim/lma/cell_event_umap.csv
+```
+
+It is a five-column project asset (`ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`),
+not the original source CSV. Schema-v1 projects may legitimately have no map;
+they retain the legacy unfiltered third-stage workflow until the user explicitly
+attaches a map.
+
 ## Strongly Recommended Files
 
 These should also be moved with the project:
@@ -56,6 +67,7 @@ results/tables/v3/00_imported_raw_inputs.csv
 reports/import_project.md
 reports/import_preprocess.log
 annotation_app/annotations/exports/
+data/interim/lma/cell_event_umap.csv
 ```
 
 `raw_inputs/` is optional. The Windows app now supports two raw input modes:
@@ -168,6 +180,7 @@ D:\LIFMSProjects\Batch03\
   data\interim\v3\02_ms_event_calling\v3_02_ms_scan_summary.parquet
   annotation_app\annotations\annotation.sqlite
   lifms_project.json
+  data\interim\lma\cell_event_umap.csv
   results\tables\v3\
   reports\
 ```
@@ -207,8 +220,8 @@ Recommended fields:
 {
   "project_id": "uuid",
   "dataset_id": "stable dataset uuid or hash",
-  "project_schema_version": 1,
-  "created_by_app_version": "annotation_app_mvp1_review_sqlite",
+  "project_schema_version": 2,
+  "created_by_app_version": "lma_studio_v0.3.0",
   "raw_inputs": {
     "lif_g2": {
       "path": "D:\\RawData\\lif_g2.csv",
@@ -255,7 +268,48 @@ Recommended fields:
   },
   "annotation_db": {
     "path": "annotation_app/annotations/annotation.sqlite",
-    "schema_version": 1
+    "schema_version": 2
+  },
+  "acquisition_layout": {
+    "layout_version": 3,
+    "lif_channels": [
+      {
+        "input_id": "lif_g2_raw",
+        "channel": "G2",
+        "time_axis": "green_axis",
+        "detector": "green",
+        "identity_prior": "Day0",
+        "use_for_cell_annotation": true
+      },
+      {
+        "input_id": "lif_r1_raw",
+        "channel": "R1",
+        "time_axis": "red_axis",
+        "detector": "red",
+        "identity_prior": "QC-only",
+        "use_for_cell_annotation": false
+      },
+      {
+        "input_id": "lif_r2_raw",
+        "channel": "R2",
+        "time_axis": "red_axis",
+        "detector": "red",
+        "identity_prior": "Day3",
+        "use_for_cell_annotation": true
+      }
+    ],
+    "qc_anchor_channels": ["G2", "R1"]
+  },
+  "cell_event_map": {
+    "schema_version": 1,
+    "path": "data/interim/lma/cell_event_umap.csv",
+    "sha256": "...",
+    "source_sha256": "...",
+    "row_count": 417,
+    "matched_event_count": 417,
+    "time_unit": "min",
+    "match_tolerance_sec": 0.01,
+    "required_source_columns": ["scan_start_time", "UMAP1", "UMAP2"]
   },
   "channel_identity_prior": {
     "G2": "Day0",
@@ -270,13 +324,12 @@ for the four intermediate parquet files and a `project_table_binding` digest.
 The same binding is stored in SQLite `project_config`.
 
 When `lifms_project.json` is present, the app validates recorded
-intermediate-table fingerprints before it writes anything to
-`annotation.sqlite`. If a transferred Linux project does not yet have
-`lifms_project.json`, the Windows app treats the first successful open as a
-legacy adoption step: it checks SQLite `input_manifest` size records and
-annotation peak/event IDs, then writes `lifms_project.json` and the SQLite
-binding. This first adoption is compatibility evidence, not historical
-cryptographic proof. Subsequent opens are strictly bound by full parquet hashes.
+intermediate-table fingerprints before allowing mutations. Opening a schema-v1
+project is side-effect free: the app does not rewrite its manifest, SQLite
+binding/input manifest, annotations, or unhashed legacy time model. A project
+without an event map may use the explicit one-time attach action; that action
+first proves that every accepted post-start QC/cell `ms_event_id` is in the new
+map, then atomically records the canonical map and schema-v2 manifest metadata.
 
 ## Transfer Safety Rules
 
@@ -293,10 +346,11 @@ cryptographic proof. Subsequent opens are strictly bound by full parquet hashes.
 ## Practical Recommendation
 
 First move a complete Linux project directory and try opening it on Windows.
-If the project does not yet have `lifms_project.json`, open it once on Windows
-from the standard directory structure to perform legacy adoption. After that,
-share the adopted project directory with the generated `lifms_project.json` and
-updated `annotation.sqlite`.
+If the project does not yet have `lifms_project.json`, keep an untouched backup
+and first open a copy from the standard directory structure. Loading itself
+does not upgrade the project. If a map is needed, use the explicit attach action
+on the copy and then transfer the resulting canonical map and updated manifest
+together with the unchanged four parquet tables and SQLite.
 
 This avoids forcing you to redraw annotations while still moving the software
 toward a professional project-based model.

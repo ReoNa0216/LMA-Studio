@@ -3,8 +3,9 @@
 
 The app loads first-principles preprocessing tables, slices synchronized LIF/MS
 windows, records human review decisions in SQLite, and exports accepted
-annotations. It deliberately does not read author CSV, h5ad, manual labels, or
-V2 outputs for candidate generation or export.
+annotations. A coordinate source is restricted to three whitelisted columns;
+author labels, h5ad, manual labels, and V2 outputs never enter candidate
+generation or export.
 """
 
 from __future__ import annotations
@@ -34,8 +35,25 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urlparse
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import numpy as np
 import pandas as pd
+
+from annotation_app.cell_event_map import (
+    CELL_EVENT_MAP_RELATIVE_PATH,
+    DEFAULT_MATCH_TOLERANCE_SEC,
+    CellEventMapError,
+    cell_event_map_manifest_entry,
+    import_cell_event_map,
+    match_source_to_events,
+    project_annotation_state,
+    read_canonical_map,
+    state_revision,
+    write_canonical_map,
+)
+from annotation_app.umap_page import UMAP_HTML
 
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -62,7 +80,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "annotation_app_mvp1_review_sqlite"
+APP_VERSION = "lma_studio_v0.3.0"
 APP_DISPLAY_NAME = "LMA Studio"
 
 DEFAULT_WINDOW_MIN = 2.5
@@ -128,8 +146,11 @@ ANNOTATION_SOURCES = {"auto_candidate", "manual_created"}
 MISSING_PEAK_SYMBOL = "NA"
 NATIVE_DIALOG_KINDS = {"directory", "file"}
 PROJECT_MANIFEST_FILENAME = "lifms_project.json"
-PROJECT_SCHEMA_VERSION = 1
-ACQUISITION_LAYOUT_VERSION = 2
+PROJECT_SCHEMA_VERSION = 2
+ACQUISITION_LAYOUT_VERSION = 3
+PROJECT_TABLE_BINDING_SCHEMA_VERSION = 1
+MIN_LIF_INPUTS = 2
+MAX_LIF_INPUTS = 4
 MIN_QC_ANCHOR_CHANNELS = 2
 MAX_QC_ANCHOR_CHANNELS = 4
 QC_MATCHER_VERSION = "axis_aware_anchor_set_v2"
@@ -176,6 +197,8 @@ def choose_native_path(kind: str, title: str = "", initial_dir: str = "", file_r
                 )
             if file_role == "ms":
                 filetypes = [("MS raw files", "*.txt *.csv"), ("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
+            elif file_role == "cell_event_map":
+                filetypes = [("Cell event coordinate CSV", "*.csv"), ("CSV files", "*.csv"), ("All files", "*.*")]
             else:
                 filetypes = [("LIF raw files", "*.csv *.txt"), ("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")]
             return filedialog.askopenfilename(
@@ -342,11 +365,13 @@ def normalize_acquisition_layout(
                     "use_for_cell_annotation": True,
                 }
             )
-    if len(lif_channels) != 3:
-        raise BadRequest("项目必须配置正好 3 个 LIF 通道")
+    if not MIN_LIF_INPUTS <= len(lif_channels) <= MAX_LIF_INPUTS:
+        raise BadRequest(f"项目必须配置 {MIN_LIF_INPUTS}-{MAX_LIF_INPUTS} 个 LIF 通道")
     channels = [row["channel"] for row in lif_channels]
     if len(set(channels)) != len(channels):
         raise BadRequest("LIF 通道名不能重复")
+    if not any(bool(row.get("use_for_cell_annotation")) for row in lif_channels):
+        raise BadRequest("至少一个 LIF 通道必须用于细胞标注")
     if qc_anchor_channels is not None:
         raw_anchors = qc_anchor_channels
     elif isinstance(layout, dict) and "qc_anchor_channels" in layout:
@@ -486,6 +511,7 @@ def write_project_manifest(
     channel_identity_prior: dict[str, str],
     intermediate_tables: dict[str, dict[str, Any]] | None = None,
     acquisition_layout: dict[str, Any] | None = None,
+    cell_event_map: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_dir.mkdir(parents=True, exist_ok=True)
     binding = project_table_binding(intermediate_tables) if intermediate_tables else {}
@@ -510,6 +536,8 @@ def write_project_manifest(
         "channel_identity_prior": prior_values,
         "updated_at": now_iso(),
     }
+    if cell_event_map is not None:
+        manifest["cell_event_map"] = copy.deepcopy(cell_event_map)
     project_manifest_path(project_dir).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -540,6 +568,8 @@ def build_raw_input_project_records(
                 "channel": str(item.get("channel") or "").strip().upper(),
                 "identity_prior": str(item.get("identity_prior") or identities.get(str(item.get("channel") or "").strip().upper(), "")),
                 "time_axis": str(item.get("time_axis") or default_time_axis_for_channel(str(item.get("channel") or ""))),
+                "detector": str(item.get("detector") or ""),
+                "use_for_cell_annotation": bool(item.get("use_for_cell_annotation", True)),
             }
             for idx, item in enumerate(lif_inputs, start=1)
         ],
@@ -557,15 +587,16 @@ def build_raw_input_project_records(
                 channel_config["channel"],
                 channel_config.get("identity_prior", ""),
                 channel_config["detector"],
+                bool(channel_config.get("use_for_cell_annotation")),
                 "LIF trace physical QC and peak calling",
                 ".csv",
                 Path(item["path"]),
             )
         )
-    specs.append(("ms", "ms_raw_txt", "raw_ms_spectra", "", "", "MS", "MS trace physical QC and event calling", ".txt", raw_paths["ms"]))
+    specs.append(("ms", "ms_raw_txt", "raw_ms_spectra", "", "", "MS", False, "MS trace physical QC and event calling", ".txt", raw_paths["ms"]))
     rows: list[dict[str, Any]] = []
     manifest_inputs: dict[str, dict[str, Any]] = {}
-    for key, input_id, input_class, channel, label, detector, role, default_suffix, raw_path in specs:
+    for key, input_id, input_class, channel, label, detector, use_for_cell_annotation, role, default_suffix, raw_path in specs:
         source_path = raw_path.expanduser()
         if mode == RAW_INPUT_MODE_COPY:
             suffix = source_path.suffix or default_suffix
@@ -582,6 +613,7 @@ def build_raw_input_project_records(
                 "label": str(label),
                 "detector": detector,
                 "role": role,
+                "use_for_cell_annotation": bool(use_for_cell_annotation),
                 "encoding_or_format": "ASCII mzML-like text export" if key == "ms" else "UTF-16 LE tab-delimited text",
             }
         )
@@ -976,8 +1008,8 @@ def raw_file_fingerprint(path: Path, full_hash_limit_bytes: int | None = 100 * 1
 
 
 def validate_distinct_lif_input_files(lif_inputs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    if len(lif_inputs) != 3:
-        raise BadRequest("项目必须提供正好 3 个 LIF 原始文件")
+    if not MIN_LIF_INPUTS <= len(lif_inputs) <= MAX_LIF_INPUTS:
+        raise BadRequest(f"项目必须提供 {MIN_LIF_INPUTS}-{MAX_LIF_INPUTS} 个 LIF 原始文件")
 
     resolved_inputs: list[tuple[str, Path]] = []
     seen_keys: dict[str, str] = {}
@@ -1082,6 +1114,126 @@ def project_with_manifest_paths(project: ProjectPaths, manifest: dict[str, Any] 
     )
 
 
+def load_project_cell_event_map(
+    project_dir: Path,
+    manifest: dict[str, Any] | None,
+    ms_events: pd.DataFrame,
+) -> tuple[pd.DataFrame | None, dict[str, Any] | None]:
+    if not manifest or manifest.get("cell_event_map") is None:
+        return None, None
+    entry = manifest.get("cell_event_map")
+    if not isinstance(entry, dict):
+        raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} cell_event_map 必须是对象")
+    if int(entry.get("schema_version", 0)) != 1:
+        raise BadRequest("cell_event_map schema_version 不受支持")
+    raw_path = Path(str(entry.get("path") or "")).expanduser()
+    if raw_path.is_absolute():
+        raise BadRequest("cell_event_map 必须是项目内相对路径，不能外部引用")
+    resolved = (project_dir / raw_path).resolve()
+    try:
+        resolved.relative_to(project_dir.resolve())
+    except ValueError as exc:
+        raise BadRequest("cell_event_map 路径越出项目目录") from exc
+    expected_required = ["scan_start_time", "UMAP1", "UMAP2"]
+    if entry.get("required_source_columns") != expected_required:
+        raise BadRequest("cell_event_map required_source_columns 与当前契约不一致")
+    try:
+        frame = read_canonical_map(
+            resolved,
+            expected_sha256=str(entry.get("sha256") or ""),
+        )
+        rebound = match_source_to_events(
+            frame[expected_required],
+            ms_events,
+            tolerance_sec=float(
+                entry.get("match_tolerance_sec", DEFAULT_MATCH_TOLERANCE_SEC)
+            ),
+        )
+    except CellEventMapError as exc:
+        raise BadRequest(str(exc)) from exc
+    if int(entry.get("row_count", -1)) != len(frame):
+        raise BadRequest("cell_event_map row_count 与 canonical 文件不一致")
+    if int(entry.get("matched_event_count", -1)) != frame["ms_event_id"].nunique():
+        raise BadRequest("cell_event_map matched_event_count 与 canonical 文件不一致")
+    expected_ids = frame["ms_event_id"].astype(str).tolist()
+    rebound_ids = rebound["ms_event_id"].astype(str).tolist()
+    if expected_ids != rebound_ids:
+        raise BadRequest("cell_event_map 的 ms_event_id 绑定与当前 MS event 表不一致")
+    def normalized_scan_id(value: Any) -> str:
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            value = int(value)
+        return str(value)
+
+    expected_scan_ids = [normalized_scan_id(value) for value in frame["scan_id"]]
+    rebound_scan_ids = [normalized_scan_id(value) for value in rebound["scan_id"]]
+    if expected_scan_ids != rebound_scan_ids:
+        raise BadRequest("cell_event_map 的 scan_id 绑定与当前 MS event 表不一致")
+    return frame, copy.deepcopy(entry)
+
+
+def write_existing_project_manifest(project_dir: Path, manifest: dict[str, Any]) -> None:
+    path = project_manifest_path(project_dir)
+    payload = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def remove_staging_project(staging_dir: Path, intended_parent: Path) -> None:
+    staging_dir = staging_dir.resolve()
+    intended_parent = intended_parent.resolve()
+    try:
+        staging_dir.relative_to(intended_parent)
+    except ValueError as exc:
+        raise RuntimeError("Refusing to remove staging directory outside intended parent") from exc
+    if ".lma-building-" not in staging_dir.name or staging_dir == intended_parent:
+        raise RuntimeError("Refusing to remove a directory that is not an LMA staging project")
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+
+
+def commit_staging_project(
+    staging_dir: Path,
+    project_dir: Path,
+    *,
+    target_preexisted: bool,
+) -> None:
+    """Publish a complete staged project with one directory rename.
+
+    An existing target is allowed only when the caller has already verified
+    that it is empty.  It is removed immediately before the atomic rename and
+    restored as an empty directory if publication fails.
+    """
+
+    staging_dir = staging_dir.resolve()
+    project_dir = project_dir.resolve()
+    if staging_dir.parent != project_dir.parent:
+        raise RuntimeError("Staging project must be a sibling of the target directory")
+    if ".lma-building-" not in staging_dir.name or staging_dir == project_dir:
+        raise RuntimeError("Refusing to publish a directory that is not an LMA staging project")
+    removed_empty_target = False
+    if target_preexisted:
+        try:
+            project_dir.rmdir()
+        except OSError as exc:
+            raise BadRequest("新项目保存路径在构建期间不再为空，已取消发布") from exc
+        removed_empty_target = True
+    try:
+        os.replace(staging_dir, project_dir)
+    except Exception:
+        if removed_empty_target and not project_dir.exists():
+            project_dir.mkdir(parents=False, exist_ok=False)
+        raise
+
+
 def intermediate_table_fingerprints(project: ProjectPaths) -> dict[str, dict[str, Any]]:
     paths = {
         "lif_traces": project.lif_traces_path,
@@ -1098,6 +1250,36 @@ def intermediate_table_fingerprints(project: ProjectPaths) -> dict[str, dict[str
     }
 
 
+def validate_staged_project_artifacts(project: ProjectPaths) -> ProjectPaths:
+    """Validate immutable staged artifacts without creating annotation.sqlite."""
+
+    manifest = read_project_manifest(project.project_dir)
+    if manifest is None:
+        raise BadRequest("staging 项目缺少 lifms_project.json")
+    validate_project_manifest_against_files(project.project_dir, manifest)
+    resolved = project_with_manifest_paths(project, manifest)
+    for path in [resolved.lif_traces_path, resolved.ms_scan_path]:
+        require_file(path)
+        try:
+            # The manifest SHA already authenticates the whole file.  Reading
+            # only parquet metadata avoids materializing very large raw traces
+            # or scan summaries during the atomic publication check.
+            pd.read_parquet(path, columns=[])
+        except Exception as exc:
+            raise BadRequest(f"staging 中间表无法读取: {display_path(path, resolved.project_dir)}") from exc
+    try:
+        lif_peaks = pd.read_parquet(resolved.lif_peaks_path, columns=["peak_id"])
+        ms_events = pd.read_parquet(
+            resolved.ms_events_path,
+            columns=["event_id", "event_strategy", "primary_signal_col", "scan_id", "time_min"],
+        )
+    except Exception as exc:
+        raise BadRequest("staging 项目中间表缺少 event-map 绑定所需字段") from exc
+    acquisition_layout_from_manifest(manifest)
+    load_project_cell_event_map(resolved.project_dir, manifest, ms_events)
+    return resolved
+
+
 def project_table_binding(intermediate_tables: dict[str, dict[str, Any]]) -> dict[str, Any]:
     normalized: dict[str, dict[str, Any]] = {}
     for key in REQUIRED_INTERMEDIATE_TABLES:
@@ -1111,7 +1293,9 @@ def project_table_binding(intermediate_tables: dict[str, dict[str, Any]]) -> dic
             "sha256": sha256,
         }
     payload = {
-        "schema_version": PROJECT_SCHEMA_VERSION,
+        # This binding predates project schema v2.  Keep the scientific table
+        # identity stable so opening a v0.2.1 project remains read-compatible.
+        "schema_version": PROJECT_TABLE_BINDING_SCHEMA_VERSION,
         "intermediate_tables": normalized,
     }
     payload["binding_sha256"] = hashlib.sha256(
@@ -4490,6 +4674,9 @@ class AppData:
     store: AnnotationStore
     channel_identity_prior: dict[str, dict[str, str]]
     acquisition_layout: dict[str, Any] | None = None
+    manifest: dict[str, Any] | None = None
+    cell_event_map: pd.DataFrame | None = None
+    cell_event_map_info: dict[str, Any] | None = None
 
     @classmethod
     def load(cls, project: ProjectPaths | None = None) -> "AppData":
@@ -4511,6 +4698,11 @@ class AppData:
         lif_peaks["phase"] = display_phase_from_time_min(lif_peaks["time_min"])
         ms_events = pd.read_parquet(project.ms_events_path).sort_values("time_min").reset_index(drop=True)
         ms_scan = pd.read_parquet(project.ms_scan_path).sort_values("scan_start_time_min").reset_index(drop=True)
+        cell_event_map, cell_event_map_info = load_project_cell_event_map(
+            project.project_dir,
+            manifest,
+            ms_events,
+        )
         acquisition_layout = acquisition_layout_from_manifest(manifest)
         channel_identity_prior = channel_identity_prior_from_manifest(manifest) or infer_channel_identity_prior(project.raw_data_dir)
         if "peak_id" not in lif_peaks.columns or "event_id" not in ms_events.columns:
@@ -4521,22 +4713,16 @@ class AppData:
             set(ms_events["event_id"].astype(str)),
         )
         assert_no_legacy_annotation_state(project.annotation_db_path)
-        allow_adopt = manifest_was_missing or sqlite_annotation_count(project.annotation_db_path) == 0
+        annotation_count_before_load = sqlite_annotation_count(project.annotation_db_path)
+        db_existed_before_load = project.annotation_db_path.exists()
+        allow_adopt = manifest_was_missing or annotation_count_before_load == 0
         if allow_adopt:
             validate_sqlite_input_manifest_against_files(project.annotation_db_path, project.project_dir, intermediate_tables)
-        validate_sqlite_project_binding(project.annotation_db_path, binding, allow_adopt=allow_adopt)
-        if manifest_was_missing:
-            prior_values = {
-                channel: info.get("identity_prior", "")
-                for channel, info in channel_identity_prior.items()
-            }
-            write_project_manifest(
-                project_dir=project.project_dir,
-                raw_input_mode=RAW_INPUT_MODE_EXTERNAL,
-                raw_inputs={},
-                channel_identity_prior=prior_values,
-                intermediate_tables=intermediate_tables,
-            )
+        binding_status = validate_sqlite_project_binding(
+            project.annotation_db_path,
+            binding,
+            allow_adopt=allow_adopt,
+        )
         store = AnnotationStore(project.annotation_db_path)
         project_config = store.project_config()
         alignment = estimate_shift_alignment(
@@ -4555,25 +4741,44 @@ class AppData:
                 acquisition_layout=acquisition_layout,
                 model=persisted_qc_alignment,
             )
-        store.record_project_table_binding(binding)
         current_layout_hash = str(alignment.get("acquisition_layout_hash") or "")
         existing_time_model = store.active_time_model()
         existing_layout_hash = str((existing_time_model or {}).get("acquisition_layout_hash") or "")
         if existing_layout_hash and current_layout_hash and existing_layout_hash != current_layout_hash:
             raise BadRequest("项目 QC anchor/time-axis 配置与当前 frozen/draft time model 不一致；请恢复原配置或清除旧 time model 后重新校正")
-        store.ensure_draft_time_model(
-            str(alignment["model"]),
-            current_layout_hash,
-            allow_unhashed_legacy_binding=is_legacy_acquisition_layout(acquisition_layout),
+        if existing_time_model and current_layout_hash and not existing_layout_hash:
+            if not is_legacy_acquisition_layout(acquisition_layout):
+                raise BadRequest(
+                    "现有 time model 没有 acquisition layout 绑定，不能静默迁移到新的 QC anchor 配置；"
+                    "请先清除旧 time model，再重新进行 QC 校正和后段局部校正"
+                )
+            # Schema-v1 projects used the fixed G2/R1/R2 layout and did not
+            # persist this hash.  Loading them must remain side-effect free:
+            # the legacy interpretation is applied in memory until the user
+            # performs an explicit mutating operation.
+        elif existing_time_model is None:
+            store.ensure_draft_time_model(
+                str(alignment["model"]),
+                current_layout_hash,
+                allow_unhashed_legacy_binding=False,
+            )
+
+        # A matched, established project is read-only during load.  Only a
+        # brand-new/empty database may be adopted and populated implicitly.
+        may_initialize_binding = (
+            binding_status in {"new", "adopt"}
+            and (not db_existed_before_load or annotation_count_before_load == 0)
         )
-        store.record_input_manifest(
-            {
-                "lif_traces": project.lif_traces_path,
-                "lif_peaks": project.lif_peaks_path,
-                "ms_events": project.ms_events_path,
-                "ms_scan_summary": project.ms_scan_path,
-            }
-        )
+        if may_initialize_binding:
+            store.record_project_table_binding(binding)
+            store.record_input_manifest(
+                {
+                    "lif_traces": project.lif_traces_path,
+                    "lif_peaks": project.lif_peaks_path,
+                    "ms_events": project.ms_events_path,
+                    "ms_scan_summary": project.ms_scan_path,
+                }
+            )
         return cls(
             project=project,
             lif_traces=lif_traces,
@@ -4584,6 +4789,9 @@ class AppData:
             store=store,
             channel_identity_prior=channel_identity_prior,
             acquisition_layout=acquisition_layout,
+            manifest=manifest,
+            cell_event_map=cell_event_map,
+            cell_event_map_info=cell_event_map_info,
         )
 
     def meta(self) -> dict[str, Any]:
@@ -4609,6 +4817,7 @@ class AppData:
         )
         return {
             "root": str(self.project.project_dir),
+            "project_id": self.project_identity(),
             "project": {
                 "project_dir": str(self.project.project_dir),
                 "raw_data_dir": str(self.project.raw_data_dir),
@@ -4623,6 +4832,12 @@ class AppData:
             "ms_scan_rows": int(len(self.ms_scan)),
             "lif_channels": labels,
             "acquisition_layout": normalize_acquisition_layout(self.acquisition_layout),
+            "cell_event_map": {
+                "available": self.cell_event_map is not None,
+                "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
+                "sha256": str((self.cell_event_map_info or {}).get("sha256") or ""),
+                "attach_allowed": self.cell_event_map is None,
+            },
             "channel_identity_prior": self.channel_identity_prior,
             "inputs": {
                 "lif_traces": display_path(self.project.lif_traces_path, self.project.project_dir),
@@ -4677,6 +4892,188 @@ class AppData:
             return "manual_qc_triplet"
         return ""
 
+    def project_identity(self) -> str:
+        manifest = self.manifest or {}
+        explicit = str(manifest.get("project_id") or manifest.get("dataset_id") or "")
+        if explicit:
+            return explicit
+        return hashlib.sha256(str(self.project.project_dir.resolve()).encode("utf-8")).hexdigest()
+
+    def cell_event_map_sha256(self) -> str:
+        return str((self.cell_event_map_info or {}).get("sha256") or "")
+
+    def cell_event_map_event_ids(self) -> set[str] | None:
+        if self.cell_event_map is None:
+            return None
+        return set(self.cell_event_map["ms_event_id"].astype(str))
+
+    def require_third_stage_event_in_map(self, ms_event_id: str) -> None:
+        allowed = self.cell_event_map_event_ids()
+        if allowed is not None and str(ms_event_id) not in allowed:
+            raise BadRequest(
+                f"MS event {ms_event_id} 不在当前单细胞 event map 白名单中，不能在第三阶段审核"
+            )
+
+    def projected_cell_event_map_state(self) -> dict[str, Any]:
+        if self.cell_event_map is None:
+            raise BadRequest("当前项目没有单细胞 event map")
+        frozen = self.frozen_time_model()
+        config = self.project_config()
+        state = project_annotation_state(
+            self.cell_event_map,
+            self.store.records(),
+            active_time_model_version=(
+                str(frozen.get("time_model_version") or "") if frozen else None
+            ),
+            annotation_start_min=float(
+                config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+            ),
+        )
+        state.update(
+            {
+                "project_id": self.project_identity(),
+                "map_sha256": self.cell_event_map_sha256(),
+                "channel_identity_prior": self.channel_identity_prior,
+            }
+        )
+        state["revision"] = state_revision(
+            project_id=state["project_id"],
+            map_sha256=state["map_sha256"],
+            projected_state=state,
+        )
+        return state
+
+    def cell_event_map_revision(self) -> dict[str, Any]:
+        state = self.projected_cell_event_map_state()
+        return {
+            "project_id": state["project_id"],
+            "map_sha256": state["map_sha256"],
+            "active_time_model_version": state["active_time_model_version"],
+            "revision": state["revision"],
+            "counts": state["counts"],
+        }
+
+    def ensure_third_stage_acceptance_allowed(
+        self,
+        payload: dict[str, Any],
+        *,
+        annotation_id: str,
+    ) -> None:
+        stage = self.annotation_review_stage(payload)
+        if stage not in {"qc_survey", "cell_annotation"}:
+            return
+        ms_event_id = str(payload.get("ms_event_id") or "")
+        if not ms_event_id:
+            raise BadRequest("第三阶段 annotation 缺少 ms_event_id")
+        self.require_third_stage_event_in_map(ms_event_id)
+        if self.cell_event_map is None:
+            return
+        state = self.projected_cell_event_map_state()
+        point = next(
+            (
+                item
+                for item in state["points"]
+                if str(item.get("ms_event_id")) == ms_event_id
+            ),
+            None,
+        )
+        existing_relations = [
+            relation
+            for relation in (point or {}).get("accepted_relations", [])
+            if str(relation.get("annotation_id") or "") != str(annotation_id)
+        ]
+        if existing_relations:
+            details = ", ".join(
+                f"{relation.get('kind')}:{relation.get('annotation_id')}"
+                for relation in existing_relations[:5]
+            )
+            raise BadRequest(
+                "同一 MS event 只能有一个 active accepted 第三阶段分类；"
+                f"请先撤销现有记录 {details}"
+            )
+
+    def attach_cell_event_map(self, source_path: Path) -> "AppData":
+        if self.cell_event_map is not None or (self.manifest or {}).get("cell_event_map"):
+            raise BadRequest("当前项目已绑定 cell event map；v0.3.0 不支持替换")
+        manifest = copy.deepcopy(self.manifest or read_project_manifest(self.project.project_dir))
+        if not manifest:
+            raise BadRequest("旧项目必须先建立 lifms_project.json 才能附加 event map")
+        destination = self.project.project_dir / CELL_EVENT_MAP_RELATIVE_PATH
+        if destination.exists():
+            raise BadRequest("项目中已存在未登记的 canonical event map，拒绝覆盖")
+        try:
+            canonical, import_metadata = import_cell_event_map(
+                source_path,
+                self.ms_events,
+                tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
+            )
+        except CellEventMapError as exc:
+            raise BadRequest(str(exc)) from exc
+        allowed_ids = set(canonical["ms_event_id"].astype(str))
+        annotation_start = float(
+            self.project_config().get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+        )
+        missing_history: set[str] = set()
+        ms_time_by_event = {
+            str(row["event_id"]): float(row["time_min"])
+            for _, row in self.ms_events[["event_id", "time_min"]].iterrows()
+        }
+        for row in self.store.records():
+            if str(row.get("review_status") or "") != "accepted":
+                continue
+            if self.annotation_review_stage(row) not in {"qc_survey", "cell_annotation"}:
+                continue
+            event_id = str(row.get("ms_event_id") or "")
+            try:
+                ms_time = float(row.get("ms_time_min"))
+            except (TypeError, ValueError):
+                ms_time = ms_time_by_event.get(event_id, math.nan)
+            if not math.isfinite(ms_time):
+                raise BadRequest(
+                    f"已有 accepted 第三阶段 annotation {row.get('annotation_id')} 无法绑定 MS 时间，拒绝附加 event map"
+                )
+            if ms_time < annotation_start:
+                continue
+            if event_id and event_id not in allowed_ids:
+                missing_history.add(event_id)
+        if missing_history:
+            preview = ", ".join(sorted(missing_history)[:10])
+            raise BadRequest(
+                "event map 缺少已有 accepted 第三阶段 MS event，不能附加: " + preview
+            )
+
+        try:
+            write_canonical_map(canonical, destination)
+            entry = cell_event_map_manifest_entry(
+                canonical_path=destination,
+                project_dir=self.project.project_dir,
+                import_metadata=import_metadata,
+            )
+            manifest["project_schema_version"] = PROJECT_SCHEMA_VERSION
+            manifest["acquisition_layout"] = normalize_acquisition_layout(
+                self.acquisition_layout
+            )
+            manifest["channel_identity_prior"] = {
+                row["channel"]: row.get("identity_prior", "")
+                for row in manifest["acquisition_layout"]["lif_channels"]
+            }
+            if isinstance(manifest.get("annotation_db"), dict):
+                manifest["annotation_db"]["schema_version"] = PROJECT_SCHEMA_VERSION
+            manifest["cell_event_map"] = entry
+            manifest["updated_by_app_version"] = APP_VERSION
+            manifest["updated_at"] = now_iso()
+            write_existing_project_manifest(self.project.project_dir, manifest)
+        except (CellEventMapError, OSError) as exc:
+            if destination.exists():
+                destination.unlink()
+            raise BadRequest(f"附加 event map 失败: {exc}") from exc
+        return replace(
+            self,
+            manifest=manifest,
+            cell_event_map=canonical,
+            cell_event_map_info=entry,
+        )
+
     def export_accepted_annotations_csv(self) -> dict[str, Any]:
         timestamp = now_iso()
         export_id = f"export_{timestamp.replace(':', '').replace('-', '').replace('Z', '')}_{uuid.uuid4().hex[:8]}"
@@ -4691,6 +5088,7 @@ class AppData:
             "active_time_model_version": active_version,
             "input_policy": "first_principles_preprocessing_tables_plus_human_review",
             "label_policy": "Day labels are channel identity priors from raw filename/project config, not author CSV/h5ad labels",
+            "cell_event_map_sha256": self.cell_event_map_sha256(),
         }
         rows: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -4826,6 +5224,17 @@ class AppData:
                 return value
             return value or (MISSING_PEAK_SYMBOL if channel in anchor_channels else None)
 
+        umap1 = None
+        umap2 = None
+        if self.cell_event_map is not None and stage in {"qc_survey", "cell_annotation"}:
+            event_id = str(row.get("ms_event_id") or "")
+            coordinate_rows = self.cell_event_map[
+                self.cell_event_map["ms_event_id"].astype(str).eq(event_id)
+            ]
+            if not coordinate_rows.empty:
+                umap1 = float(coordinate_rows.iloc[0]["UMAP1"])
+                umap2 = float(coordinate_rows.iloc[0]["UMAP2"])
+
         return {
             "export_id": export_id,
             "exported_at": exported_at,
@@ -4852,6 +5261,13 @@ class AppData:
             "r2_peak_id": qc_channel_value("R2", r2_value),
             "ms_event_id": row.get("ms_event_id"),
             "scan_id": row.get("scan_id"),
+            "UMAP1": umap1,
+            "UMAP2": umap2,
+            "cell_event_map_sha256": (
+                self.cell_event_map_sha256()
+                if stage in {"qc_survey", "cell_annotation"} and umap1 is not None
+                else None
+            ),
             "g1_raw_time_min": g1_raw,
             "g2_raw_time_min": g2_raw,
             "r1_raw_time_min": r1_raw,
@@ -4897,6 +5313,7 @@ class AppData:
             "lif_channel", "channel_identity_prior", "channel_identity_prior_source",
             "lif_peak_id",
             "g1_peak_id", "g2_peak_id", "r1_peak_id", "r2_peak_id", "ms_event_id", "scan_id",
+            "UMAP1", "UMAP2", "cell_event_map_sha256",
             "lif_raw_time_min", "g1_raw_time_min", "g2_raw_time_min", "r1_raw_time_min", "r2_raw_time_min", "ms_time_min",
             "qc_anchor_channels_json", "qc_anchor_peak_ids_json", "qc_anchor_raw_times_json",
             "qc_anchor_plot_times_json", "qc_anchor_time_axes_json", "lif_anchor_count",
@@ -4928,7 +5345,9 @@ class AppData:
         raw_input_mode: str = RAW_INPUT_MODE_EXTERNAL,
         lif_inputs: list[dict[str, Any]] | None = None,
         qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
-    ) -> "AppData":
+        cell_event_map_path: Path | None = None,
+        _staging_build: bool = False,
+    ) -> "AppData | ProjectPaths":
         project_dir = project_dir.expanduser().resolve()
         mode = normalize_raw_input_mode(raw_input_mode)
         if lif_inputs is None:
@@ -4949,6 +5368,56 @@ class AppData:
             source_raw_paths[key] = Path(item["path"]).expanduser().resolve()
         if not IS_FROZEN and project_dir == ROOT:
             raise BadRequest("项目保存路径不能使用当前代码仓库根目录；请新建独立项目目录")
+        raw_file_fingerprint(source_raw_paths["ms"])
+        if not _staging_build:
+            if cell_event_map_path is None:
+                raise BadRequest(
+                    "新项目必须选择单细胞事件坐标 CSV（scan_start_time / UMAP1 / UMAP2）"
+                )
+            cell_event_map_path = cell_event_map_path.expanduser().resolve()
+            raw_file_fingerprint(cell_event_map_path, full_hash_limit_bytes=None)
+            existing_outputs = [
+                project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_traces"],
+                project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_peaks"],
+                project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_events"],
+                project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_scan_summary"],
+                project_dir / CELL_EVENT_MAP_RELATIVE_PATH,
+            ]
+            assert_new_project_target_is_clean(project_dir, existing_outputs)
+            target_preexisted = project_dir.exists()
+            if target_preexisted and any(project_dir.iterdir()):
+                raise BadRequest("新项目保存路径必须不存在或为空目录")
+            intended_parent = project_dir.parent
+            intended_parent.mkdir(parents=True, exist_ok=True)
+            staging_dir = intended_parent / f".{project_dir.name}.lma-building-{uuid.uuid4().hex}"
+            try:
+                cls.create_project_from_raw_inputs(
+                    project_dir=staging_dir,
+                    ms_path=ms_path,
+                    raw_input_mode=mode,
+                    lif_inputs=lif_inputs,
+                    qc_anchor_channels=qc_anchor_channels,
+                    cell_event_map_path=cell_event_map_path,
+                    _staging_build=True,
+                )
+                commit_staging_project(
+                    staging_dir,
+                    project_dir,
+                    target_preexisted=target_preexisted,
+                )
+            except Exception:
+                if staging_dir.exists():
+                    remove_staging_project(staging_dir, intended_parent)
+                raise
+            return cls.load(
+                ProjectPaths.from_args(
+                    project_dir=str(project_dir),
+                    raw_data_dir=str(project_dir / "raw_inputs"),
+                    annotation_db=str(
+                        project_dir / "annotation_app/annotations/annotation.sqlite"
+                    ),
+                )
+            )
         existing_outputs = [
             project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_traces"],
             project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_peaks"],
@@ -4956,7 +5425,6 @@ class AppData:
             project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_scan_summary"],
         ]
         assert_new_project_target_is_clean(project_dir, existing_outputs)
-        raw_file_fingerprint(source_raw_paths["ms"])
 
         project_dir.mkdir(parents=True, exist_ok=True)
         lock_dir = project_dir / "results/tables/v3"
@@ -4973,6 +5441,17 @@ class AppData:
             lif_inputs=lif_inputs,
             qc_anchor_channels=qc_anchor_channels,
         )
+        missing_cell_labels = [
+            row["channel"]
+            for row in acquisition_layout["lif_channels"]
+            if bool(row.get("use_for_cell_annotation"))
+            and not str(row.get("identity_prior") or "").strip()
+        ]
+        if missing_cell_labels:
+            raise BadRequest(
+                "用于细胞标注的 LIF 通道必须填写样本标签: "
+                + ", ".join(missing_cell_labels)
+            )
         if mode == RAW_INPUT_MODE_COPY:
             for key, source_path in source_raw_paths.items():
                 destination = project_dir / str(manifest_raw_inputs[key]["path"])
@@ -5041,7 +5520,7 @@ class AppData:
                     "",
                     f"导入时间：`{now_iso()}`",
                     "",
-                    "- 本导入只锁定 3 个用户配置的 LIF 原始文件和 1 个 MS 原始文件。",
+                    f"- 本导入只锁定 {len(lif_inputs)} 个用户配置的 LIF 原始文件和 1 个 MS 原始文件。",
                     "- 不读取作者 CSV、h5ad、manual、V2/archive 输入。",
                     "- 生成的中间表用于浏览器人工标注；后续时间校正和 annotation 由软件内人工审核完成。",
                     f"- QC anchor LIF 通道：`{' + '.join(acquisition_layout['qc_anchor_channels'])}`。",
@@ -5089,6 +5568,23 @@ class AppData:
             "ms_events": {"path": project_relative_or_absolute(existing_outputs[2], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[2], full_hash_limit_bytes=None)},
             "ms_scan_summary": {"path": project_relative_or_absolute(existing_outputs[3], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[3], full_hash_limit_bytes=None)},
         }
+        if cell_event_map_path is None:
+            raise BadRequest("内部错误：staging 项目缺少 cell event map source")
+        try:
+            canonical_map, map_import_metadata = import_cell_event_map(
+                cell_event_map_path,
+                pd.read_parquet(existing_outputs[2]),
+                tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
+            )
+            canonical_path = project_dir / CELL_EVENT_MAP_RELATIVE_PATH
+            write_canonical_map(canonical_map, canonical_path)
+            map_manifest_entry = cell_event_map_manifest_entry(
+                canonical_path=canonical_path,
+                project_dir=project_dir,
+                import_metadata=map_import_metadata,
+            )
+        except CellEventMapError as exc:
+            raise BadRequest(f"单细胞 event map 导入失败: {exc}") from exc
         write_project_manifest(
             project_dir=project_dir,
             raw_input_mode=mode,
@@ -5096,6 +5592,7 @@ class AppData:
             channel_identity_prior=identities,
             intermediate_tables=intermediate_tables,
             acquisition_layout=acquisition_layout,
+            cell_event_map=map_manifest_entry,
         )
 
         project = ProjectPaths.from_args(
@@ -5103,6 +5600,8 @@ class AppData:
             raw_data_dir=str(raw_data_dir),
             annotation_db=str(project_dir / "annotation_app/annotations/annotation.sqlite"),
         )
+        if _staging_build:
+            return validate_staged_project_artifacts(project)
         return cls.load(project)
 
     def channel_shift_sec(self, channel: str, time_mode: str) -> float:
@@ -5299,7 +5798,7 @@ class AppData:
 
     def time_model_payload_fields(self) -> dict[str, Any]:
         model = self.active_time_model()
-        return {
+        payload = {
             "time_model_name": str(model.get("base_model_name", self.alignment["model"])),
             "time_model_version": str(model.get("time_model_version", "")),
             "time_model_status": str(model.get("status", "draft")),
@@ -5307,6 +5806,9 @@ class AppData:
             "ms_local_delta_sec": float(model.get("ms_local_delta_sec", 0.0) or 0.0),
             "acquisition_layout_hash": model.get("acquisition_layout_hash") or self.alignment.get("acquisition_layout_hash"),
         }
+        if self.cell_event_map is not None:
+            payload["cell_event_map_sha256"] = self.cell_event_map_sha256()
+        return payload
 
     def local_delta_anchor_pair_kwargs(self, config: dict[str, Any]) -> dict[str, Any]:
         pair_offset = self.alignment.get("qc_groups", {}).get("lif_anchor_b_minus_anchor_a_offset_sec")
@@ -5681,6 +6183,9 @@ class AppData:
         return self.payload_from_auto_group(group)
 
     def payload_from_cell_ids(self, lif_channel: str, lif_peak_id: str, ms_event_id: str) -> dict[str, Any]:
+        lif_channel = str(lif_channel).strip().upper()
+        if lif_channel not in self.cell_annotation_channels():
+            raise BadRequest(f"LIF 通道 {lif_channel} 未配置为细胞标注通道")
         lif = self.lif_peaks[self.lif_peaks["peak_id"].eq(lif_peak_id)]
         ms = self.ms_events[self.ms_events["event_id"].eq(ms_event_id)]
         if lif.empty:
@@ -5691,6 +6196,7 @@ class AppData:
         ms_row = ms.iloc[0]
         if not is_primary_pc34_event(ms_row):
             raise BadRequest("Cell annotation requires an MS760 PC34 primary event")
+        self.require_third_stage_event_in_map(ms_event_id)
         if str(ms_event_id) in self.accepted_qc_survey_ms_event_ids():
             raise BadRequest("This MS760 event has already been accepted as QC in QC survey")
         if str(lif_row["channel"]) != lif_channel:
@@ -5813,6 +6319,8 @@ class AppData:
         ms_row = ms.iloc[0]
         if not is_primary_pc34_event(ms_row):
             raise BadRequest("Manual QC anchor requires an MS760 PC34 primary event")
+        if allow_lif_missing:
+            self.require_third_stage_event_in_map(ms_event_id)
 
         lif_anchors: list[dict[str, Any]] = []
         raw_times: dict[str, float | None] = {channel: None for channel in anchors}
@@ -6017,6 +6525,11 @@ class AppData:
             window_start_min=window_start_min,
             window_end_min=window_end_min,
         )
+        if review_status == "accepted":
+            self.ensure_third_stage_acceptance_allowed(
+                payload,
+                annotation_id=annotation_id,
+            )
         existing = self.store.get(annotation_id)
         invalidate_qc_alignment = self.require_qc_evidence_invalidation_confirmation(
             payload,
@@ -6063,6 +6576,11 @@ class AppData:
                     "updated_at",
                 }
             }
+            if review_status == "accepted":
+                self.ensure_third_stage_acceptance_allowed(
+                    payload,
+                    annotation_id=annotation_id,
+                )
             invalidate_qc_alignment = self.require_qc_evidence_invalidation_confirmation(
                 payload,
                 clear_qc_alignment_model=clear_qc_alignment_model,
@@ -6220,6 +6738,10 @@ class AppData:
             lif_anchor_peak_ids=normalized_anchor_ids,
         )
         existing = self.store.get(annotation_id)
+        self.ensure_third_stage_acceptance_allowed(
+            payload,
+            annotation_id=annotation_id,
+        )
         invalidate_qc_alignment = self.require_qc_evidence_invalidation_confirmation(
             payload,
             clear_qc_alignment_model=clear_qc_alignment_model,
@@ -6289,6 +6811,10 @@ class AppData:
             "selection_reason": "manual_lif_ms760_pair",
         }
         annotation_id = manual_cell_annotation_id(lif_channel, lif_peak_id, ms_event_id)
+        self.ensure_third_stage_acceptance_allowed(
+            payload,
+            annotation_id=annotation_id,
+        )
         return self.store.upsert_review(
             annotation_id=annotation_id,
             source="manual_created",
@@ -6389,6 +6915,14 @@ class AppData:
             channel_time_axes=self.alignment.get("channel_time_axes"),
             qc_anchor_channels=self.alignment.get("qc_anchor_channels"),
         )
+        allowed_ids = self.cell_event_map_event_ids()
+        accepted_cell_ids = self.accepted_cell_annotation_ms_event_ids()
+        groups = [
+            group
+            for group in groups
+            if (allowed_ids is None or str(group.get("ms_event_id")) in allowed_ids)
+            and str(group.get("ms_event_id")) not in accepted_cell_ids
+        ]
         return [self.enrich_qc_candidate(group, post_qc=True) for group in groups]
 
     def enrich_cell_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -6440,7 +6974,19 @@ class AppData:
                 )
             )
         rows.sort(key=lambda item: (float(item["ms_plot_time_min"]), str(item["lif_channel"])))
-        return [self.enrich_cell_candidate(row) for row in rows]
+        allowed_ids = self.cell_event_map_event_ids()
+        enriched = [
+            self.enrich_cell_candidate(row)
+            for row in rows
+            if allowed_ids is None or str(row.get("ms_event_id")) in allowed_ids
+        ]
+        accepted_cell_ids = self.accepted_cell_annotation_ms_event_ids()
+        return [
+            row
+            for row in enriched
+            if str(row.get("ms_event_id")) not in accepted_cell_ids
+            or str(row.get("review_status")) == "accepted"
+        ]
 
     def accept_pending_auto_candidates_in_window(
         self,
@@ -6599,6 +7145,22 @@ class AppData:
                 ids.add(str(ms_event_id))
         return ids
 
+    def is_cell_annotation(self, row: dict[str, Any]) -> bool:
+        if str(row.get("review_status")) != "accepted":
+            return False
+        frozen = self.frozen_time_model()
+        active_version = str(frozen.get("time_model_version", "")) if frozen else ""
+        if not active_version or str(row.get("time_model_version") or "") != active_version:
+            return False
+        return self.annotation_review_stage(row) == "cell_annotation"
+
+    def accepted_cell_annotation_ms_event_ids(self) -> set[str]:
+        return {
+            str(row["ms_event_id"])
+            for row in self.store.records()
+            if self.is_cell_annotation(row) and row.get("ms_event_id")
+        }
+
     def accepted_qc_survey_anchors_for_window(
         self,
         context_start_min: float,
@@ -6701,6 +7263,12 @@ class AppData:
             ms_delta_min * 60.0,
             0.0,
         )
+        cell_event_ids = self.cell_event_map_event_ids()
+        events_source["in_cell_event_map"] = (
+            True
+            if cell_event_ids is None
+            else events_source["event_id"].astype(str).isin(cell_event_ids)
+        )
         events_window = events_source[
             events_source["plot_time_min"].between(context_start_min, context_end_min, inclusive="both")
         ].sort_values("plot_time_min").copy()
@@ -6762,6 +7330,7 @@ class AppData:
             "low_quality_scan_window",
             "nearest_event_gap_sec",
             "array_length_apex",
+            "in_cell_event_map",
         ]
 
         alignment_groups = []
@@ -6867,6 +7436,17 @@ class AppData:
             status = str(group.get("review_status", "pending"))
             if status in cell_counts:
                 cell_counts[status] += 1
+
+        third_stage_lif_peak_ids: set[str] = set()
+        for row in [*post_qc_candidates, *cell_candidates, *cell_qc_anchors, *annotations]:
+            event_id = str(row.get("ms_event_id") or "")
+            if cell_event_ids is not None and event_id not in cell_event_ids:
+                continue
+            for peak_id in qc_anchor_peak_id_map(row).values():
+                if peak_id:
+                    third_stage_lif_peak_ids.add(str(peak_id))
+            if row.get("lif_peak_id"):
+                third_stage_lif_peak_ids.add(str(row["lif_peak_id"]))
         for row in annotations:
             if row.get("source") != "manual_created":
                 continue
@@ -6901,6 +7481,7 @@ class AppData:
             "annotation_counts": annotation_counts,
             "post_qc_counts": post_qc_counts,
             "cell_counts": cell_counts,
+            "third_stage_lif_peak_ids": sorted(third_stage_lif_peak_ids),
             "annotation_store": self.store.summary(),
             "lif_traces": lif_traces,
             "lif_peaks": records(peaks_window, peak_cols),
@@ -6971,7 +7552,7 @@ class BootstrapAppData:
                 "ms_events": display_path(self.project.ms_events_path, self.project.project_dir),
                 "ms_scan_summary": display_path(self.project.ms_scan_path, self.project.project_dir),
             },
-            "input_policy": "等待导入 3 个 LIF 原始文件和 1 个 MS 原始文件；不读取作者 CSV、h5ad、manual/V2/archive 输入。",
+            "input_policy": "等待导入 2-4 个 LIF 原始文件、1 个 MS 原始文件和事件坐标 CSV；坐标源只读取白名单三列，不读取作者标签/h5ad/manual/V2/archive 输入。",
             "alignment": {"green_to_ms_shift_sec": 0.0, "red_to_ms_shift_sec": 0.0, "ms_shift_sec": 0.0},
             "project_config": self.project_config(),
             "time_model": self.active_time_model(),
@@ -7287,6 +7868,33 @@ HTML = r"""<!doctype html>
       margin: 0 0 8px;
       line-height: 1.35;
     }
+    .segmented {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2px;
+      padding: 2px;
+      margin: 0 0 9px;
+      border: 1px solid #d7dce3;
+      border-radius: 7px;
+      background: #f2f4f7;
+    }
+    .segmented.two {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    .segmented button {
+      height: 27px;
+      min-width: 0;
+      padding: 0 6px;
+      border: 0;
+      background: transparent;
+      color: #475467;
+      font-size: 11px;
+    }
+    .segmented button.active {
+      background: #fff;
+      color: #111827;
+      box-shadow: 0 1px 3px rgba(16,24,40,.12);
+    }
     .status-pill strong {
       display: block;
       color: #111827;
@@ -7524,7 +8132,7 @@ HTML = r"""<!doctype html>
       padding: 16px;
     }
     .modal.import-modal {
-      width: min(920px, 100%);
+      width: min(1100px, 100%);
     }
     .modal-head {
       display: flex;
@@ -7578,7 +8186,7 @@ HTML = r"""<!doctype html>
     .lif-input-head,
     .lif-input-row {
       display: grid;
-      grid-template-columns: 48px 112px 150px minmax(0, 1fr);
+      grid-template-columns: 44px 82px 138px 116px minmax(160px, 1fr) 32px;
       gap: 8px;
       align-items: center;
       min-width: 0;
@@ -7624,6 +8232,37 @@ HTML = r"""<!doctype html>
       gap: 8px;
       align-items: center;
       min-width: 0;
+    }
+    .lif-use-options {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .lif-use-options label {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      white-space: nowrap;
+      font-size: 11px;
+    }
+    .lif-use-options input {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+    }
+    .lif-remove {
+      width: 32px;
+      min-width: 32px;
+      padding: 0;
+      color: #b42318;
+    }
+    .lif-import-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
     }
     .qc-anchor-field {
       min-width: 0;
@@ -7791,10 +8430,11 @@ HTML = r"""<!doctype html>
         display: none;
       }
       .lif-input-row {
-        grid-template-columns: 48px minmax(0, 1fr) minmax(0, 1fr);
+        grid-template-columns: 42px minmax(0, 1fr) minmax(0, 1fr) 32px;
         grid-template-areas:
-          "slot channel identity"
-          ". file file";
+          "slot channel identity remove"
+          ". use use ."
+          ". file file .";
       }
       .lif-input-slot {
         grid-area: slot;
@@ -7805,8 +8445,14 @@ HTML = r"""<!doctype html>
       .lif-identity {
         grid-area: identity;
       }
+      .lif-use-options {
+        grid-area: use;
+      }
       .lif-file-picker {
         grid-area: file;
+      }
+      .lif-remove {
+        grid-area: remove;
       }
       .lif-mobile-label {
         display: block;
@@ -7832,6 +8478,7 @@ HTML = r"""<!doctype html>
       <button id="openImportProject" class="header-secondary-button">新建项目</button>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
+      <button id="openUmap" class="header-secondary-button" disabled>UMAP</button>
       <span id="exportHint" class="header-export-hint">导出全项目已接受标注</span>
       <button id="exportAcceptedCsv" class="header-export-button">导出已接受 CSV</button>
     </div>
@@ -7860,10 +8507,14 @@ HTML = r"""<!doctype html>
       <div class="stage-tabs">
         <button class="stage-tab active" data-stage="qc_calibration">QC 校正</button>
         <button class="stage-tab" data-stage="local_calibration">后段局部校正</button>
-        <button class="stage-tab" data-stage="qc_survey">QC 巡检</button>
-        <button class="stage-tab" data-stage="cell_annotation">细胞标注</button>
+        <button class="stage-tab" data-stage="event_annotation">事件标注</button>
       </div>
       <div id="stageNote" class="stage-note">前 10.5 min QC anchor 审核，用于确认 shift-only 时间校正。</div>
+      <div id="eventFilter" class="segmented" style="display:none;" aria-label="事件类型筛选">
+        <button type="button" class="active" data-event-filter="all">全部</button>
+        <button type="button" data-event-filter="qc">QC</button>
+        <button type="button" data-event-filter="cell">细胞</button>
+      </div>
       <div id="qcRefitPanel" class="manual-box" style="display:none; margin-top:8px;">
         <button id="previewQcRefit" class="small-button" style="width:100%;">基于已接受 anchors 预览重算</button>
         <div id="qcRefitStats" class="empty" style="margin-top:6px;">尚未生成重算预览。</div>
@@ -7914,6 +8565,10 @@ HTML = r"""<!doctype html>
       <div id="manualPanel">
         <p id="manualPanelTitle" class="side-title" style="margin-top:18px;">手动 QC anchor</p>
         <div class="manual-box">
+          <div id="manualAnnotationKind" class="segmented two" style="display:none;" aria-label="手工标注类型">
+            <button type="button" class="active" data-manual-kind="qc">QC anchor</button>
+            <button type="button" data-manual-kind="cell">细胞二元组</button>
+          </div>
           <button id="manualMode" class="small-button secondary">选择峰</button>
           <button id="clearManual" class="small-button secondary">清空</button>
           <div class="manual-selection">
@@ -7969,7 +8624,7 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="importTitle" class="modal-title">新建标注项目</p>
-          <div class="empty">选择项目保存路径，配置本项目采用的 3 个 LIF 通道、QC anchor 通道和 1 个 MS 原始文件。</div>
+          <div class="empty">配置 2–4 个 LIF 通道及其 QC / 细胞用途，并选择 MS 与单细胞事件坐标文件。</div>
         </div>
         <button id="closeImportProject" class="small-button secondary">关闭</button>
       </div>
@@ -7988,86 +8643,27 @@ HTML = r"""<!doctype html>
         <div class="lif-input-table">
           <div class="lif-input-head" aria-hidden="true">
             <span>输入</span>
-            <span>LIF 通道<small>G1 / G2 / R1 / R2</small></span>
-            <span>样本标签<small>时间点、细胞类型等</small></span>
+            <span>通道<small>G1–R2</small></span>
+            <span>样本标签<small>细胞用途必填</small></span>
+            <span>用途<small>QC / 细胞</small></span>
             <span>LIF 原始文件</span>
+            <span></span>
           </div>
-          <div class="lif-input-row">
-            <span class="lif-input-slot">LIF 1</span>
-            <div class="lif-field lif-channel">
-              <span class="lif-mobile-label">LIF 通道</span>
-              <select id="importLif1Channel" aria-label="LIF 1 通道">
-                <option value="">选择通道</option>
-                <option value="G1">G1</option>
-                <option value="G2">G2</option>
-                <option value="R1">R1</option>
-                <option value="R2">R2</option>
-              </select>
-            </div>
-            <div class="lif-field lif-identity">
-              <span class="lif-mobile-label">样本标签</span>
-              <input id="importLif1Identity" type="text" placeholder="填写样本标签" aria-label="LIF 1 样本标签" />
-            </div>
-            <div class="lif-file-picker">
-              <span class="lif-mobile-label">LIF 原始文件</span>
-              <input id="importLif1Path" type="text" placeholder="选择 LIF 原始文件" aria-label="LIF 1 文件路径" />
-              <button class="small-button secondary path-picker-button" aria-label="选择 LIF 1 原始文件" data-picker-target="importLif1Path" data-picker-kind="file" data-picker-role="lif" data-picker-title="选择 LIF 1 原始文件">选择</button>
-            </div>
+          <div id="importLifRows"></div>
+          <div class="lif-import-actions">
+            <button id="addImportLif" type="button" class="small-button secondary">＋ 添加 LIF</button>
+            <span id="importRoleSummary" class="qc-anchor-rule">QC 0 · 细胞 0</span>
           </div>
-          <div class="lif-input-row">
-            <span class="lif-input-slot">LIF 2</span>
-            <div class="lif-field lif-channel">
-              <span class="lif-mobile-label">LIF 通道</span>
-              <select id="importLif2Channel" aria-label="LIF 2 通道">
-                <option value="">选择通道</option>
-                <option value="G1">G1</option>
-                <option value="G2">G2</option>
-                <option value="R1">R1</option>
-                <option value="R2">R2</option>
-              </select>
-            </div>
-            <div class="lif-field lif-identity">
-              <span class="lif-mobile-label">样本标签</span>
-              <input id="importLif2Identity" type="text" placeholder="填写样本标签" aria-label="LIF 2 样本标签" />
-            </div>
-            <div class="lif-file-picker">
-              <span class="lif-mobile-label">LIF 原始文件</span>
-              <input id="importLif2Path" type="text" placeholder="选择 LIF 原始文件" aria-label="LIF 2 文件路径" />
-              <button class="small-button secondary path-picker-button" aria-label="选择 LIF 2 原始文件" data-picker-target="importLif2Path" data-picker-kind="file" data-picker-role="lif" data-picker-title="选择 LIF 2 原始文件">选择</button>
-            </div>
-          </div>
-          <div class="lif-input-row">
-            <span class="lif-input-slot">LIF 3</span>
-            <div class="lif-field lif-channel">
-              <span class="lif-mobile-label">LIF 通道</span>
-              <select id="importLif3Channel" aria-label="LIF 3 通道">
-                <option value="">选择通道</option>
-                <option value="G1">G1</option>
-                <option value="G2">G2</option>
-                <option value="R1">R1</option>
-                <option value="R2">R2</option>
-              </select>
-            </div>
-            <div class="lif-field lif-identity">
-              <span class="lif-mobile-label">样本标签</span>
-              <input id="importLif3Identity" type="text" placeholder="填写样本标签" aria-label="LIF 3 样本标签" />
-            </div>
-            <div class="lif-file-picker">
-              <span class="lif-mobile-label">LIF 原始文件</span>
-              <input id="importLif3Path" type="text" placeholder="选择 LIF 原始文件" aria-label="LIF 3 文件路径" />
-              <button class="small-button secondary path-picker-button" aria-label="选择 LIF 3 原始文件" data-picker-target="importLif3Path" data-picker-kind="file" data-picker-role="lif" data-picker-title="选择 LIF 3 原始文件">选择</button>
-            </div>
-          </div>
-        </div>
-        <label id="importQcAnchorLabel">QC anchor 通道</label>
-        <div class="qc-anchor-field">
-          <div id="importQcAnchorOptions" class="qc-anchor-grid" role="group" aria-labelledby="importQcAnchorLabel" aria-describedby="importQcAnchorRule"></div>
-          <div id="importQcAnchorRule" class="qc-anchor-rule">选择 2-3 个，且至少包含一个 G 通道和一个 R 通道。</div>
         </div>
         <label for="importMs">MS 文件</label>
         <div class="path-picker-row">
           <input id="importMs" type="text" placeholder="选择 MS 原始文件" />
           <button class="small-button secondary path-picker-button" aria-label="选择 MS 原始文件" data-picker-target="importMs" data-picker-kind="file" data-picker-role="ms" data-picker-title="选择 MS 原始文件">选择</button>
+        </div>
+        <label for="importCellEventMap">事件坐标 CSV</label>
+        <div class="path-picker-row">
+          <input id="importCellEventMap" type="text" placeholder="scan_start_time / UMAP1 / UMAP2" />
+          <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
         </div>
       </div>
       <div id="importHint" class="empty" style="margin-top:10px;"></div>
@@ -8112,6 +8708,14 @@ HTML = r"""<!doctype html>
         <span>标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
         <span>后段预校准取证范围(min)</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
+      <div id="attachMapPanel" class="manual-box" style="display:none; margin-top:12px;">
+        <p class="side-title">旧项目一次性附加事件坐标</p>
+        <div class="path-picker-row">
+          <input id="attachCellEventMap" type="text" placeholder="scan_start_time / UMAP1 / UMAP2" />
+          <button class="small-button secondary path-picker-button" aria-label="选择待附加的事件坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择待附加的事件坐标 CSV">选择</button>
+        </div>
+        <button id="attachMap" type="button" class="small-button secondary" style="margin-top:8px;">校验并附加</button>
+      </div>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
         <button id="saveConfig" class="small-button">保存项目时间节点</button>
@@ -8131,14 +8735,21 @@ HTML = r"""<!doctype html>
       showRejected: false,
       manualMode: false,
       stage: 'qc_calibration',
+      eventFilter: 'all',
+      manualAnnotationKind: 'qc',
       previewDeltaSec: null,
       localDeltaPreview: null,
       qcRefitPreview: null,
       manual: { anchors: {}, LIF: null, MS760: null },
       requestSeq: 0,
       actionBusy: false,
-      configSaveBusy: false
+      configSaveBusy: false,
+      importRows: [],
+      nextImportRowId: 1
     };
+    const stateChannel = ('BroadcastChannel' in window)
+      ? new BroadcastChannel('lma-studio-state-v1')
+      : null;
     const colors = { G1: '#2f6fed', G2: '#176b45', R2: '#b95d18', R1: '#6f4bb8', ms760: '#1f5f99', ms782: '#2a7d67' };
     const fallbackLifTracks = [
       { key: 'lif_g2', label: 'LIF G2 / Day0', kind: 'lif', channels: ['G2'] },
@@ -8157,8 +8768,17 @@ HTML = r"""<!doctype html>
     function tracksForCurrentProject() {
       if (state.meta?.bootstrap || !state.meta?.project) return [];
       const layoutChannels = state.meta?.acquisition_layout?.lif_channels || [];
+      const qcChannels = new Set(state.meta?.acquisition_layout?.qc_anchor_channels || []);
+      const relevantChannels = new Set(
+        layoutChannels
+          .filter(row => qcChannels.has(row.channel) || row.use_for_cell_annotation !== false)
+          .map(row => row.channel)
+      );
+      const visibleChannels = state.stage === 'qc_calibration'
+        ? qcChannels
+        : relevantChannels;
       const lifTracks = layoutChannels.length
-        ? layoutChannels.map((row) => ({
+        ? layoutChannels.filter(row => visibleChannels.has(row.channel)).map((row) => ({
             key: `lif_${String(row.channel).toLowerCase()}`,
             label: `LIF ${row.channel}${row.identity_prior ? ' / ' + row.identity_prior : ''}`,
             kind: 'lif',
@@ -8341,6 +8961,8 @@ HTML = r"""<!doctype html>
       state.start = Math.max(0, state.meta.time_min_min);
       state.timeMode = 'aligned';
       state.stage = 'qc_calibration';
+      state.eventFilter = 'all';
+      state.manualAnnotationKind = 'qc';
       applyStageWindowWidth();
       state.selectedCandidateId = null;
       state.previewDeltaSec = null;
@@ -8348,12 +8970,23 @@ HTML = r"""<!doctype html>
       resetManualSelection();
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
+      el('openUmap').disabled = !Boolean(state.meta?.cell_event_map?.available);
       el('loaded').innerHTML = [
         `LIF trace 行数: ${state.meta.lif_trace_rows.toLocaleString()}`,
         `LIF 峰数: ${state.meta.lif_peak_rows.toLocaleString()}`,
         `MS 事件数: ${state.meta.ms_event_rows.toLocaleString()}`,
         `MS scan 数: ${state.meta.ms_scan_rows.toLocaleString()}`
       ].map(escapeText).join('<br>');
+      notifyStateChannel('project-changed');
+    }
+
+    function notifyStateChannel(type = 'annotation-changed') {
+      if (!stateChannel) return;
+      stateChannel.postMessage({
+        type,
+        project_id: state.meta?.project_id || '',
+        map_sha256: state.meta?.cell_event_map?.sha256 || '',
+      });
     }
 
     function downloadTextFile(filename, text, contentType) {
@@ -8368,13 +9001,59 @@ HTML = r"""<!doctype html>
       URL.revokeObjectURL(url);
     }
 
+    function newImportLifRow() {
+      const row = {
+        id: state.nextImportRowId++,
+        path: '',
+        channel: '',
+        identity_prior: '',
+        use_for_qc: false,
+        use_for_cell_annotation: false,
+      };
+      return row;
+    }
+
     function importLifRows() {
-      return [1, 2, 3].map((idx) => ({
-        key: `lif_${idx}`,
-        path: el(`importLif${idx}Path`).value.trim(),
-        channel: el(`importLif${idx}Channel`).value.trim().toUpperCase(),
-        identity_prior: el(`importLif${idx}Identity`).value.trim(),
+      return state.importRows.map((row, index) => ({
+        key: `lif_${index + 1}`,
+        path: String(row.path || '').trim(),
+        channel: String(row.channel || '').trim().toUpperCase(),
+        identity_prior: String(row.identity_prior || '').trim(),
+        use_for_qc: Boolean(row.use_for_qc),
+        use_for_cell_annotation: Boolean(row.use_for_cell_annotation),
       }));
+    }
+
+    function renderImportLifRows() {
+      const box = el('importLifRows');
+      if (!box) return;
+      box.innerHTML = state.importRows.map((row, index) => `
+        <div class="lif-input-row" data-import-row-id="${row.id}">
+          <span class="lif-input-slot">LIF ${index + 1}</span>
+          <div class="lif-field lif-channel">
+            <span class="lif-mobile-label">LIF 通道</span>
+            <select data-import-field="channel" aria-label="LIF ${index + 1} 通道">
+              <option value="">选择</option>
+              ${['G1','G2','R1','R2'].map(channel => `<option value="${channel}"${row.channel === channel ? ' selected' : ''}>${channel}</option>`).join('')}
+            </select>
+          </div>
+          <div class="lif-field lif-identity">
+            <span class="lif-mobile-label">样本标签</span>
+            <input data-import-field="identity_prior" type="text" value="${escapeText(row.identity_prior)}" placeholder="${row.use_for_cell_annotation ? '细胞用途必填' : '可留空'}" aria-label="LIF ${index + 1} 样本标签" />
+          </div>
+          <div class="lif-use-options">
+            <label><input data-import-field="use_for_qc" type="checkbox"${row.use_for_qc ? ' checked' : ''} /> QC</label>
+            <label><input data-import-field="use_for_cell_annotation" type="checkbox"${row.use_for_cell_annotation ? ' checked' : ''} /> 细胞</label>
+          </div>
+          <div class="lif-file-picker">
+            <span class="lif-mobile-label">LIF 原始文件</span>
+            <input id="importLifPath${row.id}" data-import-field="path" type="text" value="${escapeText(row.path)}" placeholder="选择 LIF 原始文件" aria-label="LIF ${index + 1} 文件路径" />
+            <button type="button" class="small-button secondary path-picker-button" aria-label="选择 LIF ${index + 1} 原始文件" data-picker-target="importLifPath${row.id}" data-picker-kind="file" data-picker-role="lif" data-picker-title="选择 LIF ${index + 1} 原始文件">选择</button>
+          </div>
+          <button type="button" class="small-button secondary lif-remove" data-remove-import-row="${row.id}" aria-label="删除 LIF ${index + 1}"${state.importRows.length <= 2 ? ' disabled' : ''}>×</button>
+        </div>
+      `).join('');
+      refreshImportQcAnchorOptions();
     }
 
     function duplicateImportLifPathMessage() {
@@ -8392,37 +9071,14 @@ HTML = r"""<!doctype html>
 
     function refreshImportQcAnchorOptions() {
       const rows = importLifRows();
-      const channels = Array.from(new Set(rows.map(row => row.channel).filter(Boolean)));
-      const box = el('importQcAnchorOptions');
-      const selected = new Set(
-        Array.from(box.querySelectorAll('input[type="checkbox"]:checked')).map(node => node.value)
-      );
-      box.innerHTML = '';
-      if (!channels.length) {
-        const empty = document.createElement('span');
-        empty.className = 'qc-anchor-empty';
-        empty.textContent = '请先选择上方 LIF 通道';
-        box.appendChild(empty);
-        return;
-      }
-      channels.forEach((channel) => {
-        const label = document.createElement('label');
-        label.className = 'qc-anchor-option';
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.value = channel;
-        input.checked = selected.has(channel);
-        label.appendChild(input);
-        const text = document.createElement('span');
-        text.textContent = channel;
-        label.appendChild(text);
-        box.appendChild(label);
-      });
+      const qc = rows.filter(row => row.use_for_qc).length;
+      const cell = rows.filter(row => row.use_for_cell_annotation).length;
+      el('importRoleSummary').textContent = `QC ${qc} · 细胞 ${cell} · 共 ${rows.length} 个 LIF`;
+      el('addImportLif').disabled = rows.length >= 4;
     }
 
     function selectedImportQcAnchorChannels() {
-      return Array.from(el('importQcAnchorOptions').querySelectorAll('input[type="checkbox"]:checked'))
-        .map(node => node.value);
+      return importLifRows().filter(row => row.use_for_qc).map(row => row.channel).filter(Boolean);
     }
 
     let activeModal = null;
@@ -8465,19 +9121,13 @@ HTML = r"""<!doctype html>
       if (open) {
         [
           'importProjectDir',
-          'importLif1Path',
-          'importLif2Path',
-          'importLif3Path',
           'importMs',
+          'importCellEventMap',
         ].forEach((targetId) => {
           el(targetId).value = '';
         });
-        [1, 2, 3].forEach((idx) => {
-          el(`importLif${idx}Channel`).value = '';
-          el(`importLif${idx}Identity`).value = '';
-        });
-        el('importQcAnchorOptions').innerHTML = '';
-        refreshImportQcAnchorOptions();
+        state.importRows = [newImportLifRow(), newImportLifRow(), newImportLifRow()];
+        renderImportLifRows();
         const externalMode = document.querySelector('input[name="rawInputMode"][value="external_reference"]');
         if (externalMode) externalMode.checked = true;
         el('importHint').textContent = '';
@@ -8496,9 +9146,26 @@ HTML = r"""<!doctype html>
 
     function setProjectConfigModal(open) {
       if (!open && state.configSaveBusy) return;
-      if (open) renderConfigInputs();
-      if (open) setConfigSaveStatus('');
+      if (open) {
+        renderConfigInputs();
+        setConfigSaveStatus('');
+        el('attachMapPanel').style.display = state.meta?.cell_event_map?.attach_allowed ? 'block' : 'none';
+        el('attachCellEventMap').value = '';
+      }
       setModalVisibility('projectConfigModal', open);
+    }
+
+    async function openUmapWindow() {
+      if (!state.meta?.cell_event_map?.available) return;
+      try {
+        if (window.pywebview?.api?.open_umap_window) {
+          await window.pywebview.api.open_umap_window();
+        } else {
+          window.open('/umap', 'lma-umap');
+        }
+      } catch (err) {
+        alert(`无法打开 UMAP 窗口: ${err.message || err}`);
+      }
     }
 
     function selectedRawInputMode() {
@@ -8514,6 +9181,7 @@ HTML = r"""<!doctype html>
       el('start').value = state.start.toFixed(2);
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
+      el('openUmap').disabled = !Boolean(state.meta?.cell_event_map?.available);
       const loadedLines = state.meta.bootstrap ? [
         '等待新建或打开项目',
         '请选择新建项目或打开已有项目。'
@@ -8529,6 +9197,7 @@ HTML = r"""<!doctype html>
         : `已加载项目: ${state.meta.project.project_dir}`;
       renderConfigInputs();
       await loadWindow();
+      if (!state.meta.bootstrap) notifyStateChannel('project-changed');
     }
 
     async function loadWindow() {
@@ -8582,6 +9251,15 @@ HTML = r"""<!doctype html>
       });
     }
 
+    function renderCurrentState() {
+      if (!state.current) return;
+      updateMetrics();
+      draw();
+      renderCandidateList();
+      renderManualSelection();
+      updateAcceptWindowButton();
+    }
+
     function updateExportHint() {
       const summary = state.current?.annotation_store || state.meta?.annotation_store || {};
       const accepted = Number(summary.counts?.accepted || 0);
@@ -8595,8 +9273,9 @@ HTML = r"""<!doctype html>
       const qcEnd = Number(cfg.qc_calibration_end_min || 10.5);
       const anchors = qcAnchorChannels();
       if (state.stage === 'local_calibration') return '标注起点后的未标注峰拓扑预校准：只估计 MS 后段局部平移，不产生 annotation。';
-      if (state.stage === 'qc_survey') return frozen ? `冻结后段 time model 后的 QC 巡检候选：沿用 ${anchors.join('/')}/MS760 anchor 组，用于后段 QC 证据巡检。` : '请先在“后段局部校正”中冻结 delta，再进入 QC 巡检。';
-      if (state.stage === 'cell_annotation') return frozen ? '冻结 time model 后的高保守细胞候选：按 LIF 通道颜色连接到 MS760，默认逐条人工确认。' : '请先在“后段局部校正”中冻结 delta，再进入细胞标注。';
+      if (state.stage === 'event_annotation') return frozen
+        ? `同一阶段审核 map 白名单内的 QC anchor 与细胞二元组；QC 沿用 ${anchors.join('/')}，两类均逐条确认。`
+        : '请先在“后段局部校正”中冻结 delta，再进入事件标注。';
       return `前 ${fmt(qcEnd, 1)} min QC anchor 审核，用于确认 shift-only 时间校正。`;
     }
 
@@ -8641,8 +9320,17 @@ HTML = r"""<!doctype html>
       if (state.stage === 'local_calibration') {
         return { pending: 0, accepted: 0, rejected: 0 };
       }
-      if (state.stage === 'qc_survey') return state.current.post_qc_counts || {};
-      if (state.stage === 'cell_annotation') return state.current.cell_counts || {};
+      if (state.stage === 'event_annotation') {
+        const qc = state.current.post_qc_counts || {};
+        const cell = state.current.cell_counts || {};
+        if (state.eventFilter === 'qc') return qc;
+        if (state.eventFilter === 'cell') return cell;
+        return {
+          pending: Number(qc.pending || 0) + Number(cell.pending || 0),
+          accepted: Number(qc.accepted || 0) + Number(cell.accepted || 0),
+          rejected: Number(qc.rejected || 0) + Number(cell.rejected || 0),
+        };
+      }
       return state.current.annotation_counts || {};
     }
 
@@ -8707,22 +9395,24 @@ HTML = r"""<!doctype html>
       let rows = [];
       if (state.stage === 'local_calibration') {
         rows = [];
-      } else if (state.stage === 'qc_survey') {
-        rows = [...(state.current?.post_qc_candidates || [])];
-      } else if (state.stage === 'cell_annotation') {
-        rows = [...(state.current?.cell_candidates || [])];
+      } else if (state.stage === 'event_annotation') {
+        rows = [
+          ...(state.current?.post_qc_candidates || []),
+          ...(state.current?.cell_candidates || []),
+        ].filter(eventRowMatchesFilter);
       } else {
         rows = [...(state.current?.alignment_groups || [])];
       }
       const manualRows = (state.current?.annotations || [])
         .filter(row => row.source === 'manual_created')
         .filter(row => manualBelongsToStage(row, state.stage))
+        .filter(row => state.stage !== 'event_annotation' || eventRowMatchesFilter(row))
         .map(row => ({
           ...row,
           rank: '人工',
           candidate_id: row.annotation_id
         }));
-      const combined = (state.stage === 'qc_calibration' || state.stage === 'qc_survey' || state.stage === 'cell_annotation') ? [...rows, ...manualRows] : rows;
+      const combined = (state.stage === 'qc_calibration' || state.stage === 'event_annotation') ? [...rows, ...manualRows] : rows;
       return combined
         .filter(row => state.showRejected || row.review_status !== 'rejected')
         .sort((a, b) => Number(a.ms_plot_time_min || a.ms_time_min || 0) - Number(b.ms_plot_time_min || b.ms_time_min || 0));
@@ -8730,6 +9420,11 @@ HTML = r"""<!doctype html>
 
     function manualBelongsToStage(row, stage) {
       const explicit = row.review_stage || '';
+      if (stage === 'event_annotation') {
+        return ['qc_survey', 'cell_annotation'].includes(explicit)
+          || eventRowKind(row) === 'qc'
+          || eventRowKind(row) === 'cell';
+      }
       if (explicit === 'qc_calibration' || explicit === 'qc_survey' || explicit === 'cell_annotation') return explicit === stage;
       if (stage === 'cell_annotation' && (row.candidate_type === 'manual_cell_pair' || String(row.candidate_type || '').startsWith('cell'))) return true;
       if (stage === 'qc_survey' && row.candidate_type === 'manual_qc_anchor_partial') return true;
@@ -8742,12 +9437,22 @@ HTML = r"""<!doctype html>
       return false;
     }
 
+    function eventRowKind(row) {
+      const explicit = String(row?.review_stage || '');
+      const type = String(row?.candidate_type || '');
+      if (explicit === 'cell_annotation' || type === 'manual_cell_pair' || type.startsWith('cell')) return 'cell';
+      if (explicit === 'qc_survey' || type === 'qc_survey_post_10p5' || type.startsWith('manual_qc')) return 'qc';
+      return '';
+    }
+
+    function eventRowMatchesFilter(row) {
+      return state.eventFilter === 'all' || eventRowKind(row) === state.eventFilter;
+    }
+
     function qcCandidatesForCurrentStage() {
       if (!state.current) return [];
-      if (state.stage === 'cell_annotation' || state.stage === 'local_calibration') return [];
-      return state.stage === 'qc_survey'
-        ? (state.current.post_qc_candidates || [])
-        : (state.current.alignment_groups || []);
+      if (state.stage !== 'qc_calibration') return [];
+      return state.current.alignment_groups || [];
     }
 
     function candidateInsideMainWindow(row) {
@@ -8817,21 +9522,16 @@ HTML = r"""<!doctype html>
       const n = batchAcceptableAutoCandidatesInMainWindow().length;
       const individual = Math.max(0, pending - n);
       el('acceptWindow').textContent = `批量接受唯一匹配（${n}）`;
-      if (state.stage === 'cell_annotation' || state.stage === 'local_calibration') {
+      if (state.stage === 'event_annotation' || state.stage === 'local_calibration') {
         if (state.stage === 'local_calibration') {
           el('acceptWindowHint').textContent = '局部校正只做 preview，不写入 annotation';
         } else {
-          el('acceptWindowHint').textContent = '细胞标注候选需逐条确认';
+          el('acceptWindowHint').textContent = '事件标注阶段的 QC / 细胞候选均需逐条确认';
         }
         el('acceptWindow').disabled = true;
         return;
       }
       const tm = state.current?.time_model || state.meta?.time_model || {};
-      if (state.stage === 'qc_survey' && tm.status !== 'frozen') {
-        el('acceptWindowHint').textContent = 'draft preview：冻结 delta 后才允许写入 QC 巡检审核';
-        el('acceptWindow').disabled = true;
-        return;
-      }
       el('acceptWindowHint').textContent = `待审 ${pending}：可批量 ${n}${individual ? `，需逐条 ${individual}` : ''}`;
       el('acceptWindow').disabled = n === 0;
     }
@@ -8915,35 +9615,39 @@ HTML = r"""<!doctype html>
     function renderStagePanels() {
       const local = state.stage === 'local_calibration';
       const qcCalibration = state.stage === 'qc_calibration';
-      const qcSurvey = state.stage === 'qc_survey';
-      const cell = state.stage === 'cell_annotation';
+      const eventAnnotation = state.stage === 'event_annotation';
+      const cellMode = eventAnnotation && state.manualAnnotationKind === 'cell';
       const frozen = (state.current?.time_model || state.meta?.time_model || {}).status === 'frozen';
       el('qcRefitPanel').style.display = qcCalibration ? 'block' : 'none';
       el('baseTimePanel').style.display = local ? 'none' : 'block';
-      el('reviewPanel').style.display = (local || ((qcSurvey || cell) && !frozen)) ? 'none' : 'block';
-      el('manualPanel').style.display = (qcCalibration || (qcSurvey && frozen) || (cell && frozen)) ? 'block' : 'none';
-      if (qcCalibration || (qcSurvey && frozen) || (cell && frozen)) {
+      el('reviewPanel').style.display = (local || (eventAnnotation && !frozen)) ? 'none' : 'block';
+      el('manualPanel').style.display = (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
+      if (qcCalibration || (eventAnnotation && frozen)) {
         el('reviewPanel').parentNode.insertBefore(el('manualPanel'), el('reviewPanel'));
       }
-      el('manualLifRow').style.display = cell ? 'block' : 'none';
-      el('manualPanelTitle').textContent = cell ? '手动细胞二元组' : '手动 QC anchor';
-      el('acceptWindow').style.display = cell ? 'none' : 'block';
-      if (cell) {
-        el('reviewHelp').textContent = '残差 = MS760 时间 - LIF 峰校正后时间，单位 sec；候选必须逐条人工确认。';
-      } else if (qcSurvey && !frozen) {
-        el('reviewHelp').textContent = '当前为 draft preview：候选只用于检查 delta，冻结前不会写入 annotation。';
+      el('eventFilter').style.display = eventAnnotation ? 'grid' : 'none';
+      el('manualAnnotationKind').style.display = eventAnnotation ? 'grid' : 'none';
+      el('manualLifRow').style.display = cellMode ? 'block' : 'none';
+      el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动 QC anchor';
+      el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
+      document.querySelectorAll('[data-event-filter]').forEach(button => {
+        button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
+      });
+      document.querySelectorAll('[data-manual-kind]').forEach(button => {
+        button.classList.toggle('active', button.dataset.manualKind === state.manualAnnotationKind);
+      });
+      if (eventAnnotation) {
+        el('reviewHelp').textContent = 'QC 与细胞候选共享同一 event-map 白名单，均需逐条确认；同一 MS event 不能同时接受两种分类。';
       } else {
         const anchors = qcAnchorChannels();
-        el('reviewHelp').textContent = qcSurvey
-          ? `残差 = MS760 时间 - ${anchors.join('/')} 按时间轴聚合后的组合时间，单位 sec；缺失通道保存为 NA。`
-          : `残差 = MS760 时间 - ${anchors.join('/')} 按时间轴聚合后的组合时间，单位 sec；越接近 0 表示时间对齐越好。`;
+        el('reviewHelp').textContent = `残差 = MS760 时间 - ${anchors.join('/')} 按时间轴聚合后的组合时间，单位 sec；越接近 0 表示时间对齐越好。`;
       }
       const anchors = qcAnchorChannels();
-      el('manualHelp').textContent = qcSurvey
-        ? `QC 巡检：MS760 必选；${anchors.join('/')} 至少选择一个，缺失通道保存为 NA。`
-        : cell
-          ? '细胞标注：选择一个项目配置 LIF 峰和一个 MS760 峰，建立严格二元组。'
-          : `QC 校正：选择覆盖全部时间轴的 ${anchors.join('/')} 峰和 MS760 峰。`;
+      el('manualHelp').textContent = eventAnnotation
+        ? (cellMode
+            ? '细胞二元组：选择一个启用细胞用途的 LIF 峰和一个 map 内 MS760 event。'
+            : `QC anchor：MS760 必选；${anchors.join('/')} 至少选择一个，缺失通道保存为 NA。`)
+        : `QC 校正：选择覆盖全部时间轴的 ${anchors.join('/')} 峰和 MS760 峰。`;
     }
 
     function setConfigSaveStatus(message, type = '') {
@@ -9006,7 +9710,7 @@ HTML = r"""<!doctype html>
         const qcEnd = Number(cfg.qc_calibration_end_min || 10.5);
         if (state.stage === 'local_calibration') {
           state.start = annotationStart;
-        } else if ((state.stage === 'qc_survey' || state.stage === 'cell_annotation') && Number(state.start) < annotationStart) {
+        } else if (state.stage === 'event_annotation' && Number(state.start) < annotationStart) {
           state.start = annotationStart;
         } else if (state.stage === 'qc_calibration' && Number(state.start) > qcEnd) {
           state.start = 0;
@@ -9350,6 +10054,7 @@ HTML = r"""<!doctype html>
         });
         state.qcRefitPreview = null;
         await loadWindow();
+        notifyStateChannel();
       } catch (err) {
         alert(`审核写入失败: ${err.message}`);
       } finally {
@@ -9369,6 +10074,7 @@ HTML = r"""<!doctype html>
         if (state.selectedCandidateId === annotationId) state.selectedCandidateId = null;
         state.qcRefitPreview = null;
         await loadWindow();
+        notifyStateChannel();
       } catch (err) {
         alert(`清除失败: ${err.message}`);
       } finally {
@@ -9408,22 +10114,36 @@ HTML = r"""<!doctype html>
         refreshImportQcAnchorOptions();
         const lifInputs = importLifRows();
         const channels = lifInputs.map(row => row.channel);
+        if (lifInputs.length < 2 || lifInputs.length > 4) {
+          throw new Error('LIF 输入必须为 2–4 个。');
+        }
         if (lifInputs.some(row => !row.path || !row.channel)) {
-          throw new Error('请为 3 个 LIF 输入填写文件路径和通道名。');
+          throw new Error('请为每个 LIF 输入填写文件路径和通道名。');
         }
         if (new Set(channels).size !== channels.length) {
-          throw new Error('3 个 LIF 通道名不能重复。');
+          throw new Error('LIF 通道名不能重复。');
         }
         const duplicatePathMessage = duplicateImportLifPathMessage();
         if (duplicatePathMessage) {
           throw new Error(duplicatePathMessage);
         }
         const qcAnchorChannels = selectedImportQcAnchorChannels();
+        const cellRows = lifInputs.filter(row => row.use_for_cell_annotation);
+        if (!cellRows.length) {
+          throw new Error('至少一个 LIF 通道必须用于细胞标注。');
+        }
+        const missingCellLabels = cellRows.filter(row => !row.identity_prior).map(row => row.channel);
+        if (missingCellLabels.length) {
+          throw new Error(`用于细胞标注的通道必须填写样本标签：${missingCellLabels.join('、')}。`);
+        }
         if (qcAnchorChannels.length < 2 || qcAnchorChannels.length > Math.min(4, channels.length)) {
           throw new Error(`QC anchor 必须选择 2-${Math.min(4, channels.length)} 个 LIF 通道。`);
         }
         if (!qcAnchorChannels.some(channel => channel.startsWith('G')) || !qcAnchorChannels.some(channel => channel.startsWith('R'))) {
           throw new Error('QC anchor 必须至少包含一个绿色通道和一个红色通道。');
+        }
+        if (!el('importProjectDir').value.trim() || !el('importMs').value.trim() || !el('importCellEventMap').value.trim()) {
+          throw new Error('请选择项目保存路径、MS 原始文件和事件坐标 CSV。');
         }
         const result = await postJson('/api/import-project', {
           project_dir: el('importProjectDir').value,
@@ -9431,6 +10151,7 @@ HTML = r"""<!doctype html>
           raw_input_mode: selectedRawInputMode(),
           lif_inputs: lifInputs,
           qc_anchor_channels: qcAnchorChannels,
+          cell_event_map_path: el('importCellEventMap').value,
         });
         applyLoadedProjectMeta(result.meta);
         await loadWindow();
@@ -9467,6 +10188,39 @@ HTML = r"""<!doctype html>
       }
     }
 
+    async function attachCellEventMap() {
+      if (state.actionBusy) return;
+      const sourcePath = el('attachCellEventMap').value.trim();
+      if (!sourcePath) {
+        setConfigSaveStatus('请选择事件坐标 CSV。', 'error');
+        return;
+      }
+      if (!window.confirm('事件坐标将清洗为 canonical 五列表并一次性绑定到当前项目；v0.3.0 不支持替换。继续？')) return;
+      state.actionBusy = true;
+      const button = el('attachMap');
+      const oldText = button.textContent;
+      button.disabled = true;
+      button.textContent = '校验中…';
+      setConfigSaveStatus('正在校验 CSV 与当前 MS event 的一对一关系…');
+      try {
+        const result = await postJson('/api/attach-cell-event-map', { source_path: sourcePath });
+        state.meta = result.meta;
+        state.current = null;
+        el('openUmap').disabled = false;
+        el('attachMapPanel').style.display = 'none';
+        await loadWindow();
+        notifyStateChannel('map-attached');
+        setConfigSaveStatus(`已附加 ${result.cell_event_map?.counts?.unknown ?? result.meta.cell_event_map.row_count} 个事件坐标点。`, 'success');
+      } catch (err) {
+        setConfigSaveStatus(`附加失败：${err.message}`, 'error');
+        alert(`附加事件坐标失败: ${err.message}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = oldText;
+        state.actionBusy = false;
+      }
+    }
+
     function pickerInitialDir(targetId) {
       const currentValue = el(targetId).value.trim();
       if (currentValue) {
@@ -9496,6 +10250,7 @@ HTML = r"""<!doctype html>
         });
         if (!result.cancelled && result.path) {
           target.value = result.path;
+          target.dispatchEvent(new Event('input', { bubbles: true }));
           target.focus();
           el('importHint').textContent = duplicateImportLifPathMessage();
         } else {
@@ -9527,6 +10282,7 @@ HTML = r"""<!doctype html>
         });
         state.qcRefitPreview = null;
         await loadWindow();
+        notifyStateChannel();
         const accepted = Number(response.result?.accepted_count || 0);
         const skipped = Number(response.result?.skipped_count || 0);
         if (accepted !== n || skipped > 0) {
@@ -9540,7 +10296,7 @@ HTML = r"""<!doctype html>
     }
 
     function renderManualSelection() {
-      const cell = state.stage === 'cell_annotation';
+      const cell = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
       const anchors = qcAnchorChannels();
       el('manualMode').classList.toggle('manual-mode-on', state.manualMode);
       el('manualMode').textContent = state.manualMode ? '选择中' : '选择峰';
@@ -9557,7 +10313,14 @@ HTML = r"""<!doctype html>
 
     function selectManualPeak(kind, row) {
       if (!state.manualMode) return;
-      if (state.stage === 'cell_annotation' && kind !== 'MS760') {
+      const cellMode = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
+      if (cellMode && kind !== 'MS760') {
+        const allowed = new Set(
+          (state.meta?.acquisition_layout?.lif_channels || [])
+            .filter(item => item.use_for_cell_annotation !== false)
+            .map(item => item.channel)
+        );
+        if (allowed.size && !allowed.has(row.channel)) return;
         state.manual.LIF = { id: row.peak_id, channel: row.channel, time: row.raw_time_min ?? row.time_min };
         state.manual.anchors = {};
       } else {
@@ -9575,8 +10338,8 @@ HTML = r"""<!doctype html>
 
     async function createManualTriplet() {
       if (state.actionBusy) return;
-      const cell = state.stage === 'cell_annotation';
-      const qcSurvey = state.stage === 'qc_survey';
+      const cell = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
+      const qcSurvey = state.stage === 'event_annotation';
       if (cell) {
         if (!state.manual.LIF || !state.manual.MS760) {
           alert('细胞标注需选择一个 LIF 峰和一个 MS760 峰。');
@@ -9595,6 +10358,7 @@ HTML = r"""<!doctype html>
           resetManualSelection();
           state.manualMode = false;
           await loadWindow();
+          notifyStateChannel();
         } catch (err) {
           alert(`手动细胞二元组写入失败: ${err.message}`);
         } finally {
@@ -9629,7 +10393,7 @@ HTML = r"""<!doctype html>
         await postJson('/api/manual-triplet', {
           lif_anchor_peak_ids: selectedAnchorIds,
           ms_event_id: state.manual.MS760.id,
-          stage: state.stage,
+          stage: qcSurvey ? 'qc_survey' : 'qc_calibration',
           window_start_min: state.current.start_min,
           window_end_min: state.current.end_min,
           time_mode: state.current.time_mode,
@@ -9639,6 +10403,7 @@ HTML = r"""<!doctype html>
         resetManualSelection();
         state.manualMode = false;
         await loadWindow();
+        notifyStateChannel();
       } catch (err) {
         alert(`手动 QC anchor 写入失败: ${err.message}`);
       } finally {
@@ -9653,6 +10418,31 @@ HTML = r"""<!doctype html>
 
     function svgEl(name, attrs = {}) {
       return setAttrs(document.createElementNS('http://www.w3.org/2000/svg', name), attrs);
+    }
+
+    function visibleThirdStageLifPeakIds() {
+      const ids = new Set();
+      if (state.stage !== 'event_annotation' || !state.meta?.cell_event_map?.available) return null;
+      const rows = [];
+      const allowedEventIds = new Set(
+        (state.current?.ms_events || [])
+          .filter(event => event.in_cell_event_map === true)
+          .map(event => String(event.event_id))
+      );
+      if (state.eventFilter !== 'cell') {
+        rows.push(...(state.current?.post_qc_candidates || []));
+        rows.push(...(state.current?.cell_qc_anchors || []));
+      }
+      if (state.eventFilter !== 'qc') rows.push(...(state.current?.cell_candidates || []));
+      (state.current?.annotations || [])
+        .filter(row => allowedEventIds.has(String(row.ms_event_id || '')))
+        .filter(row => eventRowMatchesFilter(row))
+        .forEach(row => rows.push(row));
+      rows.forEach(row => {
+        Object.values(qcAnchorPeakIds(row)).filter(Boolean).forEach(id => ids.add(String(id)));
+        if (row.lif_peak_id) ids.add(String(row.lif_peak_id));
+      });
+      return ids;
     }
 
     function draw() {
@@ -9678,6 +10468,8 @@ HTML = r"""<!doctype html>
       const contextPadPx = Math.min(86, (contextMarginMin / Math.max(1e-6, end - start)) * plotW);
       const amplitudeLabelX = x0 - contextPadPx - 16;
       const markerPositions = {};
+      const thirdStagePeakIds = visibleThirdStageLifPeakIds();
+      const restrictThirdStageHits = thirdStagePeakIds !== null;
 
       const bg = svgEl('rect', { x: 0, y: 0, width, height, fill: '#fff' });
       svg.appendChild(bg);
@@ -9752,6 +10544,7 @@ HTML = r"""<!doctype html>
             .filter(p => track.channels.includes(p.channel))
             .forEach(p => {
               const peakY = lifPeakY(p);
+              const interactive = !restrictThirdStageHits || thirdStagePeakIds.has(String(p.peak_id));
               const c = svgEl('circle', {
                 cx: xScale(p.plot_time_min),
                 cy: yScale(peakY),
@@ -9759,17 +10552,24 @@ HTML = r"""<!doctype html>
                 fill: colorForChannel(p.channel),
                 stroke: p.close_peak_risk || p.merge_risk ? '#b42318' : '#fff',
                 'stroke-width': 1.3,
-                class: 'peak-marker',
-                tabindex: 0
+                class: 'peak-marker'
               });
-              c.__detail = { kind: 'lif_peak', type: 'LIF 峰', data: p };
-              attachHover(c);
-              c.addEventListener('click', () => {
-                selectManualPeak('LIF', p);
-              });
+              if (interactive) {
+                c.setAttribute('tabindex', '0');
+                c.__detail = { kind: 'lif_peak', type: 'LIF 峰', data: p };
+                attachHover(c);
+                c.addEventListener('click', () => {
+                  selectManualPeak('LIF', p);
+                });
+              } else {
+                c.setAttribute('opacity', '.42');
+                c.setAttribute('pointer-events', 'none');
+              }
               svg.appendChild(c);
-              markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
-              addTimeLabel(svg, fmt(p.raw_time_min ?? p.time_min, 3), xScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes);
+              if (interactive) {
+                markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
+                addTimeLabel(svg, fmt(p.raw_time_min ?? p.time_min, 3), xScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes);
+              }
             });
         } else {
           const trace = state.current.ms_traces[track.trace] || [];
@@ -9783,6 +10583,9 @@ HTML = r"""<!doctype html>
           state.current.ms_events.forEach(e => {
             const raw = track.trace === 'pc34_760_linear' ? e.pc34_760_apex : e.qc_782_apex;
             const y = Math.max(0, Number(raw || 0));
+            const interactive = state.stage !== 'event_annotation'
+              || !state.meta?.cell_event_map?.available
+              || e.in_cell_event_map === true;
             const c = svgEl('circle', {
               cx: xScale(e.plot_time_min),
               cy: yScale(y),
@@ -9790,33 +10593,42 @@ HTML = r"""<!doctype html>
               fill: track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782,
               stroke: e.low_quality_scan_window || e.collision_risk_high ? '#b42318' : '#fff',
               'stroke-width': 1.3,
-              class: 'peak-marker',
-              tabindex: 0
+              class: 'peak-marker'
             });
-            c.__detail = {
-              kind: track.trace === 'pc34_760_linear' ? 'ms760_peak' : 'ms782_peak',
-              type: track.trace === 'pc34_760_linear' ? 'MS 760 峰' : 'MS 782 峰',
-              data: e
-            };
-            attachHover(c);
-            if (track.trace === 'pc34_760_linear') {
-              c.addEventListener('click', () => selectManualPeak('MS760', e));
+            if (interactive) {
+              c.setAttribute('tabindex', '0');
+              c.__detail = {
+                kind: track.trace === 'pc34_760_linear' ? 'ms760_peak' : 'ms782_peak',
+                type: track.trace === 'pc34_760_linear' ? 'MS 760 峰' : 'MS 782 峰',
+                data: e
+              };
+              attachHover(c);
+              if (track.trace === 'pc34_760_linear') {
+                c.addEventListener('click', () => selectManualPeak('MS760', e));
+              }
+            } else {
+              c.setAttribute('opacity', '.38');
+              c.setAttribute('pointer-events', 'none');
             }
             svg.appendChild(c);
-            if (track.trace === 'pc34_760_linear') {
+            if (interactive && track.trace === 'pc34_760_linear') {
               markerPositions[`ms760:${e.event_id}`] = { x: xScale(e.plot_time_min), y: yScale(y) };
             }
-            addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782, labelBoxes);
+            if (interactive) {
+              addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782, labelBoxes);
+            }
           });
         }
       });
-      if (state.stage === 'qc_survey') {
-        drawPostQcCandidates(svg, markerPositions);
-        drawManualAnnotations(svg, markerPositions);
-      } else if (state.stage === 'cell_annotation') {
-        drawAcceptedQcSurveyAnnotations(svg, markerPositions);
-        drawCellCandidates(svg, markerPositions);
-        drawManualCellAnnotations(svg, markerPositions);
+      if (state.stage === 'event_annotation') {
+        if (state.eventFilter !== 'cell') {
+          drawPostQcCandidates(svg, markerPositions);
+          drawManualAnnotations(svg, markerPositions);
+        }
+        if (state.eventFilter !== 'qc') {
+          drawCellCandidates(svg, markerPositions);
+          drawManualCellAnnotations(svg, markerPositions);
+        }
       } else {
         drawAlignmentGroups(svg, markerPositions);
         drawManualAnnotations(svg, markerPositions);
@@ -9945,6 +10757,7 @@ HTML = r"""<!doctype html>
       (state.current.annotations || [])
         .filter(row => row.source === 'manual_created')
         .filter(row => manualBelongsToStage(row, state.stage))
+        .filter(row => state.stage !== 'event_annotation' || eventRowKind(row) === 'qc')
         .forEach(row => {
           if (row.review_status === 'rejected') return;
           const markerGroup = qcAnchorMarkerPoints(row, markerPositions);
@@ -10275,19 +11088,19 @@ HTML = r"""<!doctype html>
         state.previewDeltaSec = null;
         const cfg = state.current?.project_config || state.meta?.project_config || {};
         const annotationStart = Number(cfg.annotation_start_min || state.start);
-        if (state.stage === 'qc_survey' || state.stage === 'cell_annotation' || state.stage === 'local_calibration') {
+        if (state.stage === 'event_annotation' || state.stage === 'local_calibration') {
           state.timeMode = 'aligned';
           el('timeMode').value = state.timeMode;
         }
         if (state.stage === 'local_calibration') {
           state.start = annotationStart;
-        } else if ((state.stage === 'qc_survey' || state.stage === 'cell_annotation') && Number(state.start) < annotationStart) {
+        } else if (state.stage === 'event_annotation' && Number(state.start) < annotationStart) {
           state.start = annotationStart;
         }
         if (state.stage === 'qc_calibration' && Number(state.start) > Number(cfg.qc_calibration_end_min || 10.5)) {
           state.start = Math.max(0, Number(state.meta?.time_min_min || 0));
         }
-        if (state.stage === 'local_calibration' || state.stage === 'qc_survey' || state.stage === 'cell_annotation' || state.stage === 'qc_calibration') {
+        if (state.stage === 'local_calibration' || state.stage === 'event_annotation' || state.stage === 'qc_calibration') {
           await loadWindow();
           return;
         }
@@ -10313,6 +11126,7 @@ HTML = r"""<!doctype html>
     el('openImportProject').addEventListener('click', () => setImportModal(true));
     el('openExistingProject').addEventListener('click', () => setOpenProjectModal(true));
     el('openConfigProject').addEventListener('click', () => setProjectConfigModal(true));
+    el('openUmap').addEventListener('click', openUmapWindow);
     el('bootstrapNewProject').addEventListener('click', () => setImportModal(true));
     el('bootstrapOpenProject').addEventListener('click', () => setOpenProjectModal(true));
     el('closeImportProject').addEventListener('click', () => setImportModal(false));
@@ -10324,16 +11138,55 @@ HTML = r"""<!doctype html>
     el('projectConfigModal').addEventListener('click', (ev) => {
       if (ev.target === el('projectConfigModal')) setProjectConfigModal(false);
     });
-    document.querySelectorAll('[data-picker-target]').forEach(button => {
-      button.addEventListener('click', () => selectImportPath(button));
+    document.addEventListener('click', (event) => {
+      const picker = event.target.closest('[data-picker-target]');
+      if (picker) {
+        event.preventDefault();
+        selectImportPath(picker);
+        return;
+      }
+      const remove = event.target.closest('[data-remove-import-row]');
+      if (remove) {
+        if (state.importRows.length <= 2) return;
+        const rowId = Number(remove.dataset.removeImportRow);
+        state.importRows = state.importRows.filter(row => row.id !== rowId);
+        renderImportLifRows();
+      }
     });
-    [1, 2, 3].forEach((idx) => {
-      el(`importLif${idx}Channel`).addEventListener('change', refreshImportQcAnchorOptions);
+    el('importLifRows').addEventListener('input', event => {
+      const rowElement = event.target.closest('[data-import-row-id]');
+      const field = event.target.dataset.importField;
+      if (!rowElement || !field) return;
+      const row = state.importRows.find(item => item.id === Number(rowElement.dataset.importRowId));
+      if (!row) return;
+      row[field] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+      if (field === 'use_for_cell_annotation') renderImportLifRows();
+      else refreshImportQcAnchorOptions();
+    });
+    el('addImportLif').addEventListener('click', () => {
+      if (state.importRows.length >= 4) return;
+      state.importRows.push(newImportLifRow());
+      renderImportLifRows();
+    });
+    document.querySelectorAll('[data-event-filter]').forEach(button => {
+      button.addEventListener('click', () => {
+        state.eventFilter = button.dataset.eventFilter;
+        state.selectedCandidateId = null;
+        renderCurrentState();
+      });
+    });
+    document.querySelectorAll('[data-manual-kind]').forEach(button => {
+      button.addEventListener('click', () => {
+        state.manualAnnotationKind = button.dataset.manualKind;
+        resetManualSelection();
+        renderCurrentState();
+      });
     });
     el('runImportProject').addEventListener('click', importProject);
     el('runOpenProject').addEventListener('click', openExistingProject);
     el('acceptWindow').addEventListener('click', acceptWindowPendingAutoCandidates);
     el('saveConfig').addEventListener('click', saveProjectConfig);
+    el('attachMap').addEventListener('click', attachCellEventMap);
     el('previewQcRefit').addEventListener('click', previewQcAlignmentRefit);
     el('applyQcRefit').addEventListener('click', applyQcAlignmentRefit);
     el('estimateDelta').addEventListener('click', estimateLocalDelta);
@@ -10370,6 +11223,33 @@ HTML = r"""<!doctype html>
     });
     window.addEventListener('scroll', hideLineContextMenu, true);
     window.addEventListener('resize', () => { hideLineContextMenu(); if (state.current) draw(); });
+    if (stateChannel) {
+      stateChannel.addEventListener('message', async event => {
+        const message = event.data || {};
+        if (message.type !== 'focus-event') return;
+        if (String(message.project_id || '') !== String(state.meta?.project_id || '')) return;
+        if (String(message.map_sha256 || '') !== String(state.meta?.cell_event_map?.sha256 || '')) return;
+        const eventTime = Number(message.scan_start_time);
+        if (!Number.isFinite(eventTime)) return;
+        state.stage = 'event_annotation';
+        state.eventFilter = 'all';
+        state.timeMode = 'aligned';
+        applyStageWindowWidth();
+        state.start = Math.max(
+          Number(state.meta?.time_min_min || 0),
+          Math.min(
+            Number(state.meta?.time_min_max || eventTime) - state.width,
+            eventTime - state.width / 2
+          )
+        );
+        el('timeMode').value = state.timeMode;
+        await loadWindow();
+        const matching = candidateRows().find(row => String(row.ms_event_id || '') === String(message.ms_event_id || ''));
+        state.selectedCandidateId = matching ? rowId(matching) : null;
+        renderCandidateList();
+        draw();
+      });
+    }
     init().catch(err => {
       alert(`页面加载失败: ${err.message}`);
       console.error(err);
@@ -10466,8 +11346,26 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             if parsed.path == "/":
                 self.send_text(HTML)
                 return
+            if parsed.path == "/umap":
+                self.send_text(UMAP_HTML)
+                return
+            if parsed.path == "/favicon.ico":
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if parsed.path == "/api/meta":
                 self.send_json(self.data.meta())
+                return
+            if parsed.path == "/api/cell-event-map":
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                self.send_json(self.data.projected_cell_event_map_state())
+                return
+            if parsed.path == "/api/cell-event-map-revision":
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                self.send_json(self.data.cell_event_map_revision())
                 return
             if parsed.path == "/api/window":
                 query = parse_qs(parsed.query)
@@ -10505,7 +11403,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             self.send_json({"error": f"Not found: {parsed.path}"}, HTTPStatus.NOT_FOUND)
         except BadRequest as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             LOGGER.info("Client disconnected before GET response completed: %s", parsed.path)
         except Exception as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -10658,6 +11556,22 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json(result)
                 return
+            if parsed.path == "/api/attach-cell-event-map":
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                source_path = str(payload.get("source_path", "")).strip()
+                if not source_path:
+                    raise BadRequest("source_path is required")
+                new_data = self.data.attach_cell_event_map(Path(source_path))
+                self.__class__.data = new_data
+                self.send_json(
+                    {
+                        "ok": True,
+                        "meta": new_data.meta(),
+                        "cell_event_map": new_data.cell_event_map_revision(),
+                    }
+                )
+                return
             if parsed.path == "/api/import-project":
                 lif_inputs_payload = payload.get("lif_inputs")
                 uses_dynamic_lif_inputs = isinstance(lif_inputs_payload, list) and bool(lif_inputs_payload)
@@ -10665,9 +11579,16 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     anchor_channels_payload = payload.get("qc_anchor_channels")
                     if not isinstance(anchor_channels_payload, list) or not anchor_channels_payload:
                         raise BadRequest("qc_anchor_channels 必须明确提供 2-4 个 QC anchor 通道")
-                    required = ["project_dir", "ms_path"]
+                    required = ["project_dir", "ms_path", "cell_event_map_path"]
                 else:
-                    required = ["project_dir", "lif_g2_path", "lif_r1_path", "lif_r2_path", "ms_path"]
+                    required = [
+                        "project_dir",
+                        "lif_g2_path",
+                        "lif_r1_path",
+                        "lif_r2_path",
+                        "ms_path",
+                        "cell_event_map_path",
+                    ]
                 missing = [key for key in required if not str(payload.get(key, "")).strip()]
                 if missing:
                     raise BadRequest(f"缺少导入路径字段: {', '.join(missing)}")
@@ -10683,6 +11604,11 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                                 "channel": str(item.get("channel", "")),
                                 "identity_prior": str(item.get("identity_prior", "")),
                                 "time_axis": str(item.get("time_axis", "")),
+                                "detector": str(item.get("detector", "")),
+                                "use_for_qc": bool(item.get("use_for_qc")),
+                                "use_for_cell_annotation": bool(
+                                    item.get("use_for_cell_annotation")
+                                ),
                             }
                         )
                     new_data = AppData.create_project_from_raw_inputs(
@@ -10691,6 +11617,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         raw_input_mode=str(payload.get("raw_input_mode", RAW_INPUT_MODE_EXTERNAL)),
                         lif_inputs=lif_inputs,
                         qc_anchor_channels=list(anchor_channels_payload),
+                        cell_event_map_path=Path(str(payload["cell_event_map_path"])),
                     )
                 else:
                     new_data = AppData.create_project_from_raw_inputs(
@@ -10703,6 +11630,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         r1_identity=str(payload.get("r1_identity", "Day9")),
                         r2_identity=str(payload.get("r2_identity", "Day3")),
                         raw_input_mode=str(payload.get("raw_input_mode", RAW_INPUT_MODE_EXTERNAL)),
+                        cell_event_map_path=Path(str(payload["cell_event_map_path"])),
                     )
                 self.__class__.data = new_data
                 self.send_json({"ok": True, "meta": new_data.meta()})
@@ -10719,7 +11647,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             self.send_json({"error": f"Not found: {parsed.path}"}, HTTPStatus.NOT_FOUND)
         except BadRequest as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             LOGGER.info("Client disconnected before POST response completed: %s", parsed.path)
         except Exception as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)

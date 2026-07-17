@@ -26,6 +26,7 @@ from annotation_app.app import (
     build_raw_input_project_records,
     candidate_id_for_group,
     channel_identity_prior_from_manifest,
+    commit_staging_project,
     export_filename_for_project,
     estimate_local_delta_shift,
     estimate_axis_shift,
@@ -305,6 +306,67 @@ class ProjectManifestTest(unittest.TestCase):
             acquisition_layout_hash({**physical, "layout_version": 999}),
         )
 
+    def test_two_to_four_lif_layouts_support_all_channel_roles(self):
+        two = normalize_acquisition_layout(
+            {
+                "lif_channels": [
+                    {"input_id": "g1", "channel": "G1", "time_axis": "green_axis", "use_for_cell_annotation": True},
+                    {"input_id": "r1", "channel": "R1", "time_axis": "red_axis", "use_for_cell_annotation": True},
+                ],
+                "qc_anchor_channels": ["G1", "R1"],
+            }
+        )
+        self.assertEqual([row["channel"] for row in two["lif_channels"]], ["G1", "R1"])
+
+        four_source = {
+            "lif_channels": [
+                {"input_id": "g1", "channel": "G1", "time_axis": "green_axis", "use_for_cell_annotation": True},
+                {"input_id": "g2", "channel": "G2", "time_axis": "green_axis", "use_for_cell_annotation": True},
+                {"input_id": "r1", "channel": "R1", "time_axis": "red_axis", "use_for_cell_annotation": False},
+                {"input_id": "r2", "channel": "R2", "time_axis": "red_axis", "use_for_cell_annotation": False},
+            ],
+            "qc_anchor_channels": ["G1", "R1"],
+        }
+        four = normalize_acquisition_layout(four_source)
+        roles = {
+            row["channel"]: (
+                row["channel"] in four["qc_anchor_channels"],
+                row["use_for_cell_annotation"],
+            )
+            for row in four["lif_channels"]
+        }
+        self.assertEqual(
+            roles,
+            {
+                "G1": (True, True),
+                "G2": (False, True),
+                "R1": (True, False),
+                "R2": (False, False),
+            },
+        )
+
+        changed_cell_role = {
+            **four_source,
+            "lif_channels": [
+                *four_source["lif_channels"][:-1],
+                {**four_source["lif_channels"][-1], "use_for_cell_annotation": True},
+            ],
+        }
+        changed_qc_role = {**four_source, "qc_anchor_channels": ["G1", "G2", "R1", "R2"]}
+        self.assertNotEqual(acquisition_layout_hash(four_source), acquisition_layout_hash(changed_cell_role))
+        self.assertNotEqual(acquisition_layout_hash(four_source), acquisition_layout_hash(changed_qc_role))
+
+        with self.assertRaisesRegex(BadRequest, "至少一个 LIF"):
+            normalize_acquisition_layout(
+                {
+                    **four_source,
+                    "lif_channels": [
+                        {**row, "use_for_cell_annotation": False}
+                        for row in four_source["lif_channels"]
+                    ],
+                }
+            )
+
     def test_build_raw_input_records_accepts_configured_lif_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp) / "project"
@@ -340,6 +402,85 @@ class ProjectManifestTest(unittest.TestCase):
                     lif_inputs=lif_inputs,
                     qc_anchor_channels=[],
                 )
+
+    def test_build_raw_records_preserves_qc_only_cell_only_both_and_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lif_inputs = [
+                {"key": "g1", "path": root / "g1.csv", "channel": "G1", "identity_prior": "both", "use_for_qc": True, "use_for_cell_annotation": True},
+                {"key": "g2", "path": root / "g2.csv", "channel": "G2", "identity_prior": "cell", "use_for_qc": False, "use_for_cell_annotation": True},
+                {"key": "r1", "path": root / "r1.csv", "channel": "R1", "identity_prior": "", "use_for_qc": True, "use_for_cell_annotation": False},
+                {"key": "r2", "path": root / "r2.csv", "channel": "R2", "identity_prior": "", "use_for_qc": False, "use_for_cell_annotation": False},
+            ]
+
+            rows, _manifest, layout = build_raw_input_project_records(
+                project_dir=root / "project",
+                raw_paths={"ms": root / "ms.txt"},
+                raw_input_mode=RAW_INPUT_MODE_EXTERNAL,
+                identities={},
+                lif_inputs=lif_inputs,
+                qc_anchor_channels=["G1", "R1"],
+            )
+
+        lif_rows = [row for row in rows if row["input_class"] == "raw_lif_trace"]
+        self.assertEqual(
+            [row["use_for_cell_annotation"] for row in lif_rows],
+            [True, True, False, False],
+        )
+        self.assertEqual(layout["qc_anchor_channels"], ["G1", "R1"])
+
+    def test_backend_rejects_cell_annotation_on_qc_only_channel(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            layout = normalize_acquisition_layout(
+                {
+                    "lif_channels": [
+                        {
+                            "input_id": "lif_g1_raw",
+                            "channel": "G1",
+                            "identity_prior": "cell",
+                            "time_axis": "green_axis",
+                            "detector": "green",
+                            "use_for_cell_annotation": True,
+                        },
+                        {
+                            "input_id": "lif_r1_raw",
+                            "channel": "R1",
+                            "identity_prior": "QC-only",
+                            "time_axis": "red_axis",
+                            "detector": "red",
+                            "use_for_cell_annotation": False,
+                        },
+                    ],
+                    "qc_anchor_channels": ["G1", "R1"],
+                }
+            )
+            app = AppData(
+                project=ProjectPaths.from_args(project_dir=tmp),
+                lif_traces=pd.DataFrame(),
+                lif_peaks=pd.DataFrame(
+                    [{"peak_id": "r1", "channel": "R1", "time_min": 41.0, "time_sec": 2460.0}]
+                ),
+                ms_events=pd.DataFrame(
+                    [
+                        {
+                            "event_id": "ms",
+                            "event_strategy": "pc34_primary",
+                            "primary_signal_col": "pc34_760_max_intensity",
+                            "scan_id": 1,
+                            "time_min": 41.0,
+                            "time_sec": 2460.0,
+                        }
+                    ]
+                ),
+                ms_scan=pd.DataFrame(),
+                alignment={"model": "test", "qc_groups": {"groups": []}},
+                store=AnnotationStore(Path(tmp) / "annotation.sqlite"),
+                channel_identity_prior={"R1": {"identity_prior": "QC-only"}},
+                acquisition_layout=layout,
+            )
+
+            with self.assertRaisesRegex(BadRequest, "未配置为细胞标注通道"):
+                app.payload_from_cell_ids("R1", "r1", "ms")
 
     def test_project_dir_defaults_raw_data_dir_to_project_raw_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,6 +740,46 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertEqual(alignment["channels"]["G1"]["shift_sec"], alignment["channels"]["G2"]["shift_sec"])
         self.assertEqual(len(alignment["qc_groups"]["groups"]), 4)
         self.assertTrue(all(row["complete_anchor_set"] for row in alignment["qc_groups"]["groups"]))
+
+    def test_four_channel_synthetic_alignment_supports_four_qc_anchors(self):
+        lif_rows = []
+        ms_rows = []
+        for index, center in enumerate([60.0, 180.0, 300.0, 420.0], start=1):
+            lif_rows.extend(
+                [
+                    {"peak_id": f"g1_{index}", "channel": "G1", "time_min": (center - 4.1) / 60.0, "time_sec": center - 4.1, "snr": 45},
+                    {"peak_id": f"g2_{index}", "channel": "G2", "time_min": (center - 3.9) / 60.0, "time_sec": center - 3.9, "snr": 45},
+                    {"peak_id": f"r1_{index}", "channel": "R1", "time_min": (center + 6.9) / 60.0, "time_sec": center + 6.9, "snr": 45},
+                    {"peak_id": f"r2_{index}", "channel": "R2", "time_min": (center + 7.1) / 60.0, "time_sec": center + 7.1, "snr": 45},
+                ]
+            )
+            ms_rows.append(
+                {"event_id": f"ms_{index}", "time_min": center / 60.0, "time_sec": center, "event_strategy": "pc34_primary", "primary_signal_col": "pc34_760_max_intensity"}
+            )
+        layout = {
+            "lif_channels": [
+                {"input_id": "g1", "channel": "G1", "time_axis": "green_axis", "use_for_cell_annotation": True},
+                {"input_id": "g2", "channel": "G2", "time_axis": "green_axis", "use_for_cell_annotation": True},
+                {"input_id": "r1", "channel": "R1", "time_axis": "red_axis", "use_for_cell_annotation": False},
+                {"input_id": "r2", "channel": "R2", "time_axis": "red_axis", "use_for_cell_annotation": True},
+            ],
+            "qc_anchor_channels": ["G1", "G2", "R1", "R2"],
+        }
+
+        alignment = estimate_shift_alignment(
+            pd.DataFrame(lif_rows),
+            pd.DataFrame(ms_rows),
+            qc_calibration_end_min=8.0,
+            acquisition_layout=layout,
+        )
+
+        self.assertEqual(alignment["qc_anchor_channels"], ["G1", "G2", "R1", "R2"])
+        self.assertAlmostEqual(alignment["axis_shifts_sec"]["green_axis"], 4.0, delta=0.3)
+        self.assertAlmostEqual(alignment["axis_shifts_sec"]["red_axis"], -7.0, delta=0.3)
+        self.assertEqual(alignment["channels"]["G1"]["shift_sec"], alignment["channels"]["G2"]["shift_sec"])
+        self.assertEqual(alignment["channels"]["R1"]["shift_sec"], alignment["channels"]["R2"]["shift_sec"])
+        self.assertEqual(len(alignment["qc_groups"]["groups"]), 4)
+        self.assertTrue(all(row["lif_anchor_count"] == 4 for row in alignment["qc_groups"]["groups"]))
 
     def test_axis_shift_prioritizes_independent_events_over_one_multi_channel_coincidence(self):
         lif_rows = [
@@ -1331,17 +1512,18 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertIn('function applyStageWindowWidth()', HTML)
         self.assertIn('后段预校准取证范围(min)', HTML)
         self.assertNotIn('主窗口固定 2.5 min', HTML)
-        self.assertIn('id="importQcAnchorOptions"', HTML)
+        self.assertIn('id="importLifRows"', HTML)
+        self.assertIn('id="addImportLif"', HTML)
+        self.assertIn('id="importRoleSummary"', HTML)
         self.assertNotIn('id="importQcAnchorA"', HTML)
         self.assertNotIn('id="importQcAnchorB"', HTML)
-        self.assertIn('id="importLif1Channel" aria-label="LIF 1 通道"', HTML)
-        self.assertIn('LIF 通道<small>G1 / G2 / R1 / R2</small>', HTML)
-        self.assertIn('样本标签<small>时间点、细胞类型等</small>', HTML)
-        self.assertIn('placeholder="填写样本标签" aria-label="LIF 1 样本标签"', HTML)
+        self.assertIn('data-import-field="channel"', HTML)
+        self.assertIn('data-import-field="use_for_qc"', HTML)
+        self.assertIn('data-import-field="use_for_cell_annotation"', HTML)
+        self.assertIn('placeholder="${row.use_for_cell_annotation ? \'细胞用途必填\' : \'可留空\'}"', HTML)
         self.assertNotIn('如 LK / LSK / CLP', HTML)
-        self.assertIn("label.className = 'qc-anchor-option'", HTML)
-        self.assertIn('role="group" aria-labelledby="importQcAnchorLabel"', HTML)
-        self.assertIn('选择 2-3 个，且至少包含一个 G 通道和一个 R 通道。', HTML)
+        self.assertIn('id="importCellEventMap"', HTML)
+        self.assertIn('data-picker-role="cell_event_map"', HTML)
         self.assertIn('function setModalVisibility(', HTML)
         self.assertIn('function modalFocusableElements(', HTML)
         self.assertNotIn("if (ev.target === el('importModal')) setImportModal(false);", HTML)
@@ -1998,6 +2180,52 @@ class ProjectManifestTest(unittest.TestCase):
 
             with self.assertRaises(BadRequest):
                 assert_new_project_target_is_clean(project_dir, [])
+
+    def test_staging_project_replaces_preexisting_empty_target_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            target = parent / "new-project"
+            staging = parent / ".new-project.lma-building-test"
+            target.mkdir()
+            staging.mkdir()
+            (staging / "complete.marker").write_text("complete", encoding="utf-8")
+
+            commit_staging_project(staging, target, target_preexisted=True)
+
+            self.assertFalse(staging.exists())
+            self.assertEqual((target / "complete.marker").read_text(encoding="utf-8"), "complete")
+
+    def test_staging_publish_failure_restores_preexisting_empty_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            target = parent / "new-project"
+            staging = parent / ".new-project.lma-building-test"
+            target.mkdir()
+            staging.mkdir()
+            (staging / "complete.marker").write_text("complete", encoding="utf-8")
+
+            with mock.patch("annotation_app.app.os.replace", side_effect=OSError("publish failed")):
+                with self.assertRaisesRegex(OSError, "publish failed"):
+                    commit_staging_project(staging, target, target_preexisted=True)
+
+            self.assertTrue(target.is_dir())
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertTrue(staging.is_dir())
+
+    def test_staging_publish_refuses_target_that_became_nonempty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            target = parent / "new-project"
+            staging = parent / ".new-project.lma-building-test"
+            target.mkdir()
+            staging.mkdir()
+            (target / "user-file.txt").write_text("keep", encoding="utf-8")
+
+            with self.assertRaisesRegex(BadRequest, "不再为空"):
+                commit_staging_project(staging, target, target_preexisted=True)
+
+            self.assertEqual((target / "user-file.txt").read_text(encoding="utf-8"), "keep")
+            self.assertTrue(staging.is_dir())
 
     def test_manifest_validation_requires_all_intermediate_tables(self):
         with tempfile.TemporaryDirectory() as tmp:
