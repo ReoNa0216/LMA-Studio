@@ -7697,6 +7697,12 @@ HTML = r"""<!doctype html>
       color: #fff;
       white-space: nowrap;
     }
+    .header-secondary-button[data-unavailable="true"] {
+      border-color: #667085;
+      background: #344054;
+      color: #d0d5dd;
+      cursor: help;
+    }
     .policy {
       color: #667085;
       font-size: 12px;
@@ -8173,12 +8179,83 @@ HTML = r"""<!doctype html>
       min-width: 0;
     }
     .path-picker-row input {
+      width: 100%;
       min-width: 0;
     }
     .path-picker-button {
       width: 64px;
       height: 34px;
       white-space: nowrap;
+    }
+    .attach-map-panel {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid #d7deea;
+      border-radius: 8px;
+      background: #f8fafc;
+      color: #344054;
+    }
+    .attach-map-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 4px;
+    }
+    .attach-map-heading .side-title {
+      margin: 0;
+      color: #111827;
+      font-size: 14px;
+    }
+    .attach-map-badge {
+      flex: 0 0 auto;
+      padding: 2px 7px;
+      border: 1px solid #f0c36a;
+      border-radius: 999px;
+      background: #fffaeb;
+      color: #93370d;
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .attach-map-copy,
+    .attach-map-requirements {
+      margin: 4px 0 10px;
+      color: #667085;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .attach-map-label {
+      display: block;
+      margin: 0 0 5px;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .attach-map-panel .path-picker-row {
+      grid-template-columns: minmax(0, 1fr) 88px;
+    }
+    .attach-map-panel .path-picker-button {
+      width: 88px;
+    }
+    .attach-map-panel input {
+      text-overflow: ellipsis;
+    }
+    .attach-map-requirements code {
+      color: #344054;
+      font-size: 11px;
+    }
+    .attach-map-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .attach-map-actions .small-button {
+      flex: 0 0 auto;
+    }
+    .attach-map-ready {
+      color: #667085;
+      font-size: 11px;
     }
     .lif-input-table {
       min-width: 0;
@@ -8478,7 +8555,7 @@ HTML = r"""<!doctype html>
       <button id="openImportProject" class="header-secondary-button">新建项目</button>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
-      <button id="openUmap" class="header-secondary-button" disabled>UMAP</button>
+      <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
       <span id="exportHint" class="header-export-hint">导出全项目已接受标注</span>
       <button id="exportAcceptedCsv" class="header-export-button">导出已接受 CSV</button>
     </div>
@@ -8708,13 +8785,28 @@ HTML = r"""<!doctype html>
         <span>标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
         <span>后段预校准取证范围(min)</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
-      <div id="attachMapPanel" class="manual-box" style="display:none; margin-top:12px;">
-        <p class="side-title">旧项目一次性附加事件坐标</p>
-        <div class="path-picker-row">
-          <input id="attachCellEventMap" type="text" placeholder="scan_start_time / UMAP1 / UMAP2" />
-          <button class="small-button secondary path-picker-button" aria-label="选择待附加的事件坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择待附加的事件坐标 CSV">选择</button>
+      <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
+        <div class="attach-map-heading">
+          <p class="side-title">为旧项目附加 UMAP 事件坐标</p>
+          <span class="attach-map-badge">仅可附加一次</span>
         </div>
-        <button id="attachMap" type="button" class="small-button secondary" style="margin-top:8px;">校验并附加</button>
+        <p class="attach-map-copy">
+          选择与当前 MS 数据对应的 CSV。软件会先校验全部时间匹配，成功后才写入项目并启用 UMAP；
+          校验失败不会改变项目。
+        </p>
+        <label class="attach-map-label" for="attachCellEventMap">事件坐标 CSV</label>
+        <div class="path-picker-row">
+          <input id="attachCellEventMap" type="text" autocomplete="off" spellcheck="false" aria-describedby="attachMapRequirements" placeholder="请选择与当前项目对应的 .csv 文件" />
+          <button class="small-button secondary path-picker-button" aria-label="选择待附加的事件坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择待附加的事件坐标 CSV">选择 CSV</button>
+        </div>
+        <div id="attachMapRequirements" class="attach-map-requirements">
+          必需列：<code>scan_start_time</code>、<code>UMAP1</code>、<code>UMAP2</code>；
+          其他列会被忽略。<span id="attachMapProjectName"></span>
+        </div>
+        <div class="attach-map-actions">
+          <button id="attachMap" type="button" class="small-button" disabled>校验并附加到当前项目</button>
+          <span id="attachMapReady" class="attach-map-ready">尚未选择文件</span>
+        </div>
       </div>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
@@ -8954,6 +9046,16 @@ HTML = r"""<!doctype html>
       document.body.classList.toggle('bootstrap-mode', Boolean(state.meta?.bootstrap));
     }
 
+    function syncUmapButtonState() {
+      const button = el('openUmap');
+      const available = Boolean(state.meta?.cell_event_map?.available);
+      button.dataset.unavailable = available ? 'false' : 'true';
+      button.textContent = available ? 'UMAP' : 'UMAP（未配置）';
+      button.title = available
+        ? '打开独立 UMAP 事件地图'
+        : '当前项目尚未附加事件坐标 CSV；点击查看配置说明';
+    }
+
     function applyLoadedProjectMeta(projectMeta) {
       state.meta = projectMeta;
       state.current = null;
@@ -8970,7 +9072,7 @@ HTML = r"""<!doctype html>
       resetManualSelection();
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
-      el('openUmap').disabled = !Boolean(state.meta?.cell_event_map?.available);
+      syncUmapButtonState();
       el('loaded').innerHTML = [
         `LIF trace 行数: ${state.meta.lif_trace_rows.toLocaleString()}`,
         `LIF 峰数: ${state.meta.lif_peak_rows.toLocaleString()}`,
@@ -9149,14 +9251,36 @@ HTML = r"""<!doctype html>
       if (open) {
         renderConfigInputs();
         setConfigSaveStatus('');
-        el('attachMapPanel').style.display = state.meta?.cell_event_map?.attach_allowed ? 'block' : 'none';
+        const attachAllowed = Boolean(state.meta?.cell_event_map?.attach_allowed);
+        el('attachMapPanel').style.display = attachAllowed ? 'block' : 'none';
         el('attachCellEventMap').value = '';
+        el('attachCellEventMap').title = '';
+        const projectName = state.meta?.project?.project_dir
+          ? state.meta.project.project_dir.split(/[\\/]/).filter(Boolean).pop()
+          : '';
+        el('attachMapProjectName').textContent = projectName ? ` 当前项目：${projectName}` : '';
+        updateAttachMapControls();
       }
       setModalVisibility('projectConfigModal', open);
     }
 
     async function openUmapWindow() {
-      if (!state.meta?.cell_event_map?.available) return;
+      if (!state.meta?.cell_event_map?.available) {
+        setProjectConfigModal(true);
+        if (state.meta?.cell_event_map?.attach_allowed) {
+          setConfigSaveStatus(
+            '当前项目尚未附加事件坐标 CSV，因此 UMAP 暂不可用。请在上方选择 CSV，再点击“校验并附加到当前项目”。',
+            'warning'
+          );
+          window.setTimeout(() => el('attachCellEventMap').focus(), 0);
+        } else {
+          setConfigSaveStatus(
+            '当前项目没有事件坐标 map，且缺少可附加 map 的项目清单。UMAP 暂不可用；旧标注工作流仍可继续使用。',
+            'warning'
+          );
+        }
+        return;
+      }
       try {
         if (window.pywebview?.api?.open_umap_window) {
           await window.pywebview.api.open_umap_window();
@@ -9181,7 +9305,7 @@ HTML = r"""<!doctype html>
       el('start').value = state.start.toFixed(2);
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
-      el('openUmap').disabled = !Boolean(state.meta?.cell_event_map?.available);
+      syncUmapButtonState();
       const loadedLines = state.meta.bootstrap ? [
         '等待新建或打开项目',
         '请选择新建项目或打开已有项目。'
@@ -9654,6 +9778,17 @@ HTML = r"""<!doctype html>
       const status = el('configSaveStatus');
       status.textContent = message;
       status.className = `config-save-status${type ? ` ${type}` : ''}`;
+    }
+
+    function updateAttachMapControls() {
+      const input = el('attachCellEventMap');
+      const value = input.value.trim();
+      const filename = value.split(/[\\/]/).filter(Boolean).pop() || '';
+      input.title = value;
+      el('attachMap').disabled = Boolean(state.actionBusy) || !value;
+      el('attachMapReady').textContent = value
+        ? `已选择：${filename}`
+        : '尚未选择文件';
     }
 
     async function saveProjectConfig() {
@@ -10206,18 +10341,22 @@ HTML = r"""<!doctype html>
         const result = await postJson('/api/attach-cell-event-map', { source_path: sourcePath });
         state.meta = result.meta;
         state.current = null;
-        el('openUmap').disabled = false;
+        syncUmapButtonState();
         el('attachMapPanel').style.display = 'none';
         await loadWindow();
         notifyStateChannel('map-attached');
-        setConfigSaveStatus(`已附加 ${result.cell_event_map?.counts?.unknown ?? result.meta.cell_event_map.row_count} 个事件坐标点。`, 'success');
+        const rowCount = Number(result.meta?.cell_event_map?.row_count || 0);
+        setConfigSaveStatus(
+          `已成功附加 ${rowCount.toLocaleString()} 个事件坐标点，UMAP 已启用。`,
+          'success'
+        );
       } catch (err) {
         setConfigSaveStatus(`附加失败：${err.message}`, 'error');
         alert(`附加事件坐标失败: ${err.message}`);
       } finally {
-        button.disabled = false;
         button.textContent = oldText;
         state.actionBusy = false;
+        updateAttachMapControls();
       }
     }
 
@@ -10237,10 +10376,15 @@ HTML = r"""<!doctype html>
       if (state.actionBusy) return;
       const targetId = button.dataset.pickerTarget;
       const target = el(targetId);
+      const attachPicker = targetId === 'attachCellEventMap';
       const oldText = button.textContent;
       button.disabled = true;
       button.textContent = '选择中';
-      el('importHint').textContent = '请在弹出的系统窗口中选择路径。';
+      if (attachPicker) {
+        setConfigSaveStatus('请在弹出的系统窗口中选择事件坐标 CSV。');
+      } else {
+        el('importHint').textContent = '请在弹出的系统窗口中选择路径。';
+      }
       try {
         const result = await postJson('/api/select-path', {
           kind: button.dataset.pickerKind,
@@ -10252,16 +10396,32 @@ HTML = r"""<!doctype html>
           target.value = result.path;
           target.dispatchEvent(new Event('input', { bubbles: true }));
           target.focus();
-          el('importHint').textContent = duplicateImportLifPathMessage();
+          if (attachPicker) {
+            const filename = result.path.split(/[\\/]/).filter(Boolean).pop() || result.path;
+            setConfigSaveStatus(
+              `已选择 ${filename}。点击“校验并附加到当前项目”后才会写入项目。`
+            );
+          } else {
+            el('importHint').textContent = duplicateImportLifPathMessage();
+          }
         } else {
-          el('importHint').textContent = '已取消选择；原路径保持不变。';
+          if (attachPicker) {
+            setConfigSaveStatus('已取消选择；项目未发生变化。');
+          } else {
+            el('importHint').textContent = '已取消选择；原路径保持不变。';
+          }
         }
       } catch (err) {
-        el('importHint').textContent = `选择路径失败: ${err.message}`;
+        if (attachPicker) {
+          setConfigSaveStatus(`选择路径失败：${err.message}`, 'error');
+        } else {
+          el('importHint').textContent = `选择路径失败: ${err.message}`;
+        }
         alert(`选择路径失败: ${err.message}`);
       } finally {
         button.textContent = oldText;
         button.disabled = false;
+        if (attachPicker) updateAttachMapControls();
       }
     }
 
@@ -11187,6 +11347,7 @@ HTML = r"""<!doctype html>
     el('acceptWindow').addEventListener('click', acceptWindowPendingAutoCandidates);
     el('saveConfig').addEventListener('click', saveProjectConfig);
     el('attachMap').addEventListener('click', attachCellEventMap);
+    el('attachCellEventMap').addEventListener('input', updateAttachMapControls);
     el('previewQcRefit').addEventListener('click', previewQcAlignmentRefit);
     el('applyQcRefit').addEventListener('click', applyQcAlignmentRefit);
     el('estimateDelta').addEventListener('click', estimateLocalDelta);

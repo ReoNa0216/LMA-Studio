@@ -45,6 +45,11 @@ Click `新建项目` and fill:
 - QC anchor channels: select 2-4 configured inputs, cover every cell-annotation time axis, and include at least one green and one red detector.
 - Raw input mode, preferably external reference for large MS files.
 
+For the four-channel acceptance layout, add a fourth LIF row and configure
+`G1/G2/R1/R2`. A useful role test is QC=`G1/G2/R1` and
+cell=`G1/G2/R2`: this makes R1 QC-only and R2 cell-only while both physical
+time axes remain covered.
+
 Expected:
 
 - Every `选择` button opens a native Windows file/folder dialog parented to LMA Studio.
@@ -67,7 +72,9 @@ Expected:
 - If `lifms_project.json` exists, manifest fingerprints are checked first.
 - The SQLite database is validated against current parquet peak/event IDs.
 - Valid projects open without auto-requiring raw inputs.
-- A schema-v1 project without a map opens with the legacy unfiltered workflow and a disabled UMAP button; opening it does not change manifest/SQLite/parquet hashes.
+- A schema-v1 project without a map opens with the legacy unfiltered workflow and shows `UMAP（未配置）`; opening it does not change manifest/SQLite/parquet hashes.
+- Clicking `UMAP（未配置）` opens the configuration dialog with a readable explanation instead of silently doing nothing.
+- The attach-map path field occupies the available dialog width, shows the selected path, and keeps the validation/write action disabled until a CSV is selected.
 - The explicit attach-map action refuses a CSV that omits an already accepted post-start event, and a successful attach preserves all annotations and time models.
 
 ## 5. Core Workflow
