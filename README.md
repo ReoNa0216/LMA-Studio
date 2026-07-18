@@ -19,7 +19,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The latest formal GitHub Release remains v0.2.1 until the v0.3.0 Windows candidate completes user acceptance.
+The latest formal GitHub Release is v0.3.0.
 
 Windows x64:
 
@@ -37,7 +37,7 @@ macOS Apple Silicon:
 2. Move `LMA Studio.app` to Applications or another writable location.
 3. Control-click the app and choose **Open** on first launch if Gatekeeper warns that the package is from an unidentified developer.
 
-The macOS ARM64 build uses the native Cocoa/WebKit backend. It is an unsigned/not-notarized candidate until an Apple Developer ID is configured, so Windows remains the fully locally validated release platform.
+The macOS ARM64 build uses the native Cocoa/WebKit backend. It remains unsigned and not notarized until an Apple Developer ID is configured, so Windows remains the fully locally validated release platform.
 
 ## Project Data Policy
 
@@ -68,5 +68,5 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.3.0-rc1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.3.0 bash packaging/macos/build_macos.sh
 ```
