@@ -39,6 +39,8 @@ file "$executable" | grep -q "arm64"
 mkdir -p release
 archive="$repo_root/release/LMA-Studio-${version}-macos-arm64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$archive"
-shasum -a 256 "$archive" >"${archive}.sha256"
+archive_name="$(basename "$archive")"
+archive_hash="$(shasum -a 256 "$archive" | awk '{print $1}')"
+printf '%s  %s\n' "$archive_hash" "$archive_name" >"${archive}.sha256"
 
 echo "Build complete: $archive"
