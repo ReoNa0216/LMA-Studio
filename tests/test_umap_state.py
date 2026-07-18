@@ -219,6 +219,32 @@ class UmapAppStateTest(unittest.TestCase):
             self.assertEqual(after["counts"]["unknown"], 1)
             self.assertNotEqual(before["revision"], after["revision"])
 
+    def test_third_stage_acceptance_requires_current_frozen_time_model(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(Path(tmp), with_map=True)
+            payload = {
+                "review_stage": "cell_annotation",
+                "candidate_type": "manual_cell_pair",
+                "ms_event_id": "ms-1",
+                "time_model_version": "tm-stale",
+            }
+            with self.assertRaisesRegex(BadRequest, "当前 frozen time model"):
+                app.ensure_third_stage_acceptance_allowed(
+                    payload,
+                    annotation_id="cell-stale",
+                )
+
+            active = app.store.active_time_model()
+            app.store.upsert_time_model(
+                {**active, "status": "draft"},
+                action="test_unfreeze",
+            )
+            with self.assertRaisesRegex(BadRequest, "冻结 delta"):
+                app.ensure_third_stage_acceptance_allowed(
+                    {**payload, "time_model_version": "tm-current"},
+                    annotation_id="cell-without-frozen-model",
+                )
+
     def test_one_time_attach_preserves_annotations_and_time_model(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)

@@ -106,6 +106,8 @@ On a project with a map:
 - Unknown points are gray, accepted QC is black, accepted cells use the corresponding LIF channel color, and conflicts have an explicit red outline/X.
 - Accept/revoke in the main window updates UMAP without reloading either window.
 - Clicking a UMAP point switches the main window to event annotation and centers the matching `ms_event_id`.
+- Clicking a UMAP point uses the containing 2.5 min grid window rather than centering on an arbitrary decimal start; for example, an event at `50.075 min` opens `50.0-52.5 min`.
+- Before the local delta is frozen, third-stage candidates/manual tools remain unavailable and direct backend acceptance is rejected. Applying the optional accepted-anchor QC refit is not a prerequisite; either the automatic QC base alignment or an applied refit may feed the frozen local model.
 - Closing/reopening only the UMAP window does not change SQLite or close the main window. Closing the main window closes the UMAP window.
 - Open a different project and confirm the UMAP window clears the prior project/map state before drawing the new one.
 

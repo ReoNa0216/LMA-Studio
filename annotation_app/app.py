@@ -4962,6 +4962,13 @@ class AppData:
         stage = self.annotation_review_stage(payload)
         if stage not in {"qc_survey", "cell_annotation"}:
             return
+        frozen = self.frozen_time_model()
+        if not frozen:
+            raise BadRequest("请先完成后段局部校正并冻结 delta，再接受第三阶段标注")
+        active_version = str(frozen.get("time_model_version") or "")
+        payload_version = str(payload.get("time_model_version") or "")
+        if not payload_version or payload_version != active_version:
+            raise BadRequest("第三阶段标注不属于当前 frozen time model，请在当前图窗重新审核")
         ms_event_id = str(payload.get("ms_event_id") or "")
         if not ms_event_id:
             raise BadRequest("第三阶段 annotation 缺少 ms_event_id")
@@ -8975,6 +8982,35 @@ HTML = r"""<!doctype html>
         : '主窗口使用默认浏览宽度，边界额外载入 ±0.08 min；各轨道刻度和峰旁数字仍为原始时间(min)';
     }
 
+    function eventGridWindowStart(eventTime) {
+      const projectMin = Number(state.meta?.time_min_min || 0);
+      const projectMax = Number(state.meta?.time_min_max || eventTime);
+      const width = Number(state.width || state.meta?.default_window_min || 2.5);
+      const grid = Number(state.meta?.default_window_min || 2.5);
+      if (
+        !Number.isFinite(eventTime)
+        || !Number.isFinite(projectMin)
+        || !Number.isFinite(projectMax)
+        || !Number.isFinite(width)
+        || width <= 0
+        || !Number.isFinite(grid)
+        || grid <= 0
+      ) return projectMin;
+      const tm = state.current?.time_model || state.meta?.time_model || {};
+      const annotationStart = Number(tm.annotation_start_min || 40);
+      const deltaMin = Number(tm.ms_local_delta_sec || 0) / 60;
+      const alignedEventTime = (
+        Number.isFinite(annotationStart)
+        && Number.isFinite(deltaMin)
+        && eventTime >= annotationStart
+      ) ? eventTime + deltaMin : eventTime;
+      const epsilon = grid * 1e-10;
+      const snapped = Math.floor((alignedEventTime + epsilon) / grid) * grid;
+      const maxStart = Math.max(projectMin, projectMax - width);
+      const clamped = Math.max(projectMin, Math.min(maxStart, snapped));
+      return Math.round(clamped * 1e9) / 1e9;
+    }
+
     function fmtAxis(n) {
       const value = Number(n);
       if (!Number.isFinite(value)) return '';
@@ -11396,13 +11432,7 @@ HTML = r"""<!doctype html>
         state.eventFilter = 'all';
         state.timeMode = 'aligned';
         applyStageWindowWidth();
-        state.start = Math.max(
-          Number(state.meta?.time_min_min || 0),
-          Math.min(
-            Number(state.meta?.time_min_max || eventTime) - state.width,
-            eventTime - state.width / 2
-          )
-        );
+        state.start = eventGridWindowStart(eventTime);
         el('timeMode').value = state.timeMode;
         await loadWindow();
         const matching = candidateRows().find(row => String(row.ms_event_id || '') === String(message.ms_event_id || ''));
