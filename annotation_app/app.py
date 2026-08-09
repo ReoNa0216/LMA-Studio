@@ -11304,11 +11304,19 @@ HTML = r"""<!doctype html>
             <option value="robust">稳健放大</option>
           </select>
         </label>
+        <label>
+          <span class="policy">峰时间标签</span>
+          <select id="peakLabelMode">
+            <option value="auto" selected>自动精简</option>
+            <option value="all">全部（可能拥挤）</option>
+            <option value="hidden">隐藏</option>
+          </select>
+        </label>
         <button id="go">显示窗口</button>
       </div>
       <div class="window-readout">
         <strong id="title">同步 2.5 min 窗口</strong>
-        <span id="windowPolicy">主窗口使用默认浏览宽度，边界额外载入 ±0.08 min；各轨道刻度和峰旁数字仍为原始时间(min)</span>
+        <span id="windowPolicy">峰圆点全部保留；时间标签默认自动精简，悬停任意圆点可查看精确原始时间(min)</span>
       </div>
       <svg id="chart" role="img" aria-label="Synchronized LIF and MS tracks"></svg>
     </section>
@@ -11514,6 +11522,7 @@ HTML = r"""<!doctype html>
       width: 2.5,
       timeMode: 'aligned',
       yAxisMode: 'full',
+      peakLabelMode: 'auto',
       current: null,
       selectedCandidateId: null,
       showRejected: false,
@@ -11527,6 +11536,7 @@ HTML = r"""<!doctype html>
       manual: { anchors: {}, LIF: null, MS760: null },
       requestSeq: 0,
       actionBusy: false,
+      importCreating: false,
       configSaveBusy: false,
       importRows: [],
       nextImportRowId: 1,
@@ -11851,6 +11861,7 @@ HTML = r"""<!doctype html>
       resetManualSelection();
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
+      el('peakLabelMode').value = state.peakLabelMode;
       syncUmapButtonState();
       el('loaded').innerHTML = [
         `LIF trace 行数: ${state.meta.lif_trace_rows.toLocaleString()}`,
@@ -12072,7 +12083,12 @@ HTML = r"""<!doctype html>
         && state.importSegments.every(segment => segment.boundaries_confirmed === true);
       const createButton = el('runImportProject');
       if (createButton) {
-        createButton.textContent = allConfirmed ? '生成并进入项目' : '生成草稿并进入项目';
+        createButton.disabled = state.importCreating;
+        if (state.importCreating) {
+          if (!createButton.textContent.includes('正在创建')) createButton.textContent = '正在创建…';
+        } else {
+          createButton.textContent = allConfirmed ? '生成并进入项目' : '生成草稿并进入项目';
+        }
       }
     }
 
@@ -12258,6 +12274,7 @@ HTML = r"""<!doctype html>
     }
 
     function setImportModal(open) {
+      if (!open && state.importCreating) return;
       if (open) {
         state.importSuggestionRevision += 1;
         [
@@ -12355,6 +12372,7 @@ HTML = r"""<!doctype html>
       el('start').value = state.start.toFixed(2);
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
+      el('peakLabelMode').value = state.peakLabelMode;
       syncUmapButtonState();
       const loadedLines = state.meta.bootstrap ? [
         '等待新建或打开项目',
@@ -13494,11 +13512,24 @@ HTML = r"""<!doctype html>
     async function importProject() {
       if (state.actionBusy) return;
       state.actionBusy = true;
+      state.importCreating = true;
       const button = el('runImportProject');
-      const oldText = button.textContent;
-      button.textContent = '生成中...';
-      el('importHint').textContent = '正在生成中间表；MS 文件较大时可能需要几分钟。';
+      const closeButton = el('closeImportProject');
+      const startedAt = Date.now();
+      let creationKind = '项目';
+      let progressTimer = null;
+      const updateCreationFeedback = () => {
+        const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+        button.textContent = `正在创建… ${elapsedSec}s`;
+        el('importHint').textContent = `正在创建${creationKind}：读取原始文件并生成中间表。已等待 ${elapsedSec} 秒，请勿重复点击或关闭软件。`;
+      };
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+      closeButton.disabled = true;
+      updateCreationFeedback();
+      progressTimer = window.setInterval(updateCreationFeedback, 1000);
       try {
+        await new Promise(resolve => window.requestAnimationFrame(() => resolve()));
         refreshImportProtocolOptions();
         const lifInputs = importLifRows();
         const channels = lifInputs.map(row => row.channel);
@@ -13553,7 +13584,8 @@ HTML = r"""<!doctype html>
         }
         const unconfirmedCount = calibrationProtocol.segments.filter(segment => !segment.boundaries_confirmed).length;
         if (unconfirmedCount) {
-          el('importHint').textContent = `正在创建边界待确认草稿（${unconfirmedCount} 段）；进入后先查看原始峰形，再到“配置”确认边界。`;
+          creationKind = `边界待确认草稿（${unconfirmedCount} 段）`;
+          updateCreationFeedback();
         }
         const result = await postJson('/api/import-project', {
           project_dir: el('importProjectDir').value,
@@ -13568,13 +13600,23 @@ HTML = r"""<!doctype html>
         });
         applyLoadedProjectMeta(result.meta);
         await loadWindow();
+        if (progressTimer !== null) {
+          window.clearInterval(progressTimer);
+          progressTimer = null;
+        }
+        state.importCreating = false;
         setImportModal(false);
       } catch (err) {
         el('importHint').textContent = `导入失败: ${err.message}`;
         alert(`导入失败: ${err.message}`);
       } finally {
-        button.textContent = oldText;
+        if (progressTimer !== null) window.clearInterval(progressTimer);
+        state.importCreating = false;
+        button.removeAttribute('aria-busy');
+        button.disabled = false;
+        closeButton.disabled = false;
         state.actionBusy = false;
+        renderImportSegments();
       }
     }
 
@@ -13884,6 +13926,49 @@ HTML = r"""<!doctype html>
       return ids;
     }
 
+    function automaticPeakLabelIds(rows, idFor, timeFor, scoreFor, start, end, plotWidth) {
+      if (state.peakLabelMode === 'hidden') return new Set();
+      const visibleRows = rows.filter(row => {
+        const time = Number(timeFor(row));
+        return Number.isFinite(time) && time >= start && time <= end;
+      });
+      if (state.peakLabelMode === 'all') {
+        return new Set(visibleRows.map(row => String(idFor(row))));
+      }
+      const targetCount = Math.max(6, Math.min(20, Math.floor(plotWidth / 95)));
+      if (visibleRows.length <= targetCount) {
+        return new Set(visibleRows.map(row => String(idFor(row))));
+      }
+      const bins = Array.from({ length: targetCount }, () => null);
+      const span = Math.max(1e-9, end - start);
+      visibleRows.forEach(row => {
+        const time = Number(timeFor(row));
+        const binIndex = Math.min(
+          targetCount - 1,
+          Math.max(0, Math.floor(((time - start) / span) * targetCount))
+        );
+        const rawScore = Number(scoreFor(row));
+        const score = Number.isFinite(rawScore) ? rawScore : 0;
+        const current = bins[binIndex];
+        if (!current || score > current.score) bins[binIndex] = { row, score };
+      });
+      return new Set(
+        bins.filter(Boolean).map(item => String(idFor(item.row)))
+      );
+    }
+
+    function updatePeakLabelPolicyText() {
+      const policy = el('windowPolicy');
+      if (!policy) return;
+      if (state.peakLabelMode === 'hidden') {
+        policy.textContent = '峰圆点全部保留；时间数字已隐藏，悬停任意圆点可查看精确原始时间(min)';
+      } else if (state.peakLabelMode === 'all') {
+        policy.textContent = '正在尽量显示全部峰时间，高密度窗口可能拥挤；悬停圆点可查看精确信息';
+      } else {
+        policy.textContent = '峰圆点全部保留；每个时间分区只标注一个显著峰，悬停任意圆点可查看精确原始时间(min)';
+      }
+    }
+
     function draw() {
       const svg = el('chart');
       const rect = svg.getBoundingClientRect();
@@ -13909,6 +13994,7 @@ HTML = r"""<!doctype html>
       const markerPositions = {};
       const thirdStagePeakIds = visibleThirdStageLifPeakIds();
       const restrictThirdStageHits = thirdStagePeakIds !== null;
+      updatePeakLabelPolicyText();
 
       const bg = svgEl('rect', { x: 0, y: 0, width, height, fill: '#fff' });
       svg.appendChild(bg);
@@ -13979,11 +14065,22 @@ HTML = r"""<!doctype html>
               'vector-effect': 'non-scaling-stroke'
             }));
           });
-          state.current.lif_peaks
-            .filter(p => track.channels.includes(p.channel))
-            .forEach(p => {
+          const trackPeaks = state.current.lif_peaks
+            .filter(p => track.channels.includes(p.channel));
+          const peakIsInteractive = p => !restrictThirdStageHits
+            || thirdStagePeakIds.has(String(p.peak_id));
+          const labelIds = automaticPeakLabelIds(
+            trackPeaks.filter(peakIsInteractive),
+            p => p.peak_id,
+            p => p.plot_time_min,
+            p => Number(p.prominence ?? p.height ?? 0),
+            start,
+            end,
+            plotW
+          );
+          trackPeaks.forEach(p => {
               const peakY = lifPeakY(p);
-              const interactive = !restrictThirdStageHits || thirdStagePeakIds.has(String(p.peak_id));
+              const interactive = peakIsInteractive(p);
               const c = svgEl('circle', {
                 cx: xScale(p.plot_time_min),
                 cy: yScale(peakY),
@@ -14005,9 +14102,11 @@ HTML = r"""<!doctype html>
                 c.setAttribute('pointer-events', 'none');
               }
               svg.appendChild(c);
-              if (interactive) {
+              if (interactive && labelIds.has(String(p.peak_id))) {
                 markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
-                addTimeLabel(svg, fmt(p.raw_time_min ?? p.time_min, 3), xScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes);
+                addTimeLabel(svg, fmt(p.raw_time_min ?? p.time_min, 3), xScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes, state.peakLabelMode === 'all');
+              } else if (interactive) {
+                markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
               }
             });
         } else {
@@ -14019,12 +14118,22 @@ HTML = r"""<!doctype html>
             'stroke-width': 1.15,
             'vector-effect': 'non-scaling-stroke'
           }));
+          const eventIsInteractive = e => state.stage !== 'event_annotation'
+            || !state.meta?.cell_event_map?.available
+            || e.in_cell_event_map === true;
+          const labelIds = automaticPeakLabelIds(
+            state.current.ms_events.filter(eventIsInteractive),
+            e => e.event_id,
+            e => e.plot_time_min,
+            e => track.trace === 'pc34_760_linear' ? e.pc34_760_apex : e.qc_782_apex,
+            start,
+            end,
+            plotW
+          );
           state.current.ms_events.forEach(e => {
             const raw = track.trace === 'pc34_760_linear' ? e.pc34_760_apex : e.qc_782_apex;
             const y = Math.max(0, Number(raw || 0));
-            const interactive = state.stage !== 'event_annotation'
-              || !state.meta?.cell_event_map?.available
-              || e.in_cell_event_map === true;
+            const interactive = eventIsInteractive(e);
             const c = svgEl('circle', {
               cx: xScale(e.plot_time_min),
               cy: yScale(y),
@@ -14053,8 +14162,8 @@ HTML = r"""<!doctype html>
             if (interactive && track.trace === 'pc34_760_linear') {
               markerPositions[`ms760:${e.event_id}`] = { x: xScale(e.plot_time_min), y: yScale(y) };
             }
-            if (interactive) {
-              addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782, labelBoxes);
+            if (interactive && labelIds.has(String(e.event_id))) {
+              addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782, labelBoxes, state.peakLabelMode === 'all');
             }
           });
         }
@@ -14351,7 +14460,7 @@ HTML = r"""<!doctype html>
       svg.querySelectorAll('.peak-marker').forEach(node => svg.appendChild(node));
     }
 
-    function addTimeLabel(svg, text, x, y, top, bottom, right, color, labelBoxes) {
+    function addTimeLabel(svg, text, x, y, top, bottom, right, color, labelBoxes, allowOverlap = false) {
       const anchor = x > right - 52 ? 'end' : 'start';
       const labelX = anchor === 'end' ? x - 5 : x + 5;
       const estimatedW = Math.max(26, String(text).length * 6.2);
@@ -14370,6 +14479,7 @@ HTML = r"""<!doctype html>
         }
       }
       if (!chosen) {
+        if (!allowOverlap) return false;
         chosen = { x1, x2, y1: labelY - 10, y2: labelY + 3 };
       }
       labelBoxes.push(chosen);
@@ -14387,6 +14497,7 @@ HTML = r"""<!doctype html>
         'stroke-width': 3,
         'stroke-linejoin': 'round'
       })).textContent = text;
+      return true;
     }
 
     function attachHover(node) {
@@ -14516,6 +14627,10 @@ HTML = r"""<!doctype html>
     });
     el('yAxisMode').addEventListener('change', () => {
       state.yAxisMode = el('yAxisMode').value;
+      if (state.current) draw();
+    });
+    el('peakLabelMode').addEventListener('change', () => {
+      state.peakLabelMode = el('peakLabelMode').value;
       if (state.current) draw();
     });
     document.querySelectorAll('.stage-tab').forEach(button => {

@@ -140,6 +140,34 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(channels_rule.group("body"), r"min-height\s*:\s*34px")
         self.assertRegex(channels_rule.group("body"), r"align-items\s*:\s*center")
 
+    def test_project_creation_has_persistent_busy_and_elapsed_feedback(self):
+        body = javascript_function_body("importProject", "openExistingProject")
+        self.assertIn("button.disabled = true", body)
+        self.assertIn("aria-busy", body)
+        self.assertIn("setInterval", body)
+        self.assertIn("已等待", body)
+        self.assertIn("requestAnimationFrame", body)
+        self.assertRegex(body, r"clearInterval\(")
+
+        render = javascript_function_body(
+            "renderImportSegments",
+            "renderImportScheduledQcWindows",
+        )
+        self.assertRegex(render, r"(?s)state\.importCreating.*正在创建")
+
+    def test_dense_peak_time_labels_default_to_adaptive_decluttering(self):
+        self.assertIn('id="peakLabelMode"', HTML)
+        self.assertIn('value="auto"', HTML)
+        self.assertIn('value="all"', HTML)
+        self.assertIn('value="hidden"', HTML)
+        self.assertIn("peakLabelMode: 'auto'", HTML)
+        self.assertIn("function automaticPeakLabelIds", HTML)
+
+        draw = javascript_function_body("draw", "trackShiftSec")
+        self.assertIn("automaticPeakLabelIds", draw)
+        self.assertRegex(draw, r"labelIds\.has\(")
+        self.assertRegex(HTML, r"悬停.*精确.*时间|精确.*时间.*悬停")
+
     def test_post_qc_policy_change_explains_historical_staleness(self):
         body = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")
 
