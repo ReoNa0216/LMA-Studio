@@ -10852,11 +10852,14 @@ HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: 34px 130px 84px 84px minmax(190px, 1fr) 92px 32px;
       gap: 7px;
-      align-items: center;
+      align-items: end;
       padding: 8px;
       border: 1px solid #d7dce3;
       border-radius: 7px;
       background: #f8fafc;
+    }
+    .protocol-row > strong:first-child {
+      align-self: center;
     }
     .modal.import-modal .protocol-row {
       grid-template-columns: 34px 150px 116px 116px minmax(190px, 1fr) 104px 32px;
@@ -10869,7 +10872,10 @@ HTML = r"""<!doctype html>
     .protocol-channel-options {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 6px 10px;
+      min-height: 34px;
+      align-self: end;
     }
     .protocol-time-field {
       display: grid;
@@ -10895,6 +10901,10 @@ HTML = r"""<!doctype html>
       gap: 4px;
       white-space: nowrap;
       font-size: 11px;
+    }
+    .protocol-confirm {
+      min-height: 34px;
+      align-self: end;
     }
     .protocol-channel-options input,
     .protocol-confirm input {

@@ -123,6 +123,23 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertNotIn('placeholder="开始 min"', body)
         self.assertNotIn('placeholder="结束 min"', body)
 
+    def test_protocol_row_controls_share_one_input_baseline(self):
+        row_rule = re.search(r"\.protocol-row\s*\{(?P<body>[^}]*)\}", HTML)
+        self.assertIsNotNone(row_rule)
+        self.assertRegex(row_rule.group("body"), r"align-items\s*:\s*end")
+
+        number_rule = re.search(
+            r"\.protocol-row\s*>\s*strong:first-child\s*\{(?P<body>[^}]*)\}",
+            HTML,
+        )
+        self.assertIsNotNone(number_rule)
+        self.assertRegex(number_rule.group("body"), r"align-self\s*:\s*center")
+
+        channels_rule = re.search(r"\.protocol-channel-options\s*\{(?P<body>[^}]*)\}", HTML)
+        self.assertIsNotNone(channels_rule)
+        self.assertRegex(channels_rule.group("body"), r"min-height\s*:\s*34px")
+        self.assertRegex(channels_rule.group("body"), r"align-items\s*:\s*center")
+
     def test_post_qc_policy_change_explains_historical_staleness(self):
         body = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")
 
