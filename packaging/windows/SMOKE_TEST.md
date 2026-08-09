@@ -1,4 +1,4 @@
-# Windows v0.4.0-rc2 Candidate Smoke Test
+# Windows v0.4.0-rc3 Candidate Smoke Test
 
 Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -49,7 +49,8 @@ Create only in a new empty project directory. Configure:
 - For every LIF channel: channel name, signal color, scientific identity/sample label, and cell-annotation role. The shared acquisition-time group is assigned automatically from the signal color.
 - One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
 - A project-specific event annotation start and unlabeled-delta seed window.
-- An independent later QC policy: `disabled`, `signature` plus channels, or `scheduled_windows` plus ordered non-overlapping windows and channels.
+- An independent later QC policy: `Off`, `QC signature` plus channels, or `Scheduled windows` plus ordered non-overlapping windows and channels.
+- A channel may be both a front `QC anchor` and an Events-stage `Cell pair` channel; these roles are not mutually exclusive.
 
 Exercise small fixtures for Green-only, Red-only, Red+Green, and sequential same-axis references. Also exercise two- and four-channel layouts.
 
@@ -70,7 +71,7 @@ After creation, verify:
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
 - Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.
 
-For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc2_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc3_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 
@@ -89,7 +90,7 @@ Do not interpret historical fixed boundaries as defaults for a new project.
 
 ## 5. Front segmented calibration
 
-Open `前段参考校准`.
+Open `Calibration`.
 
 Expected:
 
@@ -99,6 +100,7 @@ Expected:
 - Red+Green segments display the configured cross-detector evidence.
 - Sequential G1/G2 segments sharing `green_axis` contribute to one Green-axis translation without requiring simultaneous peaks.
 - Manual front anchors require an explicit segment and obey its channel policy.
+- Confirming the last draft boundary automatically selects `Time = Aligned`, refreshes the window, and shows the generated QC-anchor connectors.
 - Accepted-anchor preview reports included evidence, conflicts/outliers, old/new per-axis shifts, and evidence sufficiency.
 - `应用 QC 对齐（按物理轴）` applies at most one translation per physical time axis and invalidates the dependent delta/time model.
 
@@ -109,14 +111,15 @@ Wrong-order, overlapping, missing, or unconfirmed segments must block saving or 
 On a newly built project:
 
 - The legacy high-specificity calls are tagged `core`; automatic alignment, delta, and cell candidates use only core peaks.
-- `显示 weak 弱峰` is off by default. Enabling it adds hollow/dashed weak markers without changing automatic candidates or the time model.
+- `Weak peaks` is off by default. Enabling it adds hollow/dashed weak markers without changing automatic candidates or the time model.
+- Clicking one outside `Events / QC` shows `仅在事件标注段生效`. Inside `Events / QC`, `Cell pair` + `Select peaks` can select it through the enlarged hit target and `Save pair` can persist the manual relation.
 - Weak evidence is learned only on a channel with enough core pulse evidence. Pure/no-signal channels must not be expanded into dense weak calls.
 - A user-confirmed weak peak/MS event cell pair remains exportable, while any attempt to use weak evidence as a QC or delta training anchor is rejected clearly.
 - A retired-standard project is rejected before any write and must be rebuilt in a new empty directory. There is no detector-version selector in the desktop UI.
 
 ## 6. Unlabeled later delta and freeze gate
 
-Open `后段时间差校正`.
+Open `MS Δt`.
 
 Expected:
 
@@ -134,11 +137,11 @@ After freezing, edit a confirmed segment boundary, annotation start, or delta de
 
 ## 7. Event annotation and independent post-QC
 
-Open `事件标注 / QC 巡检` and verify each policy:
+Open `Events / QC` and verify each policy:
 
-- `disabled`: no later QC candidates or manual QC writes; only cell candidates are shown.
-- `signature`: later QC candidates use only the configured signature channels.
-- `scheduled_windows`: QC candidates occur only in declared windows with their configured channels, including a declared pre-annotation window when applicable.
+- `Off`: no later QC candidates or manual QC writes; only cell candidates are shown.
+- `QC signature`: later QC candidates use only the configured channels across the Events segment.
+- `Scheduled windows`: QC candidates occur only in declared windows with their configured channels, including a declared pre-annotation window when applicable.
 
 For all policies:
 
@@ -202,11 +205,11 @@ After a real HSC1 candidate project has been created outside `HSC1_data`, run th
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packaged.ps1 `
-  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc2_candidate" `
+  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc3_candidate" `
   -HscDataDir "E:\path\to\HSC1_data"
 ```
 
-It verifies schema 3/layout 4, G1/G2 on one `green_axis`, 24 min, disabled post-QC, Track-window APIs, the 16-column export, unchanged project/source snapshots, and safe cleanup under `%TEMP%\LMAStudioProjectRegression_*`.
+It verifies schema 3/layout 4, G1/G2 on one shared Green time axis, 24 min, `Off` post-run QC, Track-window APIs, the 16-column export, unchanged temporary-copy/original-project/source snapshots (`ProjectStable`, `OriginalProjectStable`, and `HscSourceStable`), and safe cleanup under `%TEMP%\LMAStudioProjectRegression_*`.
 
 ## 11. Package boundary
 

@@ -1565,7 +1565,7 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertIn('附近有多个可匹配峰', HTML)
         self.assertNotIn('LIF G2 / Day0</div>', HTML)
         self.assertNotIn("'annotation_id', 'candidate_id', 'source', 'review_status', 'exportable'", HTML)
-        self.assertIn('稳健放大', HTML)
+        self.assertIn('<option value="robust">Zoom</option>', HTML)
 
     def test_accepted_qc_refit_estimates_each_physical_axis_and_rejects_outlier(self):
         layout = normalize_acquisition_layout(

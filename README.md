@@ -8,10 +8,10 @@ It opens its own native desktop window, lets users create or open project direct
 
 - Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a single-cell event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`; unrelated source columns are allowed and ignored.
 - Open an existing project containing preprocessing parquet tables and `annotation_app/annotations/annotation.sqlite`.
-- Configure each channel's signal color, sample label, and cell-annotation role. Shared acquisition-time groups are assigned automatically; users never type internal axis names.
+- Configure each channel's signal color, sample label, and cell-annotation role. A channel may simultaneously serve as a front `QC anchor` and an Events-stage `Cell pair` source; the two uses are independent. Shared acquisition-time groups are assigned automatically, so users never type internal axis names.
 - Use one project-wide adaptive two-tier LIF peak standard. High-confidence peaks are the only evidence used by automatic calibration, time-difference estimation, QC, candidate generation, and model fitting. Weak candidate peaks are optional display evidence for manual cell pairing only.
 - Configure ordered front reference windows using green-only, red-only, or combined red/green evidence. A read-only raw-peak scan can suggest boundaries but never confirms them. Unconfirmed windows can be opened as a raw-track draft while calibration and downstream stages remain locked.
-- Configure later QC independently as off, reference-channel based, or limited to specified time windows.
+- Configure later QC independently as `Off`, `QC signature`, or `Scheduled windows`, with a short explanation of the intended experimental scenario in the UI.
 - Estimate one calibration translation per shared signal-time group, so same-color channels such as G1/G2 pool evidence without requiring simultaneous peaks.
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
@@ -24,7 +24,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc2 and must not be published as a formal Release before Windows user acceptance.
+The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc3 and must not be published as a formal Release before Windows user acceptance.
 
 Windows x64:
 
@@ -73,7 +73,9 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.0-rc2 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.0-rc3 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload candidate artifacts only. Formal GitHub Release publication is tag-triggered and is intentionally deferred until user acceptance.
+
+Current candidate notes: [README_CANDIDATE_v0.4.0-rc3.md](README_CANDIDATE_v0.4.0-rc3.md). HSC1 walkthrough: [docs/HSC1_v0.4.0-rc3_UAT.md](docs/HSC1_v0.4.0-rc3_UAT.md).

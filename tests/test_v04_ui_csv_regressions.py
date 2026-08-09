@@ -168,6 +168,123 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(draw, r"labelIds\.has\(")
         self.assertRegex(HTML, r"悬停.*精确.*时间|精确.*时间.*悬停")
 
+    def test_weak_peak_hit_target_selects_manual_cells_and_explains_other_stages(self):
+        selection = javascript_function_body("selectManualPeak", "createManualTriplet")
+        draw = javascript_function_body("draw", "trackShiftSec")
+
+        self.assertIn("仅在事件标注段生效", selection)
+        self.assertLess(
+            selection.index("仅在事件标注段生效"),
+            selection.index("if (!state.manualMode)"),
+            "A weak peak outside Events must explain its stage gate before the manual-mode gate",
+        )
+        self.assertIn("showInteractionHint", selection)
+        self.assertIn("该通道未启用 Cell pair", selection)
+        self.assertRegex(
+            selection,
+            r"renderManualSelection\(\);\s*draw\(\);",
+            "Selecting a weak peak must repaint its visible selected outline immediately",
+        )
+        self.assertIn("weak-peak-hit-target", draw)
+        hit_radius = re.search(
+            r"weak-peak-hit-target[\s\S]{0,500}?r:\s*(?P<radius>\d+(?:\.\d+)?)",
+            draw,
+        )
+        self.assertIsNotNone(hit_radius)
+        self.assertGreaterEqual(float(hit_radius.group("radius")), 8.0)
+        self.assertRegex(draw, r"weakPeak[\s\S]{0,900}showInteractionHint")
+
+    def test_manual_save_button_names_the_selected_relation(self):
+        panels = javascript_function_body("renderStagePanels", "setConfigSaveStatus")
+        self.assertRegex(
+            panels,
+            r"createManual['\"]?\)\.textContent\s*=\s*cellMode\s*\?\s*'Save pair'\s*:\s*'Save anchor'",
+        )
+
+    def test_stage_switch_clears_unsaved_manual_selection(self):
+        stage_handler = HTML.rsplit(
+            "document.querySelectorAll('.stage-tab').forEach", 1
+        )[1].split("el('showRejected')", 1)[0]
+        self.assertIn("resetManualSelection();", stage_handler)
+        self.assertIn("state.manualMode = false;", stage_handler)
+
+    def test_dense_controls_use_compact_scientific_english(self):
+        visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
+        for label in (
+            "Start",
+            "Window",
+            "Time",
+            "Y",
+            "Labels",
+            "Weak peaks",
+            "Show",
+            "Calibration",
+            "MS Δt",
+            "Events / QC",
+            "QC anchor",
+            "Cell pair",
+        ):
+            self.assertRegex(visible_markup, rf">\s*{re.escape(label)}\s*<")
+        for verbose in (
+            "图窗起点",
+            "窗口宽度 (min)",
+            "峰时间标签",
+            "显示弱候选峰（仅人工细胞配对）",
+            "事件标注 / 质控巡检",
+        ):
+            self.assertNotIn(verbose, visible_markup)
+
+    def test_post_qc_modes_explain_when_each_mode_is_appropriate(self):
+        visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
+        for label in ("Off", "QC signature", "Scheduled windows"):
+            self.assertGreaterEqual(visible_markup.count(f">{label}</option>"), 2)
+        self.assertIn('id="importPostQcHint"', visible_markup)
+        self.assertIn('id="cfgPostQcHint"', visible_markup)
+        self.assertIn("function postQcModeHelp", HTML)
+        self.assertRegex(HTML, r"QC 时间未知.*整个事件标注段")
+        self.assertRegex(HTML, r"QC 时间已知.*仅在.*时间窗口")
+
+        import_render = javascript_function_body(
+            "renderImportPostQcControls",
+            "calibrationProtocolPayload",
+        )
+        config_render = javascript_function_body(
+            "renderConfigPostQcEditor",
+            "renderLocalDeltaPanel",
+        )
+        self.assertRegex(import_render, r"importPostQcHint.*postQcModeHelp")
+        self.assertRegex(config_render, r"cfgPostQcHint.*postQcModeHelp")
+        self.assertNotIn('data-scheduled-field="window_id"', HTML)
+        self.assertNotIn('data-cfg-scheduled-field="window_id"', HTML)
+        self.assertNotIn('placeholder="窗口 ID"', HTML)
+        self.assertIn("前段参考结束 (min)", visible_markup)
+        self.assertNotIn("前段协议结束(min)", visible_markup)
+
+    def test_confirming_calibration_draft_switches_to_aligned_qc_candidates(self):
+        save = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")
+        self.assertIn(
+            "const calibrationWasReady = calibrationBoundariesConfirmed()",
+            save,
+        )
+        self.assertIn(
+            "const calibrationBecameReady = !calibrationWasReady && calibrationBoundariesConfirmed()",
+            save,
+        )
+        self.assertRegex(
+            save,
+            r"calibrationBecameReady[\s\S]{0,700}?state\.stage\s*=\s*'qc_calibration'"
+            r"[\s\S]{0,300}?state\.timeMode\s*=\s*'aligned'",
+        )
+        self.assertIn("QC anchor 候选已生成", save)
+
+    def test_new_project_explains_qc_and_cell_roles_are_independent(self):
+        visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
+        self.assertIn('id="importDualRoleHelp"', visible_markup)
+        self.assertRegex(
+            visible_markup,
+            r"同一通道[^<]{0,100}QC anchor[^<]{0,100}Cell pair[^<]{0,100}同时",
+        )
+
     def test_main_plot_window_width_is_user_editable_and_not_reset_by_stage(self):
         control = re.search(r'<input id="widthDisplay"[^>]*>', HTML)
         self.assertIsNotNone(control)

@@ -318,7 +318,7 @@ class DetectorV2OnlyPreprocessingContractTest(unittest.TestCase):
 
 class DetectorV2OnlyUiContractTest(unittest.TestCase):
     def test_candidate_version_and_new_project_ui_expose_one_standard(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.0-rc2")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.0-rc3")
         visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
         self.assertNotIn('id="importLifPeakDetectorVersion"', HTML)
         self.assertNotRegex(HTML, r"detector_version\s*:\s*1")
@@ -342,7 +342,6 @@ class DetectorV2OnlyUiContractTest(unittest.TestCase):
             "Red-only",
             "Red+Green",
             "calibration_protocol",
-            "signature",
             "scheduled_windows",
             "disabled",
             "无标签 delta",
@@ -357,11 +356,13 @@ class DetectorV2OnlyUiContractTest(unittest.TestCase):
             "仅红色通道",
             "红绿联合",
             "自动估计时间差的范围",
-            "不进行后段巡检",
-            "按参考通道巡检",
-            "按指定时间窗口巡检",
+            "Off",
+            "QC signature",
+            "Scheduled windows",
         ):
             self.assertIn(user_facing_phrase, visible_text)
+        self.assertIn("QC 时间未知或不规律", HTML)
+        self.assertIn("QC 时间已知", HTML)
 
         for raw_runtime_message in (
             "后段 QC=${postQcMode}",
@@ -396,6 +397,15 @@ class DetectorV2OnlyUiContractTest(unittest.TestCase):
                 translated = translator(raw)
                 self.assertTrue(translated.strip())
                 self.assertIsNone(forbidden.search(translated), translated)
+
+        self.assertEqual(
+            translator("start_min, window_min, and preview_ms_delta_sec must be numeric"),
+            "开始时间、窗口宽度和预览 MS 时间差必须填写为数字。",
+        )
+        self.assertEqual(
+            translator("annotation_start_min must be numeric"),
+            "事件标注起点必须填写为数字。",
+        )
 
         self.assertIn("user_facing_error_message", HTML)
         self.assertRegex(

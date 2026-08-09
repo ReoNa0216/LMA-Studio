@@ -1,4 +1,6 @@
-# Project Model Execution Plan
+# Project Model Execution Plan (Archived)
+
+> Historical implementation checklist. The project model described here has been completed and superseded by the current architecture notes in `README.md`, `annotation_app/README.md`, and the active candidate/UAT documents. Do not use the legacy QC-role wording below as a specification for new work.
 
 **Goal:** Make project management explicit: new projects can either copy raw inputs into the project or reference external raw inputs, and existing projects can be opened by project directory.
 

@@ -9,6 +9,7 @@ LMA Studio is a local desktop application for human-reviewed LIF–MS annotation
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual outputs never enter matching or model fitting.
 - `calibration_protocol` defines front reference segments. `post_qc_strategy` independently defines later QC survey behavior.
 - Each LIF channel records detector, physical `time_axis`, scientific identity, and whether it can be used for cell annotation.
+- Front `QC anchor` membership and Events-stage `Cell pair` eligibility are independent. The same channel may have both uses; only one accepted semantic relation is allowed for a particular MS event.
 - One shift is estimated per physical axis. Multiple same-axis channels pool evidence without creating extra degrees of freedom or requiring simultaneous peaks.
 
 ## Calibration protocol
@@ -23,7 +24,7 @@ A new project must contain one or more ordered, non-overlapping project-level se
 
 The new-project UI can read the selected LIF files and suggest peak-cluster windows. Suggestions are data-derived, never global constants, and always return `boundaries_confirmed=false`. Numeric suggestions may be saved as a project draft so the user can inspect raw tracks before confirming them. A draft cannot compute or review front alignment, estimate/freeze downstream delta, or enter event annotation. Missing evidence, order/overlap conflicts, and near-equal alternatives are surfaced rather than silently resolved. Editing a suggested or confirmed boundary clears its confirmation.
 
-Legacy v0.3 G2+R1 projects are interpreted through an in-memory compatibility adapter based on their existing `qc_anchor_channels` and configured QC end. Opening a legacy project does not rewrite its manifest.
+Projects whose peak tables use the retired recognition standard are rejected before project data or SQLite is opened for mutation. Rebuild them from the original LIF/MS/coordinate inputs in a new empty directory. A narrow in-memory adapter remains only for historical calibration semantics in fixtures whose peak tables already satisfy the current recognition standard; it is not a desktop migration path.
 
 ## Post-QC policy
 
@@ -37,9 +38,9 @@ The strategy has its own hash. Changing it preserves prior reviews in SQLite but
 
 ## Three review stages
 
-1. **前段参考校准** — review per-segment anchors and optionally refit one shift per physical axis from accepted evidence.
-2. **无标签后段 delta** — estimate and inspect a generic unlabeled topology-based MS delta. It does not consume cell identity labels or post-QC identity labels.
-3. **事件标注 / QC 巡检** — after the time model is frozen, review cell candidates and any enabled post-QC candidates.
+1. **Calibration** — review per-segment QC anchors and optionally refit one shift per physical axis from accepted evidence. Confirming the last draft boundary moves the UI to `Aligned` so generated connectors are immediately visible.
+2. **MS Δt** — estimate and inspect a generic unlabeled topology-based MS delta. It does not consume cell identity labels or post-QC identity labels.
+3. **Events / QC** — after the time model is frozen, review cell candidates and any enabled post-run QC candidates. Weak LIF peaks are selectable only here through `Cell pair`; they never become automatic evidence.
 
 Third-stage writes require the current frozen model and a canonical event-map `ms_event_id`. A single MS event cannot have simultaneous active QC and cell semantics. If G1 and G2 both match the same MS event, candidates are marked `cell_cross_channel_ambiguous`, excluded from batch acceptance, and require explicit channel arbitration.
 
@@ -71,7 +72,7 @@ MS_event_id,residual_sec,annotation_id
 
 ## Project-driven preprocessing
 
-New projects write `results/tables/v3/00_project_protocol.json`. Both LIF and MS preprocessing use the same policy to label reference segments, the pre-annotation gap, and the annotation region. Reports and plots do not assign fixed 0–10.5 / 10.5–40 / >=40 meanings. A fixed-boundary fallback exists only for opening historical projects that lack this file.
+New projects write `results/tables/v3/00_project_protocol.json`. Both LIF and MS preprocessing use the same policy to label reference segments, the pre-annotation gap, and the annotation region. Reports and plots do not assign fixed 0–10.5 / 10.5–40 / >=40 meanings.
 
 ## Development and packaging
 

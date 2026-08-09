@@ -21,7 +21,7 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc2"
+    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc3"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
 $CopyProject = Join-Path $CopyRoot "HSC1"
@@ -105,6 +105,7 @@ if (Get-Process LMAStudio -ErrorAction SilentlyContinue) {
     throw "Close the running LMA Studio window before starting HSC1 regression."
 }
 
+$OriginalProjectBefore = Get-ProjectSnapshot $SourceProject
 $SourceBefore = Get-HscSourceSnapshot $HscRoot
 $Process = $null
 New-Item -ItemType Directory -Path $CopyRoot | Out-Null
@@ -214,6 +215,10 @@ try {
     if ($Before -cne $After) {
         throw "Packaged HSC1 read-only smoke changed protected project state."
     }
+    $OriginalProjectAfter = Get-ProjectSnapshot $SourceProject
+    if ($OriginalProjectBefore -cne $OriginalProjectAfter) {
+        throw "Packaged HSC1 smoke changed the original project; only the temporary copy may be used."
+    }
     $SourceAfter = Get-HscSourceSnapshot $HscRoot
     if ($SourceBefore -cne $SourceAfter) {
         throw "HSC1_data tree metadata changed during packaged regression."
@@ -232,6 +237,7 @@ try {
         DeltaStatus = [string]$Delta.recommendation_status
         CsvHeaderColumns = ($ActualHeader -split ",").Count
         ProjectStable = $true
+        OriginalProjectStable = $true
         HscSourceStable = $true
         SmokeProcessExited = $true
     } | Format-List

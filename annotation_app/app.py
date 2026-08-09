@@ -86,7 +86,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.0-rc2"
+APP_VERSION = "lma_studio_v0.4.0-rc3"
 APP_DISPLAY_NAME = "LMA Studio"
 
 DEFAULT_WINDOW_MIN = 2.5
@@ -3723,6 +3723,15 @@ def user_facing_error_message(error: Any) -> str:
         )
     if "preview_hash" in lowered or "protocol_hash" in lowered or " hash" in lowered:
         return "当前预览或项目设置已经变化，请重新打开对应步骤并生成新的预览。"
+    if "must be numeric" in lowered:
+        if "annotation_start_min" in lowered:
+            return "事件标注起点必须填写为数字。"
+        if all(
+            token in lowered
+            for token in ("start_min", "window_min", "preview_ms_delta_sec")
+        ):
+            return "开始时间、窗口宽度和预览 MS 时间差必须填写为数字。"
+        return "时间参数必须填写为数字。"
     if re.search(r"(?i)\bv(?:0\.3|1|2)(?:\.\d+)*\b", message):
         return (
             "该项目的设置格式无法由当前软件安全读取。请保留原项目不变，"
@@ -11115,6 +11124,28 @@ HTML = r"""<!doctype html>
       overflow-wrap: anywhere;
       word-break: break-word;
     }
+    .interaction-hint {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      z-index: 60;
+      max-width: min(420px, calc(100vw - 28px));
+      padding: 8px 12px;
+      border-radius: 7px;
+      background: rgba(17, 24, 39, 0.94);
+      color: #fff;
+      font-size: 12px;
+      line-height: 1.35;
+      box-shadow: 0 8px 22px rgba(15, 23, 42, 0.22);
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 8px);
+      transition: opacity .14s ease, transform .14s ease;
+    }
+    .interaction-hint.show {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
     .context-menu {
       position: fixed;
       z-index: 30;
@@ -11801,15 +11832,15 @@ HTML = r"""<!doctype html>
       <div class="metric"><span>MS scan 点数</span><strong id="msPointCount">-</strong></div>
       <p class="side-title" style="margin-top:18px;">任务阶段</p>
       <div class="stage-tabs">
-        <button class="stage-tab active" data-stage="qc_calibration">前段参考校准</button>
-        <button class="stage-tab" data-stage="local_calibration">后段时间差校正</button>
-        <button class="stage-tab" data-stage="event_annotation">事件标注 / 质控巡检</button>
+        <button class="stage-tab active" data-stage="qc_calibration" title="前段参考校准">Calibration</button>
+        <button class="stage-tab" data-stage="local_calibration" title="后段 MS 时间差校正">MS Δt</button>
+        <button class="stage-tab" data-stage="event_annotation" title="事件标注与后段 QC">Events / QC</button>
       </div>
       <div id="stageNote" class="stage-note">逐段审核前段参考峰，用于确认各组 LIF 信号相对 MS 只需做时间平移。</div>
       <div id="eventFilter" class="segmented" style="display:none;" aria-label="事件类型筛选">
-        <button type="button" class="active" data-event-filter="all">全部</button>
-        <button type="button" data-event-filter="qc">质控</button>
-        <button type="button" data-event-filter="cell">细胞</button>
+        <button type="button" class="active" data-event-filter="all">All</button>
+        <button type="button" data-event-filter="qc">QC</button>
+        <button type="button" data-event-filter="cell">Cells</button>
       </div>
       <div id="qcRefitPanel" class="manual-box" style="display:none; margin-top:8px;">
         <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考峰预览重算</button>
@@ -11861,17 +11892,17 @@ HTML = r"""<!doctype html>
         <p id="manualPanelTitle" class="side-title" style="margin-top:18px;">手动参考峰关系</p>
         <div class="manual-box">
           <div id="manualAnnotationKind" class="segmented two" style="display:none;" aria-label="手工标注类型">
-            <button type="button" class="active" data-manual-kind="qc">质控参考峰</button>
-            <button type="button" data-manual-kind="cell">细胞二元组</button>
+            <button type="button" class="active" data-manual-kind="qc">QC anchor</button>
+            <button type="button" data-manual-kind="cell">Cell pair</button>
           </div>
-          <button id="manualMode" class="small-button secondary">选择峰</button>
-          <button id="clearManual" class="small-button secondary">清空</button>
+          <button id="manualMode" class="small-button secondary">Select peaks</button>
+          <button id="clearManual" class="small-button secondary">Clear</button>
           <div class="manual-selection">
             <div id="manualLifRow" style="display:none;">LIF: <strong id="manualLIF">-</strong></div>
             <div id="manualAnchorRows"></div>
             <div>MS760: <strong id="manualMS">-</strong></div>
           </div>
-          <button id="createManual" class="small-button">建立并接受</button>
+          <button id="createManual" class="small-button">Save pair</button>
         <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的 LIF 参考峰和对应的 MS760 峰。</div>
         </div>
       </div>
@@ -11882,40 +11913,40 @@ HTML = r"""<!doctype html>
         <button id="prev" title="上一窗口" aria-label="上一窗口">&#8592;</button>
         <button id="next" title="下一窗口" aria-label="下一窗口">&#8594;</button>
         <label>
-          <span class="policy">图窗起点</span>
+          <span class="policy">Start</span>
           <input id="start" type="number" step="0.1" value="0" />
         </label>
         <label>
-          <span class="policy">窗口宽度 (min)</span>
+          <span class="policy">Window</span>
           <input id="widthDisplay" type="number" min="0.25" max="15" step="0.05" value="2.5" title="可输入 0.25–15 min" />
         </label>
         <label>
-          <span class="policy">时间轴</span>
+          <span class="policy">Time</span>
           <select id="timeMode">
-            <option value="aligned" selected>校正后</option>
-            <option value="raw">原始</option>
+            <option value="aligned" selected>Aligned</option>
+            <option value="raw">Raw</option>
           </select>
         </label>
         <label>
-          <span class="policy">Y轴</span>
+          <span class="policy">Y</span>
           <select id="yAxisMode">
-            <option value="full" selected>完整</option>
-            <option value="robust">稳健放大</option>
+            <option value="full" selected>Full</option>
+            <option value="robust">Zoom</option>
           </select>
         </label>
         <label>
-          <span class="policy">峰时间标签</span>
+          <span class="policy">Labels</span>
           <select id="peakLabelMode">
-            <option value="auto" selected>自动精简</option>
-            <option value="all">全部（可能拥挤）</option>
-            <option value="hidden">隐藏</option>
+            <option value="auto" selected>Auto</option>
+            <option value="all">All</option>
+            <option value="hidden">Off</option>
           </select>
         </label>
-        <label id="showWeakLifPeaksLabel" class="checkbox-row" style="margin:0; white-space:nowrap;" title="弱候选峰只供人工复核，不参与自动匹配">
+        <label id="showWeakLifPeaksLabel" class="checkbox-row" style="margin:0; white-space:nowrap;" title="仅在事件标注段用于人工细胞配对；不参与自动匹配">
           <input id="showWeakLifPeaks" type="checkbox" />
-          显示弱候选峰（仅人工细胞配对）
+          Weak peaks
         </label>
-        <button id="go">显示窗口</button>
+        <button id="go">Show</button>
       </div>
       <div class="window-readout">
         <strong id="title">同步 2.5 min 窗口</strong>
@@ -11925,6 +11956,7 @@ HTML = r"""<!doctype html>
     </section>
   </main>
   <div id="tooltip" class="tooltip"></div>
+  <div id="interactionHint" class="interaction-hint" role="status" aria-live="polite"></div>
   <div id="lineContextMenu" class="context-menu"></div>
   <div id="importModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="importTitle">
     <div class="modal import-modal">
@@ -11971,6 +12003,7 @@ HTML = r"""<!doctype html>
             <span id="importRoleSummary" class="qc-anchor-rule">细胞 0 · 共 0 个 LIF</span>
           </div>
         </div>
+        <div id="importDualRoleHelp" class="qc-anchor-rule" style="grid-column:2;">同一通道的 QC anchor 与 Cell pair 角色相互独立，可同时启用。</div>
         <label for="importMs">MS 文件</label>
         <div class="path-picker-row">
           <input id="importMs" type="text" placeholder="选择 MS 原始文件" />
@@ -11998,7 +12031,7 @@ HTML = r"""<!doctype html>
             <button id="addImportSegment" type="button" class="small-button secondary">＋ 添加参考段</button>
           </span>
         </div>
-        <div class="qc-anchor-rule">每段按时间顺序填写；可选择仅绿色通道、仅红色通道或红绿联合参考。可以先创建草稿并查看原始峰形；所有边界确认前，时间校准及后续阶段保持锁定。</div>
+        <div class="qc-anchor-rule">QC anchor 由各段勾选通道决定（仅绿色通道 / 仅红色通道 / 红绿联合）；CART 可在同一段选择 G2+R1。可以先创建草稿查看原始峰形；所有边界确认前，时间校准与后续阶段保持锁定。</div>
         <div id="importSuggestionStatus" class="qc-anchor-rule">尚未分析原始峰形。</div>
         <div id="importCalibrationSegments" class="protocol-editor"></div>
       </section>
@@ -12011,21 +12044,22 @@ HTML = r"""<!doctype html>
           <label>自动估计时间差的范围 (min)
             <input id="importSeedWindow" type="number" min="0.1" step="0.5" value="2.5" />
           </label>
-          <label>后段质控巡检方式
+          <label>Post-run QC
             <select id="importPostQcMode">
-              <option value="disabled" selected>不进行后段巡检</option>
-              <option value="signature">按参考通道巡检</option>
-              <option value="scheduled_windows">按指定时间窗口巡检</option>
+              <option value="disabled" selected>Off</option>
+              <option value="signature">QC signature</option>
+              <option value="scheduled_windows">Scheduled windows</option>
             </select>
           </label>
-          <label id="importPostQcChannelsLabel">后段巡检参考通道
+          <label id="importPostQcChannelsLabel">QC channels
             <select id="importPostQcChannels" multiple size="2" aria-label="后段巡检参考通道"></select>
           </label>
         </div>
+        <div id="importPostQcHint" class="qc-anchor-rule"></div>
         <div id="importScheduledQcPanel" style="display:none; margin-top:8px;">
           <div class="import-section-title">
-            <span>指定时间巡检窗口</span>
-            <button id="addImportScheduledQc" type="button" class="small-button secondary">＋ 添加巡检窗口</button>
+            <span>Scheduled windows</span>
+            <button id="addImportScheduledQc" type="button" class="small-button secondary">＋ Window</button>
           </div>
           <div id="importScheduledQcWindows" class="protocol-editor"></div>
         </div>
@@ -12069,7 +12103,7 @@ HTML = r"""<!doctype html>
         <button id="closeConfigProject" class="small-button secondary">关闭</button>
       </div>
       <div id="timeConfigPanel" class="config-grid">
-        <span>前段协议结束(min)</span><input id="cfgQcEnd" type="number" step="0.1" />
+        <span>前段参考结束 (min)</span><input id="cfgQcEnd" type="number" step="0.1" />
         <span>事件标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
         <span>自动估计时间差的范围(min)</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
@@ -12087,19 +12121,20 @@ HTML = r"""<!doctype html>
         <div id="cfgCalibrationSegments" class="protocol-editor"></div>
       </section>
       <section id="cfgPostQcPanel" class="import-section">
-        <div class="import-section-title"><span>后段质控巡检（与前段参考段独立）</span><button id="cfgAddScheduledQc" type="button" class="small-button secondary">＋ 添加巡检窗口</button></div>
+        <div class="import-section-title"><span>Post-run QC</span><button id="cfgAddScheduledQc" type="button" class="small-button secondary">＋ Window</button></div>
         <div class="policy-fields">
-          <label>策略
+          <label>Mode
             <select id="cfgPostQcMode">
-              <option value="disabled">不进行后段巡检</option>
-              <option value="signature">按参考通道巡检</option>
-              <option value="scheduled_windows">按指定时间窗口巡检</option>
+              <option value="disabled">Off</option>
+              <option value="signature">QC signature</option>
+              <option value="scheduled_windows">Scheduled windows</option>
             </select>
           </label>
-          <label id="cfgPostQcChannelsLabel">巡检参考通道
+          <label id="cfgPostQcChannelsLabel">QC channels
             <select id="cfgPostQcChannels" multiple size="2"></select>
           </label>
         </div>
+        <div id="cfgPostQcHint" class="qc-anchor-rule"></div>
         <div id="cfgScheduledQcWindows" class="protocol-editor" style="margin-top:8px;"></div>
       </section>
       <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
@@ -12327,6 +12362,19 @@ HTML = r"""<!doctype html>
     }
 
     const el = (id) => document.getElementById(id);
+    let interactionHintTimer = null;
+
+    function showInteractionHint(message) {
+      const hint = el('interactionHint');
+      if (!hint) return;
+      hint.textContent = String(message || '');
+      hint.classList.add('show');
+      if (interactionHintTimer !== null) window.clearTimeout(interactionHintTimer);
+      interactionHintTimer = window.setTimeout(() => {
+        hint.classList.remove('show');
+        interactionHintTimer = null;
+      }, 2200);
+    }
 
     function fmt(n, digits = 2) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '';
@@ -12466,6 +12514,13 @@ HTML = r"""<!doctype html>
       }
       if (/preview_hash|protocol_hash|\bhash\b/i.test(raw)) {
         return '当前预览或项目设置已经变化，请重新打开对应步骤并生成新的预览。';
+      }
+      if (/must be numeric/i.test(raw)) {
+        if (/annotation_start_min/i.test(raw)) return '事件标注起点必须填写为数字。';
+        if (/start_min/i.test(raw) && /window_min/i.test(raw) && /preview_ms_delta_sec/i.test(raw)) {
+          return '开始时间、窗口宽度和预览 MS 时间差必须填写为数字。';
+        }
+        return '时间参数必须填写为数字。';
       }
       const replacements = [
         [/post_qc_strategy/gi, '后段质控巡检设置'],
@@ -12783,7 +12838,7 @@ HTML = r"""<!doctype html>
       box.innerHTML = state.importScheduledQcWindows.map((windowRow, index) => `
         <div class="protocol-row" data-import-scheduled-id="${windowRow.id}">
           <strong>#${index + 1}</strong>
-          <input data-scheduled-field="window_id" type="text" value="${escapeText(windowRow.window_id)}" placeholder="窗口 ID" />
+          <span>QC window</span>
           <label class="protocol-time-field"><span>开始时间 (min)</span><input data-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min)}" /></label>
           <label class="protocol-time-field"><span>结束时间 (min)</span><input data-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min)}" /></label>
           <div class="protocol-channel-options">${importChannelOptions(windowRow.reference_channels).replaceAll('data-segment-channel', 'data-scheduled-channel')}</div>
@@ -12805,8 +12860,9 @@ HTML = r"""<!doctype html>
         if (el('importPostQcChannelsLabel')) {
           el('importPostQcChannelsLabel').style.display = mode === 'signature' ? 'grid' : 'none';
           el('importPostQcChannelsLabel').style.opacity = '1';
-        }
+      }
       if (el('importScheduledQcPanel')) el('importScheduledQcPanel').style.display = mode === 'scheduled_windows' ? 'block' : 'none';
+      if (el('importPostQcHint')) el('importPostQcHint').textContent = postQcModeHelp(mode);
       renderImportScheduledQcWindows();
     }
 
@@ -13161,10 +13217,20 @@ HTML = r"""<!doctype html>
     }
 
     function postQcModeLabel(mode) {
-      if (mode === 'disabled') return '不进行后段巡检';
-      if (mode === 'signature') return '按参考通道巡检';
-      if (mode === 'scheduled_windows') return '按指定时间窗口巡检';
-      return '后段巡检配置';
+      if (mode === 'disabled') return 'Off';
+      if (mode === 'signature') return 'QC signature';
+      if (mode === 'scheduled_windows') return 'Scheduled windows';
+      return 'Post-run QC';
+    }
+
+    function postQcModeHelp(mode) {
+      if (mode === 'signature') {
+        return 'QC 时间未知或不规律：在整个事件标注段寻找所选 QC 通道组合。';
+      }
+      if (mode === 'scheduled_windows') {
+        return 'QC 时间已知：仅在填写的时间窗口内寻找，减少误匹配。';
+      }
+      return '后段没有再次注入 QC 时使用；HSC1 选择 Off。';
     }
 
     function physicalAxisName(axis) {
@@ -13553,13 +13619,14 @@ HTML = r"""<!doctype html>
       el('cfgPostQcChannels').disabled = mode !== 'signature';
       el('cfgPostQcChannelsLabel').style.display = mode === 'signature' ? 'grid' : 'none';
       el('cfgPostQcChannelsLabel').style.opacity = '1';
+      el('cfgPostQcHint').textContent = postQcModeHelp(mode);
       el('cfgAddScheduledQc').style.display = mode === 'scheduled_windows' ? 'block' : 'none';
       const box = el('cfgScheduledQcWindows');
       box.style.display = mode === 'scheduled_windows' ? 'grid' : 'none';
       box.innerHTML = (strategy.windows || []).map((windowRow, index) => `
         <div class="protocol-row" data-cfg-scheduled-index="${index}">
           <strong>#${index + 1}</strong>
-          <input data-cfg-scheduled-field="window_id" type="text" value="${escapeText(windowRow.window_id || `post_qc_${index + 1}`)}" placeholder="窗口 ID" />
+          <span>QC window</span>
           <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min ?? '')}" /></label>
           <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min ?? '')}" /></label>
           <div class="protocol-channel-options">${configChannelCheckboxes(windowRow.reference_channels)}</div>
@@ -13687,6 +13754,7 @@ HTML = r"""<!doctype html>
       el('manualAnnotationKind').style.display = eventAnnotation ? 'grid' : 'none';
       el('manualLifRow').style.display = cellMode ? 'block' : 'none';
       el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动参考峰关系';
+      el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
@@ -13747,6 +13815,7 @@ HTML = r"""<!doctype html>
       button.textContent = '保存中...';
       setConfigSaveStatus('正在保存项目时间节点...');
       try {
+        const calibrationWasReady = calibrationBoundariesConfirmed();
         const currentCfg = state.current?.project_config || state.meta?.project_config || {};
         const payload = {
           qc_calibration_end_min: Number(el('cfgQcEnd').value),
@@ -13819,6 +13888,7 @@ HTML = r"""<!doctype html>
         state.configPostQcDraft = JSON.parse(JSON.stringify(result.project_config.post_qc_strategy || { mode: 'disabled' }));
         if (qcEndChanged) state.qcRefitPreview = null;
         const cfg = result.project_config;
+        const calibrationBecameReady = !calibrationWasReady && calibrationBoundariesConfirmed();
         const annotationStart = Number(cfg.annotation_start_min || state.start);
         const qcEnd = Number(cfg.qc_calibration_end_min || 10.5);
         if (!calibrationBoundariesConfirmed()) {
@@ -13833,6 +13903,15 @@ HTML = r"""<!doctype html>
             Number(firstSegment?.start_min || 0)
           );
           el('timeMode').value = 'raw';
+        } else if (calibrationBecameReady) {
+          const firstSegment = cfg.calibration_protocol?.segments?.[0];
+          state.stage = 'qc_calibration';
+          state.timeMode = 'aligned';
+          state.start = Math.max(
+            Number(state.meta?.time_min_min || 0),
+            Number(firstSegment?.start_min || 0)
+          );
+          el('timeMode').value = 'aligned';
         } else if (state.stage === 'local_calibration') {
           state.start = annotationStart;
         } else if (state.stage === 'event_annotation' && Number(state.start) < annotationStart) {
@@ -13841,7 +13920,10 @@ HTML = r"""<!doctype html>
           state.start = 0;
         }
         applyStageWindowWidth();
-        const savedMessage = `已保存：前段参考结束 ${String(Number(cfg.qc_calibration_end_min))} min；事件起点 ${String(Number(cfg.annotation_start_min))} min；自动估计时间差范围 ${String(Number(cfg.local_delta_seed_window_min))} min；${postQcModeLabel(cfg.post_qc_strategy?.mode || 'disabled')}。`;
+        const calibrationReadyMessage = calibrationBecameReady
+          ? ' QC anchor 候选已生成；关闭配置后即可审核。'
+          : '';
+        const savedMessage = `已保存：前段参考结束 ${String(Number(cfg.qc_calibration_end_min))} min；事件起点 ${String(Number(cfg.annotation_start_min))} min；自动估计时间差范围 ${String(Number(cfg.local_delta_seed_window_min))} min；${postQcModeLabel(cfg.post_qc_strategy?.mode || 'disabled')}。${calibrationReadyMessage}`;
         setConfigSaveStatus(
           result.warning ? `${savedMessage} ${result.warning}` : savedMessage,
           result.warning ? 'warning' : 'success'
@@ -14504,7 +14586,7 @@ HTML = r"""<!doctype html>
       const cell = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
       const anchors = qcAnchorChannels();
       el('manualMode').classList.toggle('manual-mode-on', state.manualMode);
-      el('manualMode').textContent = state.manualMode ? '选择中' : '选择峰';
+      el('manualMode').textContent = state.manualMode ? 'Selecting' : 'Select peaks';
       el('manualLIF').textContent = state.manual.LIF ? `${state.manual.LIF.channel} ${state.manual.LIF.id} (${fmt(state.manual.LIF.time, 3)})` : '-';
       el('manualAnchorRows').innerHTML = anchors.map((channel) => {
         const selected = state.manual.anchors[channel];
@@ -14517,18 +14599,31 @@ HTML = r"""<!doctype html>
     }
 
     function selectManualPeak(kind, row) {
-      if (!state.manualMode) return;
-      const cellMode = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
       const weakPeak = kind !== 'MS760'
         && String(row.peak_tier || 'core').trim().toLowerCase() === 'weak';
-      if (weakPeak && !cellMode) return;
+      if (weakPeak && state.stage !== 'event_annotation') {
+        showInteractionHint('仅在事件标注段生效');
+        return;
+      }
+      if (weakPeak && state.manualAnnotationKind !== 'cell') {
+        showInteractionHint('请切换到 Cell pair');
+        return;
+      }
+      if (!state.manualMode) {
+        if (weakPeak) showInteractionHint('请先点击 Select peaks');
+        return;
+      }
+      const cellMode = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
       if (cellMode && kind !== 'MS760') {
         const allowed = new Set(
           (state.meta?.acquisition_layout?.lif_channels || [])
             .filter(item => item.use_for_cell_annotation !== false)
             .map(item => item.channel)
         );
-        if (allowed.size && !allowed.has(row.channel)) return;
+        if (allowed.size && !allowed.has(row.channel)) {
+          showInteractionHint('该通道未启用 Cell pair');
+          return;
+        }
         state.manual.LIF = { id: row.peak_id, channel: row.channel, time: row.raw_time_min ?? row.time_min };
         state.manual.anchors = {};
       } else {
@@ -14542,6 +14637,7 @@ HTML = r"""<!doctype html>
         }
       }
       renderManualSelection();
+      draw();
     }
 
     async function createManualTriplet() {
@@ -14818,28 +14914,65 @@ HTML = r"""<!doctype html>
               const peakY = lifPeakY(p);
               const interactive = peakIsInteractive(p);
               const weakPeak = String(p.peak_tier || 'core').trim().toLowerCase() === 'weak';
+              const manuallySelected = String(state.manual.LIF?.id || '') === String(p.peak_id)
+                || Object.values(state.manual.anchors || {}).some(item => String(item?.id || '') === String(p.peak_id));
               const c = svgEl('circle', {
                 cx: xScale(p.plot_time_min),
                 cy: yScale(peakY),
-                r: p.close_peak_risk || p.merge_risk ? 4.5 : (weakPeak ? 3.8 : 3.4),
+                r: manuallySelected ? 5.2 : (p.close_peak_risk || p.merge_risk ? 4.5 : (weakPeak ? 3.8 : 3.4)),
                 fill: weakPeak ? '#fff' : colorForChannel(p.channel),
-                stroke: p.close_peak_risk || p.merge_risk ? '#b42318' : (weakPeak ? colorForChannel(p.channel) : '#fff'),
-                'stroke-width': weakPeak ? 1.8 : 1.3,
+                stroke: manuallySelected ? '#111827' : (p.close_peak_risk || p.merge_risk ? '#b42318' : (weakPeak ? colorForChannel(p.channel) : '#fff')),
+                'stroke-width': manuallySelected ? 2.6 : (weakPeak ? 1.8 : 1.3),
                 'stroke-dasharray': weakPeak ? '2 1' : '',
-                class: 'peak-marker'
+                class: manuallySelected ? 'peak-marker manual-selected-peak' : 'peak-marker'
               });
-              if (interactive) {
+              if (weakPeak) c.setAttribute('pointer-events', 'none');
+              if (interactive && !weakPeak) {
                 c.setAttribute('tabindex', '0');
                 c.__detail = { kind: 'lif_peak', type: 'LIF 峰', data: p };
                 attachHover(c);
                 c.addEventListener('click', () => {
                   selectManualPeak('LIF', p);
                 });
-              } else {
+              } else if (!weakPeak) {
                 c.setAttribute('opacity', '.42');
+                c.setAttribute('pointer-events', 'none');
+              } else if (!interactive) {
+                c.setAttribute('opacity', '.58');
                 c.setAttribute('pointer-events', 'none');
               }
               svg.appendChild(c);
+              if (weakPeak && state.showWeakLifPeaks) {
+                const activateWeakPeak = () => {
+                  if (state.stage !== 'event_annotation') {
+                    showInteractionHint('仅在事件标注段生效');
+                    return;
+                  }
+                  selectManualPeak('LIF', p);
+                };
+                const weakHit = svgEl('circle', {
+                  class: 'weak-peak-hit-target',
+                  cx: xScale(p.plot_time_min),
+                  cy: yScale(peakY),
+                  r: 9,
+                  fill: 'transparent',
+                  role: 'button',
+                  tabindex: '0',
+                  'aria-label': `${channelDisplayLabel(p.channel)} 弱候选峰 ${fmtMaybe(p.raw_time_min ?? p.time_min, 3)} min`,
+                  'pointer-events': 'all',
+                  cursor: state.stage === 'event_annotation' ? 'pointer' : 'help'
+                });
+                weakHit.__detail = { kind: 'lif_peak', type: 'LIF 弱候选峰', data: p };
+                attachHover(weakHit);
+                weakHit.addEventListener('click', activateWeakPeak);
+                weakHit.addEventListener('keydown', (ev) => {
+                  if (ev.key === 'Enter' || ev.key === ' ') {
+                    ev.preventDefault();
+                    activateWeakPeak();
+                  }
+                });
+                svg.appendChild(weakHit);
+              }
               if (interactive && labelIds.has(String(p.peak_id))) {
                 markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
                 addTimeLabel(svg, fmt(p.raw_time_min ?? p.time_min, 3), xScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes, state.peakLabelMode === 'all');
@@ -15196,6 +15329,7 @@ HTML = r"""<!doctype html>
 
     function bringPeakMarkersToFront(svg) {
       svg.querySelectorAll('.peak-marker').forEach(node => svg.appendChild(node));
+      svg.querySelectorAll('.weak-peak-hit-target').forEach(node => svg.appendChild(node));
     }
 
     function addTimeLabel(svg, text, x, y, top, bottom, right, color, labelBoxes, allowOverlap = false) {
@@ -15384,6 +15518,8 @@ HTML = r"""<!doctype html>
       button.addEventListener('click', async () => {
         hideLineContextMenu();
         state.stage = button.dataset.stage;
+        resetManualSelection();
+        state.manualMode = false;
         applyStageWindowWidth();
         state.selectedCandidateId = null;
         state.previewDeltaSec = null;

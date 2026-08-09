@@ -1,356 +1,122 @@
-# Linux LIF-MS Annotation Project Transfer Checklist
+# Linux → Windows Current-Standard Project Transfer
 
-This checklist is for moving an already annotated Linux project to the Windows
-packaged LIF-MS annotation app without redrawing annotations.
+Use this checklist only for a project already created with the current adaptive two-tier peak standard. A project made with the retired peak recognizer cannot be opened or upgraded in place; rebuild it from the original LIF/MS/coordinate inputs in a new empty directory.
 
-The first-principles rule is:
+## First principle
 
-> Annotation SQLite is valid only for the exact raw inputs, preprocessing outputs,
-> peak/event IDs, channel identity map, and time model that produced it.
+`annotation.sqlite` is meaningful only with the exact manifest, intermediate tables, canonical event map, and model inputs that produced its peak/event IDs. Transfer the complete project directory, never SQLite alone.
 
-Do not treat `annotation.sqlite` as a standalone project. Move it together with
-the matching project data.
-
-## Recommended Decision
-
-Use the Linux project as a complete project package.
-
-Good:
+Recommended:
 
 ```text
-Linux project directory -> archive -> Windows project directory -> open project
+complete Linux project -> archive -> extract on Windows -> open project directory
 ```
 
-Avoid:
+Unsafe:
 
 ```text
-Only copy annotation.sqlite -> attach it to a newly generated Windows project
+annotation.sqlite -> attach to separately regenerated tables
 ```
 
-The second path can silently attach annotations to the wrong LIF peak or MS
-event if IDs differ.
+## Required project assets
 
-## Required Files
+The project root must contain:
 
-From the Linux project root, these files must exist:
+- `lifms_project.json`
+- every intermediate parquet file named in `lifms_project.json.intermediate_tables`
+- the SQLite file named in `lifms_project.json.annotation_db.path`
+- `results/tables/v3/00_project_protocol.json`
+- `data/interim/lma/cell_event_umap.csv`
+
+The canonical event map is a project asset with exactly:
 
 ```text
-data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_traces.parquet
-data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_peaks.parquet
-data/interim/v3/02_ms_event_calling/v3_02_ms_events.parquet
-data/interim/v3/02_ms_event_calling/v3_02_ms_scan_summary.parquet
-annotation_app/annotations/annotation.sqlite
+ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2
 ```
 
-These four parquet files define the LIF peaks and MS events that the SQLite
-annotations point to.
+It is not the original source coordinate CSV. The source CSV may have extra columns, but only `scan_start_time`, `UMAP1`, and `UMAP2` are imported.
 
-For a schema-v2 project, this canonical map is also required:
+Keep these with the project when present:
 
-```text
-data/interim/lma/cell_event_umap.csv
-```
+- `results/tables/v3/00_allowed_inputs.csv`
+- `results/tables/v3/00_imported_raw_inputs.csv`
+- `reports/`
+- `annotation_app/annotations/exports/`
+- `raw_inputs/` when the project used copy-into-project mode
 
-It is a five-column project asset (`ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`),
-not the original source CSV. Schema-v1 projects may legitimately have no map;
-they retain the legacy unfiltered third-stage workflow until the user explicitly
-attaches a map.
+External raw inputs do not need to be copied merely to browse a complete project, but they are required for exact reprocessing. Their recorded fingerprints must still describe the original files.
 
-## Strongly Recommended Files
+## Confirm the current standard before transfer
 
-These should also be moved with the project:
+Inspect `lifms_project.json` without editing it. A current project records:
 
-```text
-lifms_project.json
-results/tables/v3/00_allowed_inputs.csv
-results/tables/v3/00_imported_raw_inputs.csv
-reports/import_project.md
-reports/import_preprocess.log
-annotation_app/annotations/exports/
-data/interim/lma/cell_event_umap.csv
-```
+- project schema 3;
+- acquisition layout 4;
+- the current `lif_peak_detection` policy and its matching scientific hash;
+- `calibration_protocol` and `post_qc_strategy`;
+- fingerprints for every intermediate table;
+- the canonical event-map binding.
 
-`raw_inputs/` is optional. The Windows app now supports two raw input modes:
+Do not manually add or rewrite these fields to make an old project appear current. The peak-table metadata and hashes are checked against the manifest, so a cosmetic manifest edit is invalid and risks losing provenance.
 
-- `external_reference`: raw files stay outside the project and
-  `lifms_project.json` records absolute source paths plus fingerprints. This is
-  the recommended mode when the MS raw text is very large.
-- `copy_into_project`: raw files are copied under `raw_inputs/` for a
-  self-contained archival project.
+## Linux preflight
 
-In both modes, project opening depends on the four parquet files and
-`annotation.sqlite`. Missing external raw files should not prevent browsing
-existing annotations, but it will prevent exact reprocessing from raw inputs.
-
-## Quick Linux Check
-
-Run this from the Linux project root:
+From the project root:
 
 ```bash
-set -e
-
-test -f data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_traces.parquet
-test -f data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_peaks.parquet
-test -f data/interim/v3/02_ms_event_calling/v3_02_ms_events.parquet
-test -f data/interim/v3/02_ms_event_calling/v3_02_ms_scan_summary.parquet
+set -euo pipefail
+test -f lifms_project.json
+test -f results/tables/v3/00_project_protocol.json
+test -f data/interim/lma/cell_event_umap.csv
 test -f annotation_app/annotations/annotation.sqlite
-
-test -f results/tables/v3/00_imported_raw_inputs.csv || true
-test -f lifms_project.json || true
-
-echo "Required project files are present."
-```
-
-If the required parquet or SQLite checks fail, do not move only the SQLite.
-First identify what is missing.
-
-## SQLite Table Check
-
-Run:
-
-```bash
 sqlite3 annotation_app/annotations/annotation.sqlite ".tables"
-```
-
-Expected core tables:
-
-```text
-annotations
-audit_events
-input_manifest
-project_config
-export_runs
-```
-
-Depending on the version and workflow, there may also be time-model related
-tables. That is expected.
-
-Then run:
-
-```bash
 sqlite3 annotation_app/annotations/annotation.sqlite \
   "select review_status, count(*) from annotations group by review_status;"
 ```
 
-This gives a quick summary of accepted, pending, and rejected records.
+Then verify that all parquet paths listed under `intermediate_tables` exist. Do not assume a hard-coded parquet directory if the manifest names another valid project-relative path.
 
-## Optional Hash Manifest
+## Record hashes before archiving
 
-For a stronger transfer record, generate hashes before archiving:
-
-```bash
-paths="data/interim annotation_app/annotations"
-test -d raw_inputs && paths="$paths raw_inputs"
-find $paths \
-  -type f \
-  \( -name '*.parquet' -o -name '*.sqlite' -o -name '*.csv' -o -name '*.txt' \) \
-  -print0 | sort -z | xargs -0 sha256sum > project_transfer_sha256.txt
-```
-
-Move `project_transfer_sha256.txt` with the project. On Windows, hashes can be
-verified later if needed.
-
-## Archive The Project
-
-From the parent directory of the project:
+From the project root:
 
 ```bash
-tar -czf Batch03_lifms_project.tar.gz Batch03/
+find . -type f -print0 | sort -z | xargs -0 sha256sum > project_transfer_sha256.txt
 ```
 
-Replace `Batch03/` with the actual project directory name.
+Keep `project_transfer_sha256.txt` outside the project tree while generating it, or exclude the file itself from the command. Store the completed hash list beside the archive.
 
-Do not archive only `annotation_app/annotations/annotation.sqlite`.
+Archive from the parent directory:
 
-## Windows Destination
+```bash
+tar -czf MyProject_lma_current.tar.gz MyProject/
+```
 
-Extract to a normal project location, for example:
+## Windows destination and verification
+
+Extract to a normal project directory, for example:
 
 ```text
-D:\LIFMSProjects\Batch03\
+D:\LMAProjects\MyProject\
 ```
 
-The expected structure on Windows should be:
+Keep the directory structure intact. Verify transferred hashes before opening. Then launch `dist\LMAStudio\LMAStudio.exe`, choose `打开项目`, and select the project root.
 
-```text
-D:\LIFMSProjects\Batch03\
-  data\interim\v3\01_lif_trace_physical_qc\v3_01_lif_traces.parquet
-  data\interim\v3\01_lif_trace_physical_qc\v3_01_lif_peaks.parquet
-  data\interim\v3\02_ms_event_calling\v3_02_ms_events.parquet
-  data\interim\v3\02_ms_event_calling\v3_02_ms_scan_summary.parquet
-  annotation_app\annotations\annotation.sqlite
-  lifms_project.json
-  data\interim\lma\cell_event_umap.csv
-  results\tables\v3\
-  reports\
-```
+Expected behavior:
 
-`raw_inputs\` may also exist if the project uses `copy_into_project`.
+- a valid current-standard project opens without rewriting its manifest merely because it was opened;
+- paths and fingerprints are validated before annotation writes;
+- Track and UMAP use the transferred canonical event map;
+- existing accepted/rejected/manual rows remain in the transferred SQLite database;
+- a retired or malformed peak-table binding is refused before project writes, with instructions to rebuild in a new empty directory.
 
-## Current Windows App Opening Method
+## Safety rules
 
-Use the app's "打开项目" button and select the project directory.
+- Never attach a transferred SQLite database to newly generated parquet tables unless every bound input/table digest is proven identical.
+- Never “repair” a rejected project by hand-editing version or hash fields.
+- If raw paths changed but content is identical, preserve the complete original project and first test any path repair on a full copy.
+- Do not use imported identity labels or author CSVs as calibration evidence.
+- Treat `export_runs` as provenance, not as new input.
+- Before experimenting, make an untouched full-directory backup.
 
-The command-line fallback is:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File packaging\windows\run_exe.ps1 `
-  -ProjectDir "D:\LIFMSProjects\Batch03"
-```
-
-Both methods expect:
-
-```text
-D:\LIFMSProjects\Batch03\annotation_app\annotations\annotation.sqlite
-```
-
-and the four parquet files at the standard paths above.
-
-## `lifms_project.json`
-
-The professional project format includes a manifest file:
-
-```text
-lifms_project.json
-```
-
-Recommended fields:
-
-```json
-{
-  "project_id": "uuid",
-  "dataset_id": "stable dataset uuid or hash",
-  "project_schema_version": 2,
-  "created_by_app_version": "lma_studio_v0.3.0",
-  "raw_inputs": {
-    "lif_g2": {
-      "path": "D:\\RawData\\lif_g2.csv",
-      "path_mode": "external_reference",
-      "size_bytes": 0,
-      "original_source_path": "/server/path/to/source"
-    },
-    "lif_r1": {
-      "path": "D:\\RawData\\lif_r1.csv",
-      "path_mode": "external_reference",
-      "size_bytes": 0,
-      "original_source_path": "/server/path/to/source"
-    },
-    "lif_r2": {
-      "path": "D:\\RawData\\lif_r2.csv",
-      "path_mode": "external_reference",
-      "size_bytes": 0,
-      "original_source_path": "/server/path/to/source"
-    },
-    "ms": {
-      "path": "D:\\RawData\\ms.txt",
-      "path_mode": "external_reference",
-      "size_bytes": 0,
-      "original_source_path": "/server/path/to/source"
-    }
-  },
-  "intermediate_tables": {
-    "lif_traces": {
-      "path": "data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_traces.parquet",
-      "sha256": "..."
-    },
-    "lif_peaks": {
-      "path": "data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_peaks.parquet",
-      "sha256": "..."
-    },
-    "ms_events": {
-      "path": "data/interim/v3/02_ms_event_calling/v3_02_ms_events.parquet",
-      "sha256": "..."
-    },
-    "ms_scan_summary": {
-      "path": "data/interim/v3/02_ms_event_calling/v3_02_ms_scan_summary.parquet",
-      "sha256": "..."
-    }
-  },
-  "annotation_db": {
-    "path": "annotation_app/annotations/annotation.sqlite",
-    "schema_version": 2
-  },
-  "acquisition_layout": {
-    "layout_version": 3,
-    "lif_channels": [
-      {
-        "input_id": "lif_g2_raw",
-        "channel": "G2",
-        "time_axis": "green_axis",
-        "detector": "green",
-        "identity_prior": "Day0",
-        "use_for_cell_annotation": true
-      },
-      {
-        "input_id": "lif_r1_raw",
-        "channel": "R1",
-        "time_axis": "red_axis",
-        "detector": "red",
-        "identity_prior": "QC-only",
-        "use_for_cell_annotation": false
-      },
-      {
-        "input_id": "lif_r2_raw",
-        "channel": "R2",
-        "time_axis": "red_axis",
-        "detector": "red",
-        "identity_prior": "Day3",
-        "use_for_cell_annotation": true
-      }
-    ],
-    "qc_anchor_channels": ["G2", "R1"]
-  },
-  "cell_event_map": {
-    "schema_version": 1,
-    "path": "data/interim/lma/cell_event_umap.csv",
-    "sha256": "...",
-    "source_sha256": "...",
-    "row_count": 417,
-    "matched_event_count": 417,
-    "time_unit": "min",
-    "match_tolerance_sec": 0.01,
-    "required_source_columns": ["scan_start_time", "UMAP1", "UMAP2"]
-  },
-  "channel_identity_prior": {
-    "G2": "Day0",
-    "R1": "Day9",
-    "R2": "Day3"
-  }
-}
-```
-
-This file is the authority for project metadata. It records full SHA256 hashes
-for the four intermediate parquet files and a `project_table_binding` digest.
-The same binding is stored in SQLite `project_config`.
-
-When `lifms_project.json` is present, the app validates recorded
-intermediate-table fingerprints before allowing mutations. Opening a schema-v1
-project is side-effect free: the app does not rewrite its manifest, SQLite
-binding/input manifest, annotations, or unhashed legacy time model. A project
-without an event map may use the explicit one-time attach action; that action
-first proves that every accepted post-start QC/cell `ms_event_id` is in the new
-map, then atomically records the canonical map and schema-v2 manifest metadata.
-
-## Transfer Safety Rules
-
-- If parquet files are missing, do not use the SQLite alone.
-- If the project was regenerated on Windows, do not assume Linux SQLite still
-  matches unless raw and parquet hashes match.
-- If only file paths changed from Linux to Windows but file hashes match, the
-  project is likely transferable.
-- Imported annotations must not be used as calibration evidence for time model
-  estimation.
-- `export_runs` from Linux should be treated as historical provenance, not as
-  a new Windows export.
-
-## Practical Recommendation
-
-First move a complete Linux project directory and try opening it on Windows.
-If the project does not yet have `lifms_project.json`, keep an untouched backup
-and first open a copy from the standard directory structure. Loading itself
-does not upgrade the project. If a map is needed, use the explicit attach action
-on the copy and then transfer the resulting canonical map and updated manifest
-together with the unchanged four parquet tables and SQLite.
-
-This avoids forcing you to redraw annotations while still moving the software
-toward a professional project-based model.
+For Windows candidate behavior, use `README_CANDIDATE_v0.4.0-rc3.md` and `docs/HSC1_v0.4.0-rc3_UAT.md`.
