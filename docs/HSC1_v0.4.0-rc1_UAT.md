@@ -10,13 +10,15 @@ LMAStudio_UAT_Copies\HSC1_manual_UAT_v0.4.0-rc1
 
 不要选择 `LMAStudio_UAT_Copies` 父目录本身，也不要覆盖已有项目。最好让最后一级项目目录尚不存在，由 LMA Studio 创建。
 
-## 一、先准备事件坐标 CSV
+## 一、选择事件坐标 CSV
 
-原始文件 `HSC-Lin-LSK-MPP-CLP-LK-20260809-After-Batch-Correction.csv` 混合了多个批次，因此先筛选：
+直接使用已经按群体拆好的文件：
 
 ```text
-batch == Lin-LSK
+HSC1_data\HSC-Lin-LSK-20260809-After-Batch-Correction.csv
 ```
+
+它包含 971 行 Lin-LSK 事件，不需要再用 Excel 筛选。若以后从混合总表重新制作，只需筛选 `batch == Lin-LSK`；不要把 MPP、CLP 或 LK 行一起导入当前 LSK 项目。
 
 筛选后的 CSV 必须能找到以下三个表头，而且每个表头只能出现一次：
 
@@ -30,13 +32,13 @@ UMAP2
 
 你刚才截图中的格式可以使用。建议给第一列写上 `CellNumber` 表头，但即使保留为空表头，它也只是被忽略的额外列。
 
-保存前检查：
+如需自行重新制作，保存前检查：
 
 - 筛选后应有 971 行数据，不含表头行；
 - `scan_start_time / UMAP1 / UMAP2` 都是数值；
 - `scan_start_time` 没有重复；
 - 保存为 CSV，建议 UTF-8；
-- CSV 放在 `HSC1_data` 和待创建项目目录之外，例如 `LMAStudio_UAT_Copies\HSC1_UAT_inputs`。
+- 不要把 CSV 保存到已经生成的 LMA Studio 项目目录内；可以像当前拆分文件一样放在 `HSC1_data` 中。
 
 ## 二、新建 HSC1 项目
 
@@ -63,7 +65,7 @@ UMAP2
    - G1：`HSC1_data\Lin-_LSK\G1.CSV`
    - G2：`HSC1_data\Lin-_LSK\G2.CSV`
    - MS：`HSC1_data\Lin-_LSK.txt`
-   - 事件坐标 CSV：第一步筛选后保存的文件
+   - 事件坐标 CSV：`HSC1_data\HSC-Lin-LSK-20260809-After-Batch-Correction.csv`
 
 7. 检查“事件标注起点”为 `24 min`。
 8. 检查“后段 QC 策略”为“不巡检”。HSC1 没有实际使用 R1/R2，因此不要为它增加 Red 通道或后段 QC。
