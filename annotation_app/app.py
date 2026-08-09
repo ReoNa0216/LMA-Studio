@@ -10580,6 +10580,7 @@ HTML = r"""<!doctype html>
     }
     .modal.import-modal {
       width: min(1240px, 100%);
+      padding: 20px 24px 22px;
     }
     .modal-head {
       display: flex;
@@ -10857,6 +10858,9 @@ HTML = r"""<!doctype html>
       border-radius: 7px;
       background: #f8fafc;
     }
+    .modal.import-modal .protocol-row {
+      grid-template-columns: 34px 150px 116px 116px minmax(190px, 1fr) 104px 32px;
+    }
     .protocol-row input,
     .protocol-row select {
       width: 100%;
@@ -10866,6 +10870,23 @@ HTML = r"""<!doctype html>
       display: flex;
       flex-wrap: wrap;
       gap: 6px 10px;
+    }
+    .protocol-time-field {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      color: #667085;
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .protocol-time-field > span {
+      display: block;
+      padding-left: 2px;
+      white-space: nowrap;
+    }
+    .protocol-time-field > input {
+      width: 100%;
     }
     .protocol-channel-options label,
     .protocol-confirm {
@@ -10892,7 +10913,7 @@ HTML = r"""<!doctype html>
     }
     .import-section {
       margin-top: 14px;
-      padding-top: 12px;
+      padding: 12px 16px 14px;
       border-top: 1px solid #e4e7ec;
     }
     .import-section-title {
@@ -11061,6 +11082,9 @@ HTML = r"""<!doctype html>
         max-height: calc(100dvh - 24px);
         padding: 12px;
       }
+      .modal.import-modal {
+        padding: 14px;
+      }
       .import-grid {
         grid-template-columns: minmax(0, 1fr);
         gap: 7px;
@@ -11117,6 +11141,9 @@ HTML = r"""<!doctype html>
         margin-bottom: -4px;
       }
       .protocol-row {
+        grid-template-columns: 34px minmax(0, 1fr) minmax(0, 1fr) 32px;
+      }
+      .modal.import-modal .protocol-row {
         grid-template-columns: 34px minmax(0, 1fr) minmax(0, 1fr) 32px;
       }
       .protocol-row > *:nth-child(5),
@@ -12023,8 +12050,8 @@ HTML = r"""<!doctype html>
         <div class="protocol-row" data-import-segment-id="${segment.id}">
           <strong>#${index + 1}</strong>
           <input data-segment-field="population_label" type="text" value="${escapeText(segment.population_label)}" placeholder="群体/参考段名称" aria-label="参考段 ${index + 1} 群体名称" />
-          <input data-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" placeholder="开始 min" aria-label="参考段 ${index + 1} 开始时间" />
-          <input data-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" placeholder="结束 min" aria-label="参考段 ${index + 1} 结束时间" />
+          <label class="protocol-time-field"><span>开始时间 (min)</span><input data-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="参考段 ${index + 1} 开始时间" /></label>
+          <label class="protocol-time-field"><span>结束时间 (min)</span><input data-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="参考段 ${index + 1} 结束时间" /></label>
           <div class="protocol-channel-options">${importChannelOptions(segment.reference_channels)}</div>
           <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''} /> 边界已确认</label>
           <button type="button" class="small-button secondary lif-remove" data-remove-import-segment="${segment.id}" aria-label="删除参考段 ${index + 1}"${state.importSegments.length <= 1 ? ' disabled' : ''}>×</button>
@@ -12046,8 +12073,8 @@ HTML = r"""<!doctype html>
         <div class="protocol-row" data-import-scheduled-id="${windowRow.id}">
           <strong>#${index + 1}</strong>
           <input data-scheduled-field="window_id" type="text" value="${escapeText(windowRow.window_id)}" placeholder="窗口 ID" />
-          <input data-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min)}" placeholder="开始 min" />
-          <input data-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min)}" placeholder="结束 min" />
+          <label class="protocol-time-field"><span>开始时间 (min)</span><input data-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min)}" /></label>
+          <label class="protocol-time-field"><span>结束时间 (min)</span><input data-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min)}" /></label>
           <div class="protocol-channel-options">${importChannelOptions(windowRow.reference_channels).replaceAll('data-segment-channel', 'data-scheduled-channel')}</div>
           <span></span>
           <button type="button" class="small-button secondary lif-remove" data-remove-import-scheduled="${windowRow.id}" aria-label="删除定时 QC 窗口 ${index + 1}">×</button>
@@ -12758,8 +12785,8 @@ HTML = r"""<!doctype html>
         <div class="protocol-row" data-cfg-segment-index="${index}">
           <strong>#${segment.order}</strong>
           <span><strong>${escapeText(segment.population_label || segment.segment_id)}</strong><br><small>${escapeText((segment.reference_channels || []).join('/'))}</small></span>
-          <input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(segment.segment_id)} 开始时间"${legacy ? ' disabled' : ''} />
-          <input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(segment.segment_id)} 结束时间"${legacy ? ' disabled' : ''} />
+          <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(segment.segment_id)} 开始时间"${legacy ? ' disabled' : ''} /></label>
+          <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(segment.segment_id)} 结束时间"${legacy ? ' disabled' : ''} /></label>
           <span>${escapeText(segment.reference_mode || '')} · ${(segment.time_axes || []).map(escapeText).join('/')}</span>
           <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
           <span></span>
@@ -12790,8 +12817,8 @@ HTML = r"""<!doctype html>
         <div class="protocol-row" data-cfg-scheduled-index="${index}">
           <strong>#${index + 1}</strong>
           <input data-cfg-scheduled-field="window_id" type="text" value="${escapeText(windowRow.window_id || `post_qc_${index + 1}`)}" placeholder="窗口 ID" />
-          <input data-cfg-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min ?? '')}" placeholder="开始 min" />
-          <input data-cfg-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min ?? '')}" placeholder="结束 min" />
+          <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min ?? '')}" /></label>
+          <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min ?? '')}" /></label>
           <div class="protocol-channel-options">${configChannelCheckboxes(windowRow.reference_channels)}</div>
           <span></span>
           <button type="button" class="small-button secondary lif-remove" data-remove-cfg-scheduled="${index}" aria-label="删除定时 QC 窗口 ${index + 1}">×</button>

@@ -105,6 +105,24 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(rule.group("body"), r"grid-column\s*:\s*1\s*/\s*-1")
         self.assertRegex(rule.group("body"), r"overflow-wrap\s*:\s*(?:anywhere|break-word)")
 
+    def test_import_sections_have_side_insets_and_time_fields_use_visible_labels(self):
+        section_rule = re.search(r"\.import-section\s*\{(?P<body>[^}]*)\}", HTML)
+        self.assertIsNotNone(section_rule)
+        self.assertRegex(
+            section_rule.group("body"),
+            r"padding\s*:\s*\d+px\s+(?:1[4-9]|[2-9]\d)px(?:\s+\d+px)?",
+        )
+
+        body = javascript_function_body(
+            "renderImportSegments",
+            "renderImportScheduledQcWindows",
+        )
+        self.assertIn('class="protocol-time-field"', body)
+        self.assertIn("开始时间 (min)", body)
+        self.assertIn("结束时间 (min)", body)
+        self.assertNotIn('placeholder="开始 min"', body)
+        self.assertNotIn('placeholder="结束 min"', body)
+
     def test_post_qc_policy_change_explains_historical_staleness(self):
         body = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")
 
