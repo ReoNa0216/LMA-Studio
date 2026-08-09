@@ -19,6 +19,7 @@ from annotation_app.app import (
     build_raw_input_project_records,
     calibration_protocol_from_manifest,
     calibration_protocol_hash,
+    draft_calibration_alignment,
     estimate_shift_alignment,
     normalize_acquisition_layout,
     normalize_calibration_protocol,
@@ -377,6 +378,104 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
                 },
                 mixed_layout,
             )
+
+    def test_unconfirmed_protocol_is_persistable_as_project_draft_but_not_usable_for_alignment(self):
+        layout = self.hsc_layout()
+        draft_input = self.hsc_protocol()
+        for segment in draft_input["segments"]:
+            segment["boundaries_confirmed"] = False
+
+        draft = normalize_calibration_protocol(
+            draft_input,
+            layout,
+            require_confirmed=False,
+        )
+        self.assertFalse(draft["boundaries_confirmed"])
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            manifest = write_project_manifest(
+                project_dir=root,
+                raw_input_mode="external_reference",
+                raw_inputs={},
+                channel_identity_prior={"G1": "LSK", "G2": "Lin-"},
+                acquisition_layout=layout,
+                calibration_protocol=draft,
+                post_qc_strategy={"mode": "disabled"},
+                annotation_config={
+                    "annotation_start_min": 24.0,
+                    "local_delta_seed_window_min": 2.5,
+                },
+            )
+            loaded = calibration_protocol_from_manifest(manifest, {})
+
+        self.assertFalse(loaded["boundaries_confirmed"])
+        with self.assertRaisesRegex(BadRequest, "确认"):
+            estimate_shift_alignment(
+                pd.DataFrame(),
+                pd.DataFrame(),
+                acquisition_layout=layout,
+                calibration_protocol=loaded,
+            )
+
+    def test_unconfirmed_draft_cannot_create_or_freeze_downstream_time_model(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            app = self.make_hsc_app(
+                root,
+                pd.DataFrame(),
+                pd.DataFrame(),
+                strategy={"mode": "disabled"},
+                frozen=False,
+            )
+            draft_input = self.hsc_protocol()
+            for segment in draft_input["segments"]:
+                segment["boundaries_confirmed"] = False
+            draft = normalize_calibration_protocol(
+                draft_input,
+                self.hsc_layout(),
+                require_confirmed=False,
+            )
+            app.store.update_project_config({"calibration_protocol": draft})
+            object.__setattr__(app, "calibration_protocol", draft)
+            object.__setattr__(
+                app,
+                "alignment",
+                draft_calibration_alignment(
+                    acquisition_layout=self.hsc_layout(),
+                    calibration_protocol=draft,
+                ),
+            )
+
+            actions = (
+                lambda: app.local_delta_preview(0.0),
+                app.estimate_local_delta_preview,
+                lambda: app.update_local_delta_draft(0.0),
+                app.freeze_local_delta_model,
+            )
+            for action in actions:
+                with self.subTest(action=action), self.assertRaisesRegex(BadRequest, "确认"):
+                    action()
+                self.assertIsNone(app.store.active_time_model())
+
+            app.store.upsert_review(
+                annotation_id="manual_front_history",
+                source="manual_created",
+                review_status="accepted",
+                payload={
+                    "review_stage": "qc_calibration",
+                    "candidate_type": "manual_qc_anchor_partial",
+                },
+                action="test_seed_manual_front_history",
+            )
+            with self.assertRaisesRegex(BadRequest, "确认"):
+                app.review_annotation("manual_front_history", "rejected")
+            with self.assertRaisesRegex(BadRequest, "确认"):
+                app.clear_manual_annotation("manual_front_history")
+            self.assertIsNotNone(app.store.get("manual_front_history"))
+
+            with self.assertRaisesRegex(BadRequest, "确认"):
+                app.create_manual_triplet(None, None, "missing", stage="qc_calibration")
 
     def test_v03_manifest_adapts_front_and_post_qc_without_mutation(self):
         manifest = {

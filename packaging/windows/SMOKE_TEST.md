@@ -44,8 +44,8 @@ Expected:
 Create only in a new empty project directory. Configure:
 
 - Two to four distinct LIF raw files and one MS raw file.
-- One event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`.
-- For every LIF channel: channel name, detector, shared physical `time_axis`, scientific identity/sample label, and cell-annotation role.
+- One event-coordinate CSV in which `scan_start_time`, `UMAP1`, and `UMAP2` can be found; unrelated columns are allowed.
+- For every LIF channel: channel name, detector, scientific identity/sample label, and cell-annotation role. The shared physical time axis is assigned automatically from the detector.
 - One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
 - A project-specific event annotation start and unlabeled-delta seed window.
 - An independent later QC policy: `disabled`, `signature` plus channels, or `scheduled_windows` plus ordered non-overlapping windows and channels.
@@ -58,12 +58,13 @@ Click `分析已选 LIF 并建议窗口`. Expected:
 - Suggested boundaries come from the selected raw peaks.
 - Every suggested or edited segment remains unconfirmed until the user checks `边界已确认`.
 - Missing, ambiguous, wrong-order, or overlapping evidence is surfaced and cannot be silently confirmed.
+- Numeric suggested windows may be saved as an unconfirmed project draft. The draft opens in raw front-track mode; front alignment, local delta, freezing, and event annotation remain locked.
 
 After creation, verify:
 
 - `lifms_project.json` records project schema 3 and acquisition layout 4.
 - The manifest contains `calibration_protocol`, `post_qc_strategy`, channel detector/time-axis roles, and project-specific annotation settings.
-- `results/tables/v3/00_project_protocol.json` records the confirmed boundaries used by both preprocessing stages.
+- `results/tables/v3/00_project_protocol.json` records draft windows explicitly as `calibration_draft:*`; after every segment is confirmed it records the confirmed boundaries used by both preprocessing stages.
 - `data/interim/lma/cell_event_umap.csv` contains exactly `ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`.
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
 - Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.

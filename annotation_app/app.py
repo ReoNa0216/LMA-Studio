@@ -797,7 +797,14 @@ def calibration_protocol_hash(
     acquisition_layout: dict[str, Any] | None,
 ) -> str:
     layout = normalize_acquisition_layout(acquisition_layout)
-    normalized = normalize_calibration_protocol(protocol, layout)
+    # Confirmation is a workflow gate, not part of the physical boundary
+    # identity. Draft projects therefore need the same stable protocol hash
+    # before and after a user confirms unchanged boundaries.
+    normalized = normalize_calibration_protocol(
+        protocol,
+        layout,
+        require_confirmed=False,
+    )
     channel_physics = {
         str(row["channel"]): {
             "detector": str(row["detector"]),
@@ -840,7 +847,14 @@ def calibration_protocol_from_manifest(
     if not isinstance(configured, dict) and manifest:
         configured = manifest.get("calibration_protocol")
     if isinstance(configured, dict):
-        return normalize_calibration_protocol(copy.deepcopy(configured), layout)
+        # Project storage may contain a deliberately unconfirmed draft. Code
+        # that performs calibration still calls normalize_calibration_protocol
+        # with its default require_confirmed=True gate.
+        return normalize_calibration_protocol(
+            copy.deepcopy(configured),
+            layout,
+            require_confirmed=False,
+        )
     legacy_channels = list(layout.get("qc_anchor_channels") or [])
     if not legacy_channels:
         raise BadRequest("项目缺少 calibration_protocol，且没有可只读适配的旧 qc_anchor_channels")
@@ -1197,7 +1211,11 @@ def write_project_manifest(
                 }
             ],
         }
-    normalized_protocol = normalize_calibration_protocol(calibration_protocol, layout)
+    normalized_protocol = normalize_calibration_protocol(
+        calibration_protocol,
+        layout,
+        require_confirmed=False,
+    )
     protocol_end_min = max(
         float(row["end_min"]) for row in normalized_protocol["segments"]
     )
@@ -1303,7 +1321,11 @@ def build_raw_input_project_records(
     }
     layout = normalize_acquisition_layout(layout_input, identities=identities)
     if calibration_protocol is not None:
-        normalize_calibration_protocol(calibration_protocol, layout)
+        normalize_calibration_protocol(
+            calibration_protocol,
+            layout,
+            require_confirmed=False,
+        )
     specs = []
     for item, channel_config in zip(lif_inputs, layout["lif_channels"]):
         key = str(item.get("key") or channel_config["input_id"].removesuffix("_raw"))
@@ -3513,7 +3535,12 @@ def display_phase_from_time_min(
                 (t >= float(segment["start_min"]))
                 & (t <= float(segment["end_min"]))
             )
-            choices.append(f"calibration:{segment['segment_id']}")
+            prefix = (
+                "calibration"
+                if bool(segment.get("boundaries_confirmed"))
+                else "calibration_draft"
+            )
+            choices.append(f"{prefix}:{segment['segment_id']}")
         start_min = float(
             DEFAULT_ANNOTATION_START_MIN
             if annotation_start_min is None
@@ -5349,6 +5376,85 @@ def estimate_local_delta_shift(
     return best
 
 
+def draft_calibration_alignment(
+    *,
+    acquisition_layout: dict[str, Any],
+    calibration_protocol: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a non-scientific zero-shift view for an unconfirmed project.
+
+    It lets users open the project and inspect raw peak shapes. No candidate,
+    accepted anchor, QC refit, or downstream time model is derived from these
+    provisional boundaries.
+    """
+
+    layout = normalize_acquisition_layout(acquisition_layout)
+    protocol = normalize_calibration_protocol(
+        calibration_protocol,
+        layout,
+        require_confirmed=False,
+    )
+    if bool(protocol.get("boundaries_confirmed")):
+        raise BadRequest("draft_calibration_alignment 只用于边界待确认的项目")
+    protocol_hash = calibration_protocol_hash(protocol, layout)
+    channel_time_axes = {
+        str(channel): str(axis)
+        for channel, axis in layout["channel_time_axes"].items()
+    }
+    configured_axes = sorted(set(channel_time_axes.values()))
+    axis_shifts_sec = {axis: 0.0 for axis in configured_axes}
+    channels = {
+        str(row["channel"]): {
+            "channel": str(row["channel"]),
+            "shift_sec": 0.0,
+            "match_count": 0,
+            "median_abs_residual_sec": None,
+            "p90_abs_residual_sec": None,
+            "status": "calibration_boundaries_unconfirmed",
+            "shift_estimation_matches": [],
+        }
+        for row in layout["lif_channels"]
+    }
+    axes = {
+        axis: {
+            "time_axis": axis,
+            "shift_sec": 0.0,
+            "match_count": 0,
+            "median_abs_residual_sec": None,
+            "p90_abs_residual_sec": None,
+            "status": "calibration_boundaries_unconfirmed",
+            "shift_estimation_matches": [],
+        }
+        for axis in configured_axes
+    }
+    return {
+        "model": f"calibration_draft_{protocol_hash[:12]}",
+        "status": "calibration_boundaries_unconfirmed",
+        "description": (
+            "参考段边界尚未确认；当前只提供原始峰形浏览，物理轴平移未估计，"
+            "前段校准、后段 delta 和事件标注均已门禁。"
+        ),
+        "green_to_ms_shift_sec": 0.0,
+        "red_to_ms_shift_sec": 0.0,
+        "axis_shifts_sec": axis_shifts_sec,
+        "channel_time_axes": channel_time_axes,
+        "qc_anchor_channels": list(protocol["reference_channels"]),
+        "qc_anchor_time_axes": list(protocol["calibration_time_axes"]),
+        "calibration_protocol": {**protocol, "protocol_hash": protocol_hash},
+        "calibration_protocol_hash": protocol_hash,
+        "matcher_version": SEGMENTED_CALIBRATION_MATCHER_VERSION,
+        "acquisition_layout_hash": acquisition_layout_hash(layout),
+        "r2_uses": "red_to_ms_shift_sec",
+        "ms_shift_sec": 0.0,
+        "channels": channels,
+        "axes": axes,
+        "qc_groups": {
+            "status": "calibration_boundaries_unconfirmed",
+            "groups": [],
+        },
+    }
+
+
 def estimate_segmented_shift_alignment(
     lif_peaks: pd.DataFrame,
     ms_events: pd.DataFrame,
@@ -6083,18 +6189,25 @@ class AppData:
         calibration_protocol = calibration_protocol_from_manifest(manifest, project_config)
         post_qc_strategy = post_qc_strategy_from_manifest(manifest, project_config)
         legacy_protocol = bool(calibration_protocol.get("compatibility_mode"))
+        protocol_confirmed = bool(calibration_protocol.get("boundaries_confirmed"))
         lif_peaks["phase"] = display_phase_from_time_min(
             lif_peaks["time_min"],
             calibration_protocol,
             float(project_config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)),
         )
-        alignment = estimate_shift_alignment(
-            lif_peaks,
-            ms_events,
-            float(project_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
-            acquisition_layout=acquisition_layout,
-            calibration_protocol=None if legacy_protocol else calibration_protocol,
-        )
+        if protocol_confirmed:
+            alignment = estimate_shift_alignment(
+                lif_peaks,
+                ms_events,
+                float(project_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
+                acquisition_layout=acquisition_layout,
+                calibration_protocol=None if legacy_protocol else calibration_protocol,
+            )
+        else:
+            alignment = draft_calibration_alignment(
+                acquisition_layout=acquisition_layout,
+                calibration_protocol=calibration_protocol,
+            )
         alignment.setdefault("calibration_protocol", copy.deepcopy(calibration_protocol))
         alignment.setdefault(
             "calibration_protocol_hash",
@@ -6106,6 +6219,11 @@ class AppData:
         )
         persisted_qc_alignment = store.qc_alignment_model()
         if persisted_qc_alignment:
+            if not protocol_confirmed:
+                raise BadRequest(
+                    "项目参考段边界尚未确认，但仍存在已应用的 QC 对齐模型；"
+                    "请恢复已确认协议，或在配置中明确清除旧模型后重新确认边界"
+                )
             alignment = apply_qc_alignment_model(
                 alignment,
                 lif_peaks,
@@ -6121,6 +6239,11 @@ class AppData:
             or calibration_protocol_hash(calibration_protocol, acquisition_layout)
         )
         existing_time_model = store.active_time_model()
+        if existing_time_model and not protocol_confirmed:
+            raise BadRequest(
+                "项目参考段边界尚未确认，但仍存在 active time model；"
+                "请恢复已确认协议，或明确失效旧模型后重新确认边界"
+            )
         existing_layout_hash = str((existing_time_model or {}).get("acquisition_layout_hash") or "")
         existing_protocol_hash = str(
             (existing_time_model or {}).get("calibration_protocol_hash") or ""
@@ -6152,7 +6275,7 @@ class AppData:
                     "现有 time model 没有 calibration protocol 绑定，不能静默迁移到新协议；"
                     "请明确失效旧 time model 后重新校正"
                 )
-        elif existing_time_model is None:
+        elif existing_time_model is None and protocol_confirmed:
             store.ensure_draft_time_model(
                 str(alignment["model"]),
                 current_layout_hash,
@@ -7036,7 +7159,9 @@ class AppData:
             )
         else:
             effective_protocol = normalize_calibration_protocol(
-                calibration_protocol, acquisition_layout
+                calibration_protocol,
+                acquisition_layout,
+                require_confirmed=False,
             )
         if post_qc_strategy is None:
             legacy_channels = list(
@@ -7164,7 +7289,14 @@ class AppData:
                     "- 不读取作者 CSV、h5ad、manual、V2/archive 输入。",
                     "- 生成的中间表用于浏览器人工标注；后续时间校正和 annotation 由软件内人工审核完成。",
                     f"- 前段校准参考通道：`{' + '.join(effective_protocol['reference_channels'])}`。",
-                    f"- 前段参考段数量：`{len(effective_protocol['segments'])}`；边界均为项目级用户确认参数。",
+                    (
+                        f"- 前段参考段数量：`{len(effective_protocol['segments'])}`；"
+                        + (
+                            "边界已由用户确认。"
+                            if effective_protocol.get("boundaries_confirmed")
+                            else "当前为项目级待确认草稿，只可用于峰形浏览，尚未用于时间对齐。"
+                        )
+                    ),
                     f"- 后段 QC 策略：`{effective_post_qc_strategy['mode']}`。",
                     f"- 事件标注起点：`{effective_annotation_start_min:g} min`。",
                     "",
@@ -7344,6 +7476,31 @@ class AppData:
         if model:
             return model
         config = self.project_config()
+        if not bool(config.get("calibration_protocol", {}).get("boundaries_confirmed")):
+            return {
+                "time_model_version": "",
+                "status": "calibration_boundaries_unconfirmed",
+                "base_model_name": str(self.alignment.get("model") or "calibration_draft"),
+                "qc_calibration_end_min": float(config["qc_calibration_end_min"]),
+                "sample_valve_switch_min": float(config["sample_valve_switch_min"]),
+                "annotation_start_min": float(config["annotation_start_min"]),
+                "local_delta_seed_window_min": float(config["local_delta_seed_window_min"]),
+                "ms_local_delta_sec": 0.0,
+                "contains_cell_labels": False,
+                "max_training_time_min": float(config["annotation_start_min"]),
+                "evidence_count": 0,
+                "unique_match_count": 0,
+                "conflict_count": 0,
+                "median_abs_residual_sec": None,
+                "p90_abs_residual_sec": None,
+                "acquisition_layout_hash": str(
+                    self.alignment.get("acquisition_layout_hash") or ""
+                ),
+                "calibration_protocol_hash": str(
+                    config.get("calibration_protocol_hash") or ""
+                ),
+                "persisted": False,
+            }
         return self.store.ensure_draft_time_model(
             str(self.alignment["model"]),
             str(self.alignment.get("acquisition_layout_hash") or ""),
@@ -7394,7 +7551,17 @@ class AppData:
             )
         return required
 
+    def require_confirmed_calibration(self, action: str) -> None:
+        protocol = self.project_config().get("calibration_protocol") or {}
+        if bool(protocol.get("boundaries_confirmed")):
+            return
+        raise BadRequest(
+            f"参考段边界尚未全部确认，不能{action}。"
+            "请先查看原始峰形，再到“配置”确认每个参考段边界。"
+        )
+
     def reset_to_automatic_qc_alignment(self) -> None:
+        self.require_confirmed_calibration("重算前段校准")
         config = self.project_config()
         alignment = estimate_shift_alignment(
             self.lif_peaks,
@@ -7410,6 +7577,7 @@ class AppData:
         object.__setattr__(self, "alignment", alignment)
 
     def qc_alignment_refit_preview(self) -> dict[str, Any]:
+        self.require_confirmed_calibration("预览前段 QC 对齐")
         config = self.project_config()
         return accepted_qc_alignment_refit(
             self.lif_peaks,
@@ -7549,6 +7717,7 @@ class AppData:
         return payload
 
     def local_delta_preview(self, delta_sec: float | None = None) -> dict[str, Any]:
+        self.require_confirmed_calibration("预览后段 delta")
         config = self.project_config()
         model = self.active_time_model()
         delta = float(model.get("ms_local_delta_sec", 0.0) if delta_sec is None else delta_sec)
@@ -7575,6 +7744,7 @@ class AppData:
         }
 
     def estimate_local_delta_model(self) -> dict[str, Any]:
+        self.require_confirmed_calibration("估计后段 delta")
         config = self.project_config()
         result = estimate_local_delta_shift(
             self.lif_peaks,
@@ -7626,6 +7796,7 @@ class AppData:
         return self.store.upsert_time_model(payload, action="estimate_local_delta_from_unlabeled_topology")
 
     def estimate_local_delta_preview(self) -> dict[str, Any]:
+        self.require_confirmed_calibration("估计后段 delta")
         config = self.project_config()
         result = estimate_local_delta_shift(
             self.lif_peaks,
@@ -7650,6 +7821,7 @@ class AppData:
         }
 
     def update_local_delta_draft(self, delta_sec: float) -> dict[str, Any]:
+        self.require_confirmed_calibration("保存后段 delta")
         model = self.active_time_model()
         if str(model.get("status")) == "frozen":
             model = {**model, "time_model_version": f"tm_{uuid.uuid4().hex[:12]}", "status": "draft"}
@@ -7675,6 +7847,7 @@ class AppData:
         return self.store.upsert_time_model(payload, action="manual_update_local_delta_draft")
 
     def freeze_local_delta_model(self) -> dict[str, Any]:
+        self.require_confirmed_calibration("冻结后段 time model")
         model = self.active_time_model()
         if bool(model.get("contains_cell_labels", False)):
             raise BadRequest("Cannot freeze a time model that contains cell labels")
@@ -7702,12 +7875,16 @@ class AppData:
         current_config = self.project_config()
         normalized_updates = copy.deepcopy(updates)
         current_protocol = normalize_calibration_protocol(
-            current_config["calibration_protocol"], self.acquisition_layout
+            current_config["calibration_protocol"],
+            self.acquisition_layout,
+            require_confirmed=False,
         )
         proposed_protocol = current_protocol
         if "calibration_protocol" in updates:
             proposed_protocol = normalize_calibration_protocol(
-                updates.get("calibration_protocol"), self.acquisition_layout
+                updates.get("calibration_protocol"),
+                self.acquisition_layout,
+                require_confirmed=False,
             )
             persist_protocol = True
             if (
@@ -7725,6 +7902,7 @@ class AppData:
                     proposed_protocol = normalize_calibration_protocol(
                         proposed_protocol,
                         self.acquisition_layout,
+                        require_confirmed=False,
                     )
             if persist_protocol:
                 normalized_updates["calibration_protocol"] = proposed_protocol
@@ -7791,6 +7969,7 @@ class AppData:
             proposed_protocol = normalize_calibration_protocol(
                 compat_protocol,
                 self.acquisition_layout,
+                require_confirmed=False,
             )
             if "calibration_protocol" in self.store.project_config():
                 normalized_updates["calibration_protocol"] = proposed_protocol
@@ -7801,6 +7980,9 @@ class AppData:
             proposed_protocol, self.acquisition_layout
         )
         protocol_changed = current_protocol_hash != proposed_protocol_hash
+        current_protocol_ready = bool(current_protocol.get("boundaries_confirmed"))
+        proposed_protocol_ready = bool(proposed_protocol.get("boundaries_confirmed"))
+        readiness_changed = current_protocol_ready != proposed_protocol_ready
         current_strategy_hash = post_qc_strategy_hash(
             current_strategy,
             self.acquisition_layout,
@@ -7812,15 +7994,27 @@ class AppData:
         strategy_changed = current_strategy_hash != proposed_strategy_hash
         validate_post_qc_strategy_timing(proposed_strategy, proposed_qc_end)
         legacy_protocol = bool(proposed_protocol.get("compatibility_mode"))
-        proposed_alignment = estimate_shift_alignment(
-            self.lif_peaks,
-            self.ms_events,
-            proposed_qc_end,
-            acquisition_layout=self.acquisition_layout,
-            calibration_protocol=None if legacy_protocol else proposed_protocol,
-        )
+        if proposed_protocol_ready:
+            proposed_alignment = estimate_shift_alignment(
+                self.lif_peaks,
+                self.ms_events,
+                proposed_qc_end,
+                acquisition_layout=self.acquisition_layout,
+                calibration_protocol=None if legacy_protocol else proposed_protocol,
+            )
+        else:
+            proposed_alignment = draft_calibration_alignment(
+                acquisition_layout=self.acquisition_layout,
+                calibration_protocol=proposed_protocol,
+            )
         persisted_qc_alignment = self.store.qc_alignment_model()
-        if persisted_qc_alignment and not qc_end_changed and not protocol_changed:
+        if (
+            proposed_protocol_ready
+            and persisted_qc_alignment
+            and not qc_end_changed
+            and not protocol_changed
+            and not readiness_changed
+        ):
             proposed_alignment = apply_qc_alignment_model(
                 proposed_alignment,
                 self.lif_peaks,
@@ -7854,7 +8048,7 @@ class AppData:
         try:
             model = self.active_time_model()
             response_time_model = model
-            if str(model.get("status")) != "frozen":
+            if proposed_protocol_ready and str(model.get("status")) != "frozen":
                 payload = {
                     **model,
                     "status": "draft",
@@ -7864,7 +8058,7 @@ class AppData:
                     "annotation_start_min": float(config["annotation_start_min"]),
                     "local_delta_seed_window_min": float(config["local_delta_seed_window_min"]),
                     "contains_cell_labels": False,
-                    "ms_local_delta_sec": 0.0 if (clear_frozen_time_model or qc_end_changed or protocol_changed) else float(model.get("ms_local_delta_sec", 0.0) or 0.0),
+                    "ms_local_delta_sec": 0.0 if (clear_frozen_time_model or qc_end_changed or protocol_changed or readiness_changed) else float(model.get("ms_local_delta_sec", 0.0) or 0.0),
                     "max_training_time_min": float(config["annotation_start_min"]) + float(config["local_delta_seed_window_min"]),
                     "acquisition_layout_hash": self.alignment.get("acquisition_layout_hash"),
                     "calibration_protocol_hash": proposed_protocol_hash,
@@ -7881,6 +8075,12 @@ class AppData:
                 "但不再作为当前策略结果，后段 QC 候选与导出已按新策略重算。"
             )
             warning = f"{warning} {strategy_warning}".strip()
+        if not proposed_protocol_ready:
+            draft_warning = (
+                "参考段边界仍待确认；项目只允许浏览原始峰形。"
+                "确认全部边界后才会重新计算前段候选并解锁后段时间模型。"
+            )
+            warning = f"{warning} {draft_warning}".strip()
         object.__setattr__(self, "_project_config_update_warning", warning)
         object.__setattr__(self, "_project_config_update_time_model", response_time_model)
         return self.project_config()
@@ -8498,6 +8698,8 @@ class AppData:
             window_start_min=window_start_min,
             window_end_min=window_end_min,
         )
+        if str(payload.get("review_stage") or "") == "qc_calibration":
+            self.require_confirmed_calibration("审核前段校准证据")
         if review_status == "accepted":
             self.ensure_third_stage_acceptance_allowed(
                 payload,
@@ -8549,6 +8751,8 @@ class AppData:
                     "updated_at",
                 }
             }
+            if str(payload.get("review_stage") or "") == "qc_calibration":
+                self.require_confirmed_calibration("审核前段校准证据")
             if review_status == "accepted":
                 self.ensure_third_stage_acceptance_allowed(
                     payload,
@@ -8602,6 +8806,8 @@ class AppData:
         ms_event_id = optional_peak_id(ms_event_id) or ""
         if stage not in {"qc_calibration", "qc_survey"}:
             raise BadRequest("Manual QC anchor can only be created in QC calibration or QC survey")
+        if stage == "qc_calibration":
+            self.require_confirmed_calibration("新建前段校准证据")
         config = self.project_config()
         protocol = normalize_calibration_protocol(
             config["calibration_protocol"], self.acquisition_layout
@@ -8882,6 +9088,8 @@ class AppData:
         existing = self.store.get(annotation_id)
         if not existing:
             return self.store.hard_delete_manual(annotation_id)
+        if str(existing.get("review_stage") or "") == "qc_calibration":
+            self.require_confirmed_calibration("清除前段校准证据")
         invalidate_qc_alignment = self.require_qc_evidence_invalidation_confirmation(
             existing,
             clear_qc_alignment_model=clear_qc_alignment_model,
@@ -10699,19 +10907,23 @@ HTML = r"""<!doctype html>
     }
     .policy-fields {
       display: grid;
-      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
       gap: 8px;
     }
     .policy-fields label {
       display: grid;
       gap: 4px;
+      min-width: 0;
       color: #475467;
       font-size: 11px;
       font-weight: 700;
+      line-height: 1.35;
     }
     .policy-fields input,
     .policy-fields select {
       width: 100%;
+      min-width: 0;
+      box-sizing: border-box;
     }
     .project-template-options {
       margin-bottom: 10px;
@@ -10912,7 +11124,7 @@ HTML = r"""<!doctype html>
         grid-column: 2 / 4;
       }
       .policy-fields {
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr;
       }
     }
   </style>
@@ -11133,7 +11345,7 @@ HTML = r"""<!doctype html>
             <button id="addImportSegment" type="button" class="small-button secondary">＋ 添加参考段</button>
           </span>
         </div>
-        <div class="qc-anchor-rule">每段按时间顺序填写；通道可为 Green-only、Red-only 或 Red+Green。原始峰形只作建议，只有勾选“边界已确认”后才能创建项目。</div>
+        <div class="qc-anchor-rule">每段按时间顺序填写；通道可为 Green-only、Red-only 或 Red+Green。可先创建项目并把建议边界保留为待确认草稿；确认边界前（须全部确认）只能查看原始峰形，前段校准及其下游阶段保持锁定。</div>
         <div id="importSuggestionStatus" class="qc-anchor-rule">尚未分析原始峰形。</div>
         <div id="importCalibrationSegments" class="protocol-editor"></div>
       </section>
@@ -11167,7 +11379,7 @@ HTML = r"""<!doctype html>
       </section>
       <div id="importHint" class="empty" style="margin-top:10px;"></div>
       <div class="modal-actions">
-        <button id="runImportProject" class="small-button">生成并进入项目</button>
+        <button id="runImportProject" class="small-button">生成草稿并进入项目</button>
       </div>
     </div>
   </div>
@@ -11209,7 +11421,7 @@ HTML = r"""<!doctype html>
       </div>
       <section id="cfgProtocolPanel" class="import-section">
         <div class="import-section-title"><span>分段 calibration_protocol</span></div>
-        <div class="qc-anchor-rule">通道与顺序保持不变；可逐段修订项目边界。每次保存都必须确认边界。</div>
+        <div class="qc-anchor-rule">通道与顺序保持不变；可先保存待确认边界。全部勾选“边界已确认”后，才会计算前段校准并解锁后段阶段。</div>
         <div id="cfgCalibrationSegments" class="protocol-editor"></div>
       </section>
       <section id="cfgPostQcPanel" class="import-section">
@@ -11360,6 +11572,16 @@ HTML = r"""<!doctype html>
         || state.meta?.calibration_protocol
         || state.current?.alignment?.calibration_protocol
         || null;
+    }
+
+    function calibrationBoundariesConfirmed() {
+      const protocol = calibrationProtocol();
+      const segments = protocol?.segments || [];
+      return Boolean(
+        segments.length
+        && protocol?.boundaries_confirmed === true
+        && segments.every(segment => segment.boundaries_confirmed === true)
+      );
     }
 
     function calibrationReferenceChannels() {
@@ -11804,11 +12026,17 @@ HTML = r"""<!doctype html>
           <input data-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" placeholder="开始 min" aria-label="参考段 ${index + 1} 开始时间" />
           <input data-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" placeholder="结束 min" aria-label="参考段 ${index + 1} 结束时间" />
           <div class="protocol-channel-options">${importChannelOptions(segment.reference_channels)}</div>
-          <label class="protocol-confirm"><input data-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''} /> 边界已确认</label>
+          <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''} /> 边界已确认</label>
           <button type="button" class="small-button secondary lif-remove" data-remove-import-segment="${segment.id}" aria-label="删除参考段 ${index + 1}"${state.importSegments.length <= 1 ? ' disabled' : ''}>×</button>
           ${segment.suggestion_status ? `<small class="protocol-segment-status" role="status">${escapeText(calibrationSuggestionStatusLabel(segment.suggestion_status))}</small>` : ''}
         </div>
       `).join('');
+      const allConfirmed = state.importSegments.length > 0
+        && state.importSegments.every(segment => segment.boundaries_confirmed === true);
+      const createButton = el('runImportProject');
+      if (createButton) {
+        createButton.textContent = allConfirmed ? '生成并进入项目' : '生成草稿并进入项目';
+      }
     }
 
     function renderImportScheduledQcWindows() {
@@ -11836,7 +12064,10 @@ HTML = r"""<!doctype html>
         select.innerHTML = channels.map(channel => `<option value="${escapeText(channel)}"${selected.has(channel) ? ' selected' : ''}>${escapeText(channel)}</option>`).join('');
         select.disabled = mode !== 'signature';
       }
-      if (el('importPostQcChannelsLabel')) el('importPostQcChannelsLabel').style.opacity = mode === 'signature' ? '1' : '0.55';
+        if (el('importPostQcChannelsLabel')) {
+          el('importPostQcChannelsLabel').style.display = mode === 'signature' ? 'grid' : 'none';
+          el('importPostQcChannelsLabel').style.opacity = '1';
+        }
       if (el('importScheduledQcPanel')) el('importScheduledQcPanel').style.display = mode === 'scheduled_windows' ? 'block' : 'none';
       renderImportScheduledQcWindows();
     }
@@ -11921,7 +12152,7 @@ HTML = r"""<!doctype html>
           .join(' · ');
         const warnings = (result.warnings || []).join(' ');
         status.textContent = [
-          result.can_apply_suggestions ? '已回填建议边界；所有“边界已确认”均保持未勾选，请核对峰形和顺序后逐段确认。' : '证据不足，未形成可完整应用的有序方案。',
+          result.can_apply_suggestions ? '已回填建议边界；可先创建草稿并在项目轨迹中核对。所有边界保持待确认，确认前不会用于校准。' : '证据不足，未形成可完整应用的有序方案。',
           summaries,
           warnings,
         ].filter(Boolean).join(' ');
@@ -12110,6 +12341,22 @@ HTML = r"""<!doctype html>
       const seq = ++state.requestSeq;
       hideLineContextMenu();
       document.body.classList.add('loading');
+      if (!calibrationBoundariesConfirmed()) {
+        const stageChanged = state.stage !== 'qc_calibration';
+        state.stage = 'qc_calibration';
+        state.timeMode = 'raw';
+        state.previewDeltaSec = null;
+        state.localDeltaPreview = null;
+        if (stageChanged) {
+          const firstSegment = calibrationProtocol()?.segments?.[0];
+          state.start = Math.max(
+            Number(state.meta?.time_min_min || 0),
+            Number(firstSegment?.start_min || 0)
+          );
+        }
+        applyStageWindowWidth();
+        el('timeMode').value = 'raw';
+      }
       let url = `/api/window?start_min=${encodeURIComponent(state.start)}&window_min=${encodeURIComponent(state.width)}&time_mode=${encodeURIComponent(state.timeMode)}`;
       if (state.stage === 'local_calibration' && state.previewDeltaSec !== null) {
         url += `&preview_ms_delta_sec=${encodeURIComponent(state.previewDeltaSec)}`;
@@ -12123,7 +12370,9 @@ HTML = r"""<!doctype html>
       state.meta.project_config = payload.project_config || state.meta.project_config;
       state.meta.time_model = payload.time_model || state.meta.time_model;
       el('start').value = state.start.toFixed(2);
-      if (state.stage === 'local_calibration') await loadLocalDeltaPreview(state.previewDeltaSec);
+      if (state.stage === 'local_calibration' && calibrationBoundariesConfirmed()) {
+        await loadLocalDeltaPreview(state.previewDeltaSec);
+      }
       updateMetrics();
       draw();
       renderCandidateList();
@@ -12175,6 +12424,9 @@ HTML = r"""<!doctype html>
       const frozen = tm.status === 'frozen';
       const cfg = state.current?.project_config || state.meta?.project_config || {};
       const anchors = qcAnchorChannels();
+      if (!calibrationBoundariesConfirmed()) {
+        return '参考段边界待确认：当前只显示原始峰形。请在“配置”中核对并确认全部边界，随后才会计算前段校准并解锁后段阶段。';
+      }
       if (state.stage === 'local_calibration') return '标注起点后的未标注峰拓扑预校准：只估计 MS 后段局部平移，不产生 annotation。';
       if (state.stage === 'event_annotation') {
         const strategy = cfg.post_qc_strategy || {};
@@ -12191,6 +12443,7 @@ HTML = r"""<!doctype html>
     }
 
     function timeModelDisplayName(tm) {
+      if (tm.status === 'calibration_boundaries_unconfirmed') return '边界待确认';
       const status = tm.status === 'frozen' ? '冻结' : (tm.status === 'exploratory' ? '探索' : '草稿');
       const delta = Number(tm.ms_local_delta_sec || 0);
       return `${status} ${delta >= 0 ? '+' : ''}${fmt(delta, 2)}s`;
@@ -12208,11 +12461,12 @@ HTML = r"""<!doctype html>
       if (!box) return;
       const alignment = windowState?.alignment || {};
       const shifts = alignment.axis_shifts_sec || {};
+      const calibrationBlocked = alignment.status === 'calibration_boundaries_unconfirmed';
       box.innerHTML = physicalAxes.map(axis => {
         let value = shifts[axis];
         if (!Number.isFinite(Number(value)) && axis === 'green_axis') value = alignment.green_to_ms_shift_sec;
         if (!Number.isFinite(Number(value)) && axis === 'red_axis') value = alignment.red_to_ms_shift_sec;
-        const display = Number.isFinite(Number(value)) ? `${fmt(Number(value), 2)} sec` : '未估计';
+        const display = !calibrationBlocked && Number.isFinite(Number(value)) ? `${fmt(Number(value), 2)} sec` : '未估计';
         return `<div class="metric" data-physical-axis="${escapeText(axis)}"><span>${escapeText(axis)} ${escapeText(suffix)}</span><strong>${escapeText(display)}</strong></div>`;
       }).join('');
     }
@@ -12227,7 +12481,9 @@ HTML = r"""<!doctype html>
         renderAxisShiftMetrics(w, physicalAxes, '平移');
         el('baseTimeTitle').textContent = '自动时间校正';
         el('modeMetricLabel').textContent = '模式';
-        el('modeLabel').textContent = w.time_mode === 'aligned' ? '校正后' : '原始';
+        el('modeLabel').textContent = calibrationBoundariesConfirmed()
+          ? (w.time_mode === 'aligned' ? '校正后' : '原始')
+          : '仅原始浏览';
         el('msDeltaMetric').style.display = 'none';
         el('matchMetricLabel').textContent = 'QC anchor 组';
         el('matchCount').textContent = w.time_mode === 'aligned' ? `${visibleGroups}/${totalGroups}` : '-';
@@ -12236,7 +12492,9 @@ HTML = r"""<!doctype html>
       renderAxisShiftMetrics(w, physicalAxes, 'base shift');
       el('baseTimeTitle').textContent = '当前时间模型';
       el('modeMetricLabel').textContent = '状态';
-      el('modeLabel').textContent = tm.status === 'frozen' ? '已冻结' : 'draft';
+      el('modeLabel').textContent = tm.status === 'calibration_boundaries_unconfirmed'
+        ? '边界待确认'
+        : (tm.status === 'frozen' ? '已冻结' : 'draft');
       el('msDeltaMetric').style.display = 'grid';
       el('msDeltaShift').textContent = `${fmt(tm.ms_local_delta_sec || 0, 2)} sec`;
       el('matchMetricLabel').textContent = '时间模型';
@@ -12503,7 +12761,7 @@ HTML = r"""<!doctype html>
           <input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(segment.segment_id)} 开始时间"${legacy ? ' disabled' : ''} />
           <input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(segment.segment_id)} 结束时间"${legacy ? ' disabled' : ''} />
           <span>${escapeText(segment.reference_mode || '')} · ${(segment.time_axes || []).map(escapeText).join('/')}</span>
-          <label class="protocol-confirm"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
+          <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
           <span></span>
         </div>
       `).join('');
@@ -12523,7 +12781,8 @@ HTML = r"""<!doctype html>
       const selected = new Set(strategy.reference_channels || []);
       el('cfgPostQcChannels').innerHTML = channels.map(channel => `<option value="${escapeText(channel)}"${selected.has(channel) ? ' selected' : ''}>${escapeText(channel)}</option>`).join('');
       el('cfgPostQcChannels').disabled = mode !== 'signature';
-      el('cfgPostQcChannelsLabel').style.opacity = mode === 'signature' ? '1' : '0.55';
+      el('cfgPostQcChannelsLabel').style.display = mode === 'signature' ? 'grid' : 'none';
+      el('cfgPostQcChannelsLabel').style.opacity = '1';
       el('cfgAddScheduledQc').style.display = mode === 'scheduled_windows' ? 'block' : 'none';
       const box = el('cfgScheduledQcWindows');
       box.style.display = mode === 'scheduled_windows' ? 'grid' : 'none';
@@ -12580,6 +12839,13 @@ HTML = r"""<!doctype html>
       const visible = state.stage === 'qc_calibration';
       el('qcRefitPanel').style.display = visible ? 'block' : 'none';
       if (!visible) return;
+      const calibrationReady = calibrationBoundariesConfirmed();
+      el('previewQcRefit').disabled = !calibrationReady || state.actionBusy;
+      if (!calibrationReady) {
+        el('applyQcRefit').disabled = true;
+        el('qcRefitStats').textContent = '参考段边界待确认；请先查看原始峰形，并在“配置”中确认全部边界。';
+        return;
+      }
       const preview = state.qcRefitPreview;
       const active = state.current?.alignment?.qc_alignment_model
         || state.meta?.alignment?.qc_alignment_model
@@ -12613,6 +12879,7 @@ HTML = r"""<!doctype html>
       const qcCalibration = state.stage === 'qc_calibration';
       const eventAnnotation = state.stage === 'event_annotation';
       let cellMode = eventAnnotation && state.manualAnnotationKind === 'cell';
+      const calibrationReady = calibrationBoundariesConfirmed();
       const frozen = (state.current?.time_model || state.meta?.time_model || {}).status === 'frozen';
       const postQcMode = String(
         state.current?.project_config?.post_qc_strategy?.mode
@@ -12627,11 +12894,15 @@ HTML = r"""<!doctype html>
       }
       el('qcRefitPanel').style.display = qcCalibration ? 'block' : 'none';
       el('baseTimePanel').style.display = local ? 'none' : 'block';
-      el('reviewPanel').style.display = (local || (eventAnnotation && !frozen)) ? 'none' : 'block';
-      el('manualPanel').style.display = (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
-      if (qcCalibration || (eventAnnotation && frozen)) {
+      el('reviewPanel').style.display = (!calibrationReady || local || (eventAnnotation && !frozen)) ? 'none' : 'block';
+      el('manualPanel').style.display = calibrationReady && (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
+      if (calibrationReady && (qcCalibration || (eventAnnotation && frozen))) {
         el('reviewPanel').parentNode.insertBefore(el('manualPanel'), el('reviewPanel'));
       }
+      document.querySelectorAll('.stage-tab').forEach(button => {
+        button.disabled = !calibrationReady && button.dataset.stage !== 'qc_calibration';
+        button.title = button.disabled ? '请先在配置中确认全部前段参考边界' : '';
+      });
       el('eventFilter').style.display = eventAnnotation ? 'grid' : 'none';
       el('manualAnnotationKind').style.display = eventAnnotation ? 'grid' : 'none';
       el('manualLifRow').style.display = cellMode ? 'block' : 'none';
@@ -12766,18 +13037,30 @@ HTML = r"""<!doctype html>
           ? JSON.parse(JSON.stringify(result.project_config.calibration_protocol))
           : null;
         state.configPostQcDraft = JSON.parse(JSON.stringify(result.project_config.post_qc_strategy || { mode: 'disabled' }));
-        applyStageWindowWidth();
         if (qcEndChanged) state.qcRefitPreview = null;
         const cfg = result.project_config;
         const annotationStart = Number(cfg.annotation_start_min || state.start);
         const qcEnd = Number(cfg.qc_calibration_end_min || 10.5);
-        if (state.stage === 'local_calibration') {
+        if (!calibrationBoundariesConfirmed()) {
+          state.stage = 'qc_calibration';
+          state.timeMode = 'raw';
+          state.previewDeltaSec = null;
+          state.localDeltaPreview = null;
+          state.qcRefitPreview = null;
+          const firstSegment = cfg.calibration_protocol?.segments?.[0];
+          state.start = Math.max(
+            Number(state.meta?.time_min_min || 0),
+            Number(firstSegment?.start_min || 0)
+          );
+          el('timeMode').value = 'raw';
+        } else if (state.stage === 'local_calibration') {
           state.start = annotationStart;
         } else if (state.stage === 'event_annotation' && Number(state.start) < annotationStart) {
           state.start = annotationStart;
         } else if (state.stage === 'qc_calibration' && Number(state.start) > qcEnd) {
           state.start = 0;
         }
+        applyStageWindowWidth();
         const savedMessage = `已保存：前段协议结束 ${String(Number(cfg.qc_calibration_end_min))} min；事件起点 ${String(Number(cfg.annotation_start_min))} min；无标签 delta 取证 ${String(Number(cfg.local_delta_seed_window_min))} min；后段 QC=${cfg.post_qc_strategy?.mode || 'disabled'}。`;
         setConfigSaveStatus(
           result.warning ? `${savedMessage} ${result.warning}` : savedMessage,
@@ -12950,6 +13233,7 @@ HTML = r"""<!doctype html>
     }
 
     function contextActions(row) {
+      if (state.stage === 'qc_calibration' && !calibrationBoundariesConfirmed()) return [];
       if (!row || row.review_enabled === false || row.source === 'preview') return [];
       const actions = [
         { action: 'accepted', label: '接受' },
@@ -13185,7 +13469,7 @@ HTML = r"""<!doctype html>
           throw new Error('LIF 输入必须为 2–4 个。');
         }
         if (lifInputs.some(row => !row.path || !row.channel || !row.detector || !row.time_axis)) {
-          throw new Error('请为每个 LIF 输入填写文件、通道、检测器和物理时间轴。');
+          throw new Error('请为每个 LIF 输入选择文件并填写通道和检测器。');
         }
         if (new Set(channels).size !== channels.length) {
           throw new Error('LIF 通道名不能重复。');
@@ -13213,7 +13497,6 @@ HTML = r"""<!doctype html>
             throw new Error(`参考段 #${index + 1} 与前一段重叠或顺序错误。`);
           }
           if (!segment.reference_channels.length) throw new Error(`参考段 #${index + 1} 至少选择一个参考通道。`);
-          if (!segment.boundaries_confirmed) throw new Error(`参考段 #${index + 1} 的边界尚未由用户确认。`);
           previousEnd = segment.end_min;
         });
         const axesByChannel = Object.fromEntries(lifInputs.map(row => [row.channel, row.time_axis]));
@@ -13230,6 +13513,10 @@ HTML = r"""<!doctype html>
         const postQcStrategy = postQcStrategyPayload();
         if (!el('importProjectDir').value.trim() || !el('importMs').value.trim() || !el('importCellEventMap').value.trim()) {
           throw new Error('请选择项目保存路径、MS 原始文件和事件坐标 CSV。');
+        }
+        const unconfirmedCount = calibrationProtocol.segments.filter(segment => !segment.boundaries_confirmed).length;
+        if (unconfirmedCount) {
+          el('importHint').textContent = `正在创建边界待确认草稿（${unconfirmedCount} 段）；进入后先查看原始峰形，再到“配置”确认边界。`;
         }
         const result = await postJson('/api/import-project', {
           project_dir: el('importProjectDir').value,
@@ -14532,6 +14819,10 @@ HTML = r"""<!doctype html>
         if (String(message.map_sha256 || '') !== String(state.meta?.cell_event_map?.sha256 || '')) return;
         const eventTime = Number(message.scan_start_time);
         if (!Number.isFinite(eventTime)) return;
+        if (!calibrationBoundariesConfirmed()) {
+          alert('参考段边界尚未全部确认；当前草稿只能浏览原始峰形，暂不能从 UMAP 跳转到事件标注。');
+          return;
+        }
         state.stage = 'event_annotation';
         state.eventFilter = 'all';
         state.timeMode = 'aligned';

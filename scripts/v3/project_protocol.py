@@ -45,8 +45,7 @@ def _normalize_segment(raw: Any, index: int) -> dict[str, Any]:
     ]
     if not channels:
         raise ValueError(f"{segment_id} must have reference_channels")
-    if not bool(raw.get("boundaries_confirmed", False)):
-        raise ValueError(f"{segment_id} boundaries must be user-confirmed")
+    confirmed = bool(raw.get("boundaries_confirmed", False))
     return {
         "segment_id": segment_id,
         "order": index,
@@ -54,7 +53,7 @@ def _normalize_segment(raw: Any, index: int) -> dict[str, Any]:
         "start_min": start_min,
         "end_min": end_min,
         "reference_channels": channels,
-        "boundaries_confirmed": True,
+        "boundaries_confirmed": confirmed,
     }
 
 
@@ -156,6 +155,9 @@ def load_project_protocol(project_root: str | Path) -> dict[str, Any]:
         "source": str(path),
         "compatibility_mode": "",
         "segments": segments,
+        "boundaries_confirmed": all(
+            bool(segment["boundaries_confirmed"]) for segment in segments
+        ),
         "annotation_start_min": annotation_start,
         "post_qc_strategy": post_qc,
     }
@@ -171,7 +173,12 @@ def classify_project_phase(time_min: Any, policy: dict[str, Any]) -> np.ndarray:
             (values >= float(segment["start_min"]))
             & (values <= float(segment["end_min"]))
         )
-        choices.append(f"calibration:{segment['segment_id']}")
+        prefix = (
+            "calibration"
+            if bool(segment.get("boundaries_confirmed"))
+            else "calibration_draft"
+        )
+        choices.append(f"{prefix}:{segment['segment_id']}")
     conditions.append(values >= float(policy["annotation_start_min"]))
     choices.append("annotation_region")
     return np.select(conditions, choices, default="pre_annotation_unassigned")
@@ -183,6 +190,8 @@ def phase_role_from_labels(phases: Any) -> np.ndarray:
         [
             f"calibration_reference_only:{str(value).split(':', 1)[1]}"
             if str(value).startswith("calibration:")
+            else f"calibration_reference_draft:{str(value).split(':', 1)[1]}"
+            if str(value).startswith("calibration_draft:")
             else "annotation_region"
             if str(value) == "annotation_region"
             else "pre_annotation_unassigned"
@@ -202,6 +211,7 @@ def phase_boundaries_min(policy: dict[str, Any]) -> str:
         parts.append(
             f"calibration:{segment['segment_id']}({population}; {channels}):"
             f"{float(segment['start_min']):g}-{float(segment['end_min']):g}"
+            f"[{'confirmed' if segment.get('boundaries_confirmed') else 'draft'}]"
         )
     parts.append(f"annotation_region:>={float(policy['annotation_start_min']):g}")
     parts.append("other configured gaps:pre_annotation_unassigned")

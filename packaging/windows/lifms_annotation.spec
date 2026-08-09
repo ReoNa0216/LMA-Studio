@@ -9,6 +9,20 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 repo_root = Path(SPECPATH).parents[1]
 
 
+def preferred_runtime_dll(name):
+    """Select DLLs from the interpreter environment, never a parent Conda env."""
+
+    candidates = [
+        Path(sys.prefix) / "Library/bin" / name,
+        Path(sys.prefix) / "DLLs" / name,
+        Path(sys.prefix) / name,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return (str(candidate), ".")
+    return None
+
+
 def production_submodule(name):
     parts = name.split(".")
     return not any(
@@ -26,7 +40,19 @@ datas += collect_data_files("matplotlib")
 datas += collect_data_files("webview", subdir="lib")
 datas += collect_data_files("webview", subdir="js")
 
-binaries = []
+binaries = [
+    item
+    for item in (
+        preferred_runtime_dll("libexpat.dll"),
+        preferred_runtime_dll("libcrypto-3-x64.dll"),
+        preferred_runtime_dll("libssl-3-x64.dll"),
+        preferred_runtime_dll("liblzma.dll"),
+        preferred_runtime_dll("libbz2.dll"),
+        preferred_runtime_dll("ffi-8.dll"),
+        preferred_runtime_dll("sqlite3.dll"),
+    )
+    if item is not None
+]
 binaries += collect_dynamic_libs("pyarrow")
 binaries += collect_dynamic_libs("scipy")
 binaries += collect_dynamic_libs("webview")

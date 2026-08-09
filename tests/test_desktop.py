@@ -7,6 +7,7 @@ import unittest
 from urllib.request import urlopen
 import uuid
 
+import annotation_app.desktop as desktop_module
 from annotation_app.app import BootstrapAppData, ProjectPaths, RequestActivity
 from annotation_app.desktop import (
     DesktopApi,
@@ -254,6 +255,33 @@ class DesktopArgumentsTest(unittest.TestCase):
         self.assertIsNone(args.annotation_db)
         self.assertFalse(args.debug)
         self.assertFalse(args.check_runtime)
+
+
+class PackagedScientificRuntimeProbeTest(unittest.TestCase):
+    def test_runtime_probe_exercises_expat_and_dynamic_preprocessing_imports(self):
+        probe = getattr(desktop_module, "check_scientific_runtime", None)
+        self.assertTrue(callable(probe))
+
+        result = probe()
+
+        self.assertRegex(result["expat_version"], r"^expat_")
+        self.assertEqual(
+            result["preprocessing_scripts"],
+            [
+                "run_v3_01_lif_trace_physical_qc.py",
+                "run_v3_02_ms_event_calling.py",
+            ],
+        )
+
+    def test_windows_builder_prioritizes_selected_python_environment_dlls(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "packaging/windows/build_windows.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Library\\bin", script)
+        self.assertRegex(script, r"\$env:PATH\s*=")
+        self.assertRegex(script, r"libexpat\.dll")
 
 
 if __name__ == "__main__":

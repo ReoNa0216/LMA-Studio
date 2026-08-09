@@ -15,7 +15,7 @@ from scripts.v3.project_protocol import (
 )
 
 
-def write_protocol(root: Path) -> None:
+def write_protocol(root: Path, *, boundaries_confirmed: bool = True) -> None:
     path = root / "results/tables/v3/00_project_protocol.json"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -31,7 +31,7 @@ def write_protocol(root: Path) -> None:
                             "start_min": 1.25,
                             "end_min": 3.5,
                             "reference_channels": ["G1"],
-                            "boundaries_confirmed": True,
+                            "boundaries_confirmed": boundaries_confirmed,
                         },
                         {
                             "segment_id": "linneg_reference",
@@ -39,7 +39,7 @@ def write_protocol(root: Path) -> None:
                             "start_min": 5.0,
                             "end_min": 8.75,
                             "reference_channels": ["G2"],
-                            "boundaries_confirmed": True,
+                            "boundaries_confirmed": boundaries_confirmed,
                         },
                     ],
                 },
@@ -53,6 +53,28 @@ def write_protocol(root: Path) -> None:
 
 
 class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
+    def test_unconfirmed_project_windows_remain_explicit_drafts_during_preprocessing(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            write_protocol(root, boundaries_confirmed=False)
+
+            policy = load_project_protocol(root)
+            phases = classify_project_phase(
+                np.asarray([2.0, 6.0, 24.0]),
+                policy,
+            ).tolist()
+
+            self.assertFalse(policy["boundaries_confirmed"])
+            self.assertEqual(
+                phases,
+                [
+                    "calibration_draft:lsk_reference",
+                    "calibration_draft:linneg_reference",
+                    "annotation_region",
+                ],
+            )
+            self.assertIn("draft", phase_boundaries_min(policy))
+
     def test_custom_segments_and_annotation_start_drive_phase_labels(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)

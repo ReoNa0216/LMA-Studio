@@ -38,6 +38,36 @@ $Python = (Resolve-Path $PythonExe).Path
 
 Write-Host "Using Python: $Python"
 
+# Calling an environment's python.exe by absolute path does not activate that
+# environment.  Without this isolation PyInstaller can resolve pyexpat.pyd from
+# the selected environment but libexpat.dll (and other core DLLs) from the base
+# Conda PATH.  Put the selected interpreter's runtime directories first.
+$PythonPrefix = (& $Python -c "import sys; print(sys.prefix)").Trim()
+if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $PythonPrefix)) {
+    throw "Cannot resolve the selected Python environment prefix."
+}
+$PythonBasePrefix = (& $Python -c "import sys; print(sys.base_prefix)").Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Cannot resolve the selected Python base prefix."
+}
+$RuntimePathDirs = @(
+    $PythonPrefix,
+    (Join-Path $PythonPrefix "Library\mingw-w64\bin"),
+    (Join-Path $PythonPrefix "Library\usr\bin"),
+    (Join-Path $PythonPrefix "Library\bin"),
+    (Join-Path $PythonPrefix "Scripts"),
+    (Join-Path $PythonPrefix "DLLs")
+) | Where-Object { Test-Path -LiteralPath $_ }
+if ($PythonBasePrefix -ne $PythonPrefix) {
+    $RuntimePathDirs += @(
+        $PythonBasePrefix,
+        (Join-Path $PythonBasePrefix "Library\bin"),
+        (Join-Path $PythonBasePrefix "DLLs")
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+}
+$env:PATH = (($RuntimePathDirs | Select-Object -Unique) + @($env:PATH)) -join [IO.Path]::PathSeparator
+Write-Host "Python environment prefix: $PythonPrefix"
+
 & $Python -m pip install --upgrade pip wheel setuptools
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to update the Windows build toolchain (exit code $LASTEXITCODE)."
@@ -67,6 +97,34 @@ if (!(Test-Path $BuiltExe)) {
 $RuntimeConfigSource = Join-Path $RepoRoot "packaging\windows\LMAStudio.exe.config"
 $RuntimeConfigTarget = Join-Path $RepoRoot "dist\LMAStudio\LMAStudio.exe.config"
 Copy-Item -LiteralPath $RuntimeConfigSource -Destination $RuntimeConfigTarget -Force
+
+# The imports above prove loadability; exact hashes also prove PyInstaller did
+# not silently select same-named DLLs from a different Conda environment.
+$CoreRuntimeDlls = @(
+    "libexpat.dll",
+    "libcrypto-3-x64.dll",
+    "libssl-3-x64.dll",
+    "liblzma.dll",
+    "libbz2.dll",
+    "ffi-8.dll",
+    "sqlite3.dll"
+)
+$PreferredDllDir = Join-Path $PythonPrefix "Library\bin"
+foreach ($DllName in $CoreRuntimeDlls) {
+    $ExpectedDll = Join-Path $PreferredDllDir $DllName
+    if (!(Test-Path -LiteralPath $ExpectedDll)) {
+        continue
+    }
+    $PackagedDll = Join-Path $RepoRoot "dist\LMAStudio\_internal\$DllName"
+    if (!(Test-Path -LiteralPath $PackagedDll)) {
+        throw "The packaged runtime is missing $DllName from the selected Python environment."
+    }
+    $ExpectedHash = (Get-FileHash -LiteralPath $ExpectedDll -Algorithm SHA256).Hash
+    $PackagedHash = (Get-FileHash -LiteralPath $PackagedDll -Algorithm SHA256).Hash
+    if ($ExpectedHash -ne $PackagedHash) {
+        throw "The packaged $DllName came from a different Python/Conda environment."
+    }
+}
 
 function Invoke-PackagedRuntimeProbe {
     $Probe = Start-Process -FilePath $BuiltExe -ArgumentList "--check-runtime" -WindowStyle Hidden -Wait -PassThru

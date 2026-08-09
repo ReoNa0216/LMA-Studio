@@ -19,9 +19,9 @@ A new project must contain one or more ordered, non-overlapping project-level se
 - `start_min` / `end_min`;
 - one or more `reference_channels`;
 - derived `reference_mode`: `green_only`, `red_only`, or `red_green`;
-- `boundaries_confirmed=true`, set explicitly by the user.
+- `boundaries_confirmed`, set explicitly by the user after inspecting raw peak shapes.
 
-The new-project UI can read the selected LIF files and suggest peak-cluster windows. Suggestions are data-derived, never global constants, and always return `boundaries_confirmed=false`. Missing evidence, order/overlap conflicts, and near-equal alternatives are surfaced rather than silently resolved. Editing a suggested or confirmed boundary clears its confirmation.
+The new-project UI can read the selected LIF files and suggest peak-cluster windows. Suggestions are data-derived, never global constants, and always return `boundaries_confirmed=false`. Numeric suggestions may be saved as a project draft so the user can inspect raw tracks before confirming them. A draft cannot compute or review front alignment, estimate/freeze downstream delta, or enter event annotation. Missing evidence, order/overlap conflicts, and near-equal alternatives are surfaced rather than silently resolved. Editing a suggested or confirmed boundary clears its confirmation.
 
 Legacy v0.3 G2+R1 projects are interpreted through an in-memory compatibility adapter based on their existing `qc_anchor_channels` and configured QC end. Opening a legacy project does not rewrite its manifest.
 

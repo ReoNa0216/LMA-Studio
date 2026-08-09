@@ -120,6 +120,50 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertIn("configuredPhysicalAxes()", body)
         self.assertIn("renderAxisShiftMetrics", body)
 
+    def test_new_project_allows_unconfirmed_draft_but_explains_calibration_gate(self):
+        import_body = javascript_function_body("importProject", "openExistingProject")
+
+        self.assertNotIn("的边界尚未由用户确认", import_body)
+        self.assertRegex(
+            HTML,
+            r"可先创建项目.*边界.*待确认.*前段校准|边界.*待确认.*可先创建项目.*前段校准",
+        )
+        self.assertRegex(HTML, r"确认边界前.*校准|校准.*确认边界前")
+
+    def test_post_qc_policy_fields_wrap_and_hide_irrelevant_signature_picker(self):
+        rule = re.search(r"\.policy-fields\s*\{(?P<body>[^}]*)\}", HTML)
+        self.assertIsNotNone(rule)
+        self.assertRegex(rule.group("body"), r"repeat\(auto-(?:fit|fill)")
+        self.assertRegex(rule.group("body"), r"minmax\(")
+
+        render = javascript_function_body(
+            "renderImportPostQcControls",
+            "calibrationProtocolPayload",
+        )
+        self.assertRegex(
+            render,
+            r"importPostQcChannelsLabel.*style\.display.*mode\s*===\s*'signature'",
+        )
+
+    def test_saving_or_navigating_a_draft_returns_to_raw_front_stage(self):
+        load = javascript_function_body("loadWindow", "updateMetrics")
+        self.assertIn("!calibrationBoundariesConfirmed()", load)
+        self.assertIn("state.stage = 'qc_calibration'", load)
+        self.assertIn("state.timeMode = 'raw'", load)
+        self.assertRegex(
+            load,
+            r"state\.stage\s*===\s*'local_calibration'.*calibrationBoundariesConfirmed\(\)",
+        )
+
+        save = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")
+        self.assertIn("!calibrationBoundariesConfirmed()", save)
+        self.assertIn("state.stage = 'qc_calibration'", save)
+        self.assertIn("state.timeMode = 'raw'", save)
+
+        actions = javascript_function_body("contextActions", "hideLineContextMenu")
+        self.assertRegex(actions, r"qc_calibration.*!calibrationBoundariesConfirmed\(\).*return \[\]")
+        self.assertRegex(HTML, r"focus-event[\s\S]*!calibrationBoundariesConfirmed\(\)[\s\S]*UMAP")
+
 
 def make_export_app(root: Path) -> AppData:
     layout = {

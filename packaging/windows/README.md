@@ -24,7 +24,7 @@ dist\LMAStudio\LMAStudio.exe
 
 Distribute the whole `dist\LMAStudio` directory or a zip made from that directory. Do not distribute only the single exe; the onedir build also needs bundled DLLs and runtime resources.
 
-The build copies `LMAStudio.exe.config` beside the executable and probes the packaged pythonnet/CLR bridge both normally and with simulated Internet-zone download markers. This guards the common GitHub-download-and-extract startup path.
+The build isolates DLL resolution to the selected Python/Conda environment, verifies core runtime DLL hashes, and probes XML/Expat, SSL, SQLite, compression, ctypes, both preprocessing scripts, and the pythonnet/CLR bridge. The CLR probe is repeated with simulated Internet-zone download markers. This catches mixed-Conda DLL packages and guards the common GitHub-download-and-extract startup path.
 
 ## Run
 

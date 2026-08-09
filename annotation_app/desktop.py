@@ -27,6 +27,7 @@ from annotation_app.app import (
     ProjectPaths,
     create_http_server,
     initial_app_data,
+    load_preprocessing_module,
     native_path_dialog_response,
 )
 
@@ -303,7 +304,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def check_scientific_runtime() -> dict[str, Any]:
+    """Exercise binary-backed imports used after the desktop has started.
+
+    A plain GUI startup probe does not import ``pyexpat`` or the dynamically
+    loaded preprocessing scripts.  Keeping these imports here makes a packaged
+    ``--check-runtime`` fail during the build instead of when a user first
+    clicks the calibration-window suggestion button.
+    """
+
+    import bz2  # noqa: F401
+    import lzma  # noqa: F401
+    import sqlite3
+    import ssl
+    from xml.parsers import expat
+
+    # ``ctypes`` is imported at module load; touch its binary loader here so a
+    # missing libffi is caught by the packaged probe as well.
+    if not callable(getattr(ctypes, "CDLL", None)):
+        raise RuntimeError("ctypes binary loader is unavailable")
+
+    script_names = [
+        "run_v3_01_lif_trace_physical_qc.py",
+        "run_v3_02_ms_event_calling.py",
+    ]
+    for script_name in script_names:
+        module = load_preprocessing_module(script_name)
+        if not callable(getattr(module, "run", None)):
+            raise RuntimeError(
+                f"Bundled preprocessing script has no run(project_dir=...) entry: {script_name}"
+            )
+
+    return {
+        "expat_version": str(expat.EXPAT_VERSION),
+        "openssl_version": str(ssl.OPENSSL_VERSION),
+        "sqlite_version": str(sqlite3.sqlite_version),
+        "preprocessing_scripts": script_names,
+    }
+
+
 def check_desktop_runtime() -> None:
+    check_scientific_runtime()
     if sys.platform == "win32":
         if webview2_runtime_version() is None:
             raise RuntimeError("未检测到 Microsoft Edge WebView2 Runtime。")
