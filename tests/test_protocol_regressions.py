@@ -21,6 +21,10 @@ from annotation_app.app import (
     post_qc_strategy_hash,
     raw_file_fingerprint,
 )
+from scripts.v3.lif_peak_detection import (
+    adaptive_lif_peak_detection,
+    lif_peak_detection_hash,
+)
 from tests.test_calibration_protocol import lif_peak, ms_event
 
 
@@ -46,6 +50,11 @@ def create_legacy_project(root: Path, *, qc_end_min: float = 12.0) -> tuple[Path
         ]
     )
     lif_peaks["peak_stage"] = "merged"
+    detector_config = adaptive_lif_peak_detection()
+    detector_hash = lif_peak_detection_hash(detector_config)
+    lif_peaks["peak_tier"] = "core"
+    lif_peaks["detector_version"] = 2
+    lif_peaks["detector_config_hash"] = detector_hash
     ms_events = pd.DataFrame(
         [
             ms_event("ms_1", 65.0),
@@ -102,6 +111,8 @@ def create_legacy_project(root: Path, *, qc_end_min: float = 12.0) -> tuple[Path
             "qc_anchor_channels": ["G2", "R1"],
         },
         "channel_identity_prior": {"G2": "Day0", "R1": "Day9", "R2": "Day3"},
+        "lif_peak_detection": detector_config,
+        "lif_peak_detection_hash": detector_hash,
         "intermediate_tables": {},
         "annotation_db": {
             "path": "annotation_app/annotations/annotation.sqlite",

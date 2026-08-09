@@ -35,7 +35,7 @@ class V04UiRegressionTest(unittest.TestCase):
         )
 
         self.assertIn("compatibility_mode", body)
-        self.assertRegex(body, r"旧项目.*只读|只读.*旧项目")
+        self.assertRegex(body, r"此项目.*只读|只读.*此项目")
         for field in ("start_min", "end_min", "boundaries_confirmed"):
             control = re.search(
                 rf'<(?:input|select)[^>]*data-cfg-segment-field="{field}"[^>]*>',
@@ -74,9 +74,9 @@ class V04UiRegressionTest(unittest.TestCase):
     def test_new_project_uses_automatic_plain_language_physical_axes(self):
         self.assertIn("function automaticTimeAxisForDetector", HTML)
         self.assertIn("function physicalTimeAxisLabel", HTML)
-        self.assertIn("Green 共享时间轴", HTML)
-        self.assertIn("Red 共享时间轴", HTML)
-        self.assertIn("由检测器自动设置", HTML)
+        self.assertIn("绿色信号共享时间轴", HTML)
+        self.assertIn("红色信号共享时间轴", HTML)
+        self.assertIn("按信号颜色自动设置", HTML)
         self.assertNotIn('data-import-field="time_axis"', HTML)
 
     def test_hsc1_is_an_optional_collapsed_template_not_the_default_action(self):
@@ -206,11 +206,8 @@ class V04UiRegressionTest(unittest.TestCase):
         import_body = javascript_function_body("importProject", "openExistingProject")
 
         self.assertNotIn("的边界尚未由用户确认", import_body)
-        self.assertRegex(
-            HTML,
-            r"可先创建项目.*边界.*待确认.*前段校准|边界.*待确认.*可先创建项目.*前段校准",
-        )
-        self.assertRegex(HTML, r"确认边界前.*校准|校准.*确认边界前")
+        self.assertRegex(HTML, r"可以先创建草稿.*所有边界确认前.*时间校准")
+        self.assertRegex(HTML, r"所有边界确认前.*后续阶段.*锁定")
 
     def test_post_qc_policy_fields_wrap_and_hide_irrelevant_signature_picker(self):
         rule = re.search(r"\.policy-fields\s*\{(?P<body>[^}]*)\}", HTML)

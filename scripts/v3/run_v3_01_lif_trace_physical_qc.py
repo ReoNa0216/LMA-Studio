@@ -16,15 +16,17 @@ from scipy.signal import find_peaks, peak_widths
 
 try:
     from scripts.v3.lif_peak_detection import (
-        legacy_lif_peak_detection,
+        adaptive_lif_peak_detection,
         lif_peak_detection_hash,
         normalize_lif_peak_detection,
+        require_active_lif_peak_detection,
     )
 except ModuleNotFoundError:  # Direct execution from scripts/v3.
     from lif_peak_detection import (  # type: ignore[no-redef]
-        legacy_lif_peak_detection,
+        adaptive_lif_peak_detection,
         lif_peak_detection_hash,
         normalize_lif_peak_detection,
+        require_active_lif_peak_detection,
     )
 
 try:
@@ -66,7 +68,10 @@ RED_PAIR_BIN_SEC = 0.25
 RED_NEAR_ZERO_HALF_WIDTH_SEC = 0.75
 MIN_LIF_INPUTS = 2
 MAX_LIF_INPUTS = 4
-PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
+PROJECT_PHASE_POLICY = load_project_protocol(
+    ROOT,
+    allow_unbound_module_default=True,
+)
 
 FORBIDDEN_PATH_PARTS = [
     "hrgc-obs-check.csv",
@@ -82,7 +87,11 @@ FORBIDDEN_PATH_PARTS = [
 ]
 
 
-def configure_project_root(project_dir: str | Path) -> Path:
+def configure_project_root(
+    project_dir: str | Path,
+    *,
+    allow_unbound_module_default: bool = False,
+) -> Path:
     global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT, PROJECT_PHASE_POLICY
     ROOT = Path(project_dir).expanduser().resolve()
     INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
@@ -91,7 +100,10 @@ def configure_project_root(project_dir: str | Path) -> Path:
     OUT_FIG = ROOT / "results/figures/v3" / STEP
     OUT_QC = ROOT / "results/qc/v3" / STEP
     OUT_REPORT = ROOT / "reports/v3/01_lif_trace_physical_qc.md"
-    PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
+    PROJECT_PHASE_POLICY = load_project_protocol(
+        ROOT,
+        allow_unbound_module_default=allow_unbound_module_default,
+    )
     return ROOT
 
 
@@ -330,7 +342,7 @@ def add_baseline_and_noise(
         noise = 1e-12
 
     config = normalize_lif_peak_detection(
-        detection_config if detection_config is not None else legacy_lif_peak_detection()
+        detection_config if detection_config is not None else adaptive_lif_peak_detection()
     )
     config_hash = lif_peak_detection_hash(config)
     out["baseline"] = baseline
@@ -415,28 +427,7 @@ def call_raw_peaks(
     config = normalize_lif_peak_detection(
         detection_config
         if detection_config is not None
-        else {
-            "detector_version": int(meta.get("detector_version", 1)),
-            "profile": meta.get("detector_profile", "legacy_v3_fixed"),
-            "core": {
-                "prominence_snr_min": float(
-                    meta.get("prom_snr_min", PROM_SNR_MIN)
-                )
-            },
-            "weak": {
-                "enabled": False,
-                "prominence_snr_min": None,
-            },
-            "geometry": {
-                "min_distance_sec": float(
-                    meta.get("raw_min_distance_sec", RAW_MIN_DISTANCE_SEC)
-                ),
-                "merge_gap_sec": float(meta.get("merge_gap_sec", MERGE_GAP_SEC)),
-                "min_width_sec": float(meta.get("min_width_sec", MIN_WIDTH_SEC)),
-                "max_width_sec": float(meta.get("max_width_sec", MAX_WIDTH_SEC)),
-            },
-            "weak_usage": "disabled",
-        }
+        else adaptive_lif_peak_detection()
     )
     config_hash = lif_peak_detection_hash(config)
     signal = trace["signal"].to_numpy(float)
@@ -1117,17 +1108,18 @@ def write_report(
 
 
 def run(project_dir: str | Path | None = None) -> None:
-    if project_dir is not None:
-        configure_project_root(project_dir)
+    # Module imports use an in-memory default so scientific helpers remain
+    # importable. Every actual run, including the no-argument CLI, must bind a
+    # real project protocol before creating any output directory.
+    configure_project_root(Path.cwd() if project_dir is None else project_dir)
     apply_plot_style()
     OUT_DATA.mkdir(parents=True, exist_ok=True)
     OUT_TABLE.mkdir(parents=True, exist_ok=True)
     OUT_FIG.mkdir(parents=True, exist_ok=True)
     OUT_QC.mkdir(parents=True, exist_ok=True)
 
-    detection_config = normalize_lif_peak_detection(
+    detection_config = require_active_lif_peak_detection(
         PROJECT_PHASE_POLICY.get("lif_peak_detection")
-        or legacy_lif_peak_detection(compatibility_mode=True)
     )
     traces = []
     peak_tables = []

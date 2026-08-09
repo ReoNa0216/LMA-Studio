@@ -53,7 +53,10 @@ LOW_ARRAY_LENGTH_SEVERE = 1000
 TIC_SUPPORT_TOL_SEC = 0.75
 PC34_FALLBACK_HEIGHT_FRACTION = 0.10
 PC34_FALLBACK_PROMINENCE_FRACTION = 0.10
-PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
+PROJECT_PHASE_POLICY = load_project_protocol(
+    ROOT,
+    allow_unbound_module_default=True,
+)
 
 FORBIDDEN_PATH_PARTS = [
     "hrgc-obs-check.csv",
@@ -69,7 +72,11 @@ FORBIDDEN_PATH_PARTS = [
 ]
 
 
-def configure_project_root(project_dir: str | Path) -> Path:
+def configure_project_root(
+    project_dir: str | Path,
+    *,
+    allow_unbound_module_default: bool = False,
+) -> Path:
     global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT, PROJECT_PHASE_POLICY
     ROOT = Path(project_dir).expanduser().resolve()
     INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
@@ -78,7 +85,10 @@ def configure_project_root(project_dir: str | Path) -> Path:
     OUT_FIG = ROOT / "results/figures/v3" / STEP
     OUT_QC = ROOT / "results/qc/v3" / STEP
     OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
-    PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
+    PROJECT_PHASE_POLICY = load_project_protocol(
+        ROOT,
+        allow_unbound_module_default=allow_unbound_module_default,
+    )
     return ROOT
 
 RE_INDEX = re.compile(r"^\s*index:\s*(\d+)")
@@ -1021,8 +1031,10 @@ def write_report(
 
 
 def run(project_dir: str | Path | None = None) -> None:
-    if project_dir is not None:
-        configure_project_root(project_dir)
+    # Module imports use an in-memory default so parsers remain importable.
+    # Every actual run, including the no-argument CLI, must bind a real project
+    # protocol before creating any output directory.
+    configure_project_root(Path.cwd() if project_dir is None else project_dir)
     apply_plot_style()
     OUT_DATA.mkdir(parents=True, exist_ok=True)
     OUT_TABLE.mkdir(parents=True, exist_ok=True)

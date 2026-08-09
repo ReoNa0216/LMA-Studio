@@ -16,13 +16,13 @@ import numpy as np
 
 try:
     from scripts.v3.lif_peak_detection import (
-        legacy_lif_peak_detection,
-        normalize_lif_peak_detection,
+        adaptive_lif_peak_detection,
+        require_active_lif_peak_detection,
     )
 except ModuleNotFoundError:  # Direct execution from scripts/v3.
     from lif_peak_detection import (  # type: ignore[no-redef]
-        legacy_lif_peak_detection,
-        normalize_lif_peak_detection,
+        adaptive_lif_peak_detection,
+        require_active_lif_peak_detection,
     )
 
 
@@ -68,12 +68,12 @@ def _normalize_segment(raw: Any, index: int) -> dict[str, Any]:
     }
 
 
-def _legacy_policy() -> dict[str, Any]:
-    """Read-only adapter for preprocessing artifacts created before schema v3."""
+def _module_default_policy() -> dict[str, Any]:
+    """Non-persistent policy used only while importing preprocessing modules."""
     return {
-        "schema_version": 0,
-        "source": "legacy_compatibility_adapter",
-        "compatibility_mode": "v0.3_fixed_phase_semantics",
+        "schema_version": 4,
+        "source": "unbound_module_default",
+        "compatibility_mode": "",
         "segments": [
             {
                 "segment_id": "legacy_qc_calibration",
@@ -91,9 +91,7 @@ def _legacy_policy() -> dict[str, Any]:
             "reference_channels": ["G2", "R1"],
             "compatibility_mode": "v0.3_qc_anchor_channels",
         },
-        "lif_peak_detection": legacy_lif_peak_detection(
-            compatibility_mode=True
-        ),
+        "lif_peak_detection": adaptive_lif_peak_detection(),
     }
 
 
@@ -127,11 +125,21 @@ def _with_derived_fields(policy: dict[str, Any]) -> dict[str, Any]:
     return policy
 
 
-def load_project_protocol(project_root: str | Path) -> dict[str, Any]:
+def load_project_protocol(
+    project_root: str | Path,
+    *,
+    allow_unbound_module_default: bool = False,
+) -> dict[str, Any]:
     root = Path(project_root).expanduser().resolve()
     path = root / PROTOCOL_RELATIVE_PATH
     if not path.exists():
-        return _with_derived_fields(_legacy_policy())
+        if allow_unbound_module_default:
+            return _with_derived_fields(_module_default_policy())
+        raise ValueError(
+            "Project preprocessing protocol is missing. Old V3/v1 projects are "
+            "not adapted: create a new empty detector-v2 project, select the "
+            "original inputs again, and rerun preprocessing."
+        )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -166,9 +174,19 @@ def load_project_protocol(project_root: str | Path) -> dict[str, Any]:
         raise ValueError("00_project_protocol.json is missing post_qc_strategy")
     peak_detection_raw = raw.get("lif_peak_detection")
     if peak_detection_raw is None:
-        peak_detection = legacy_lif_peak_detection(compatibility_mode=True)
-    else:
-        peak_detection = normalize_lif_peak_detection(peak_detection_raw)
+        raise ValueError(
+            "00_project_protocol.json is missing lif_peak_detection; old V3/v1 "
+            "protocols must be rebuilt as detector v2 in a new project."
+        )
+    try:
+        peak_detection = require_active_lif_peak_detection(peak_detection_raw)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported LIF detector protocol: {exc}") from exc
+    if peak_detection_raw != peak_detection:
+        raise ValueError(
+            "00_project_protocol.json lif_peak_detection must contain the full "
+            "canonical detector-v2 core+weak configuration"
+        )
     policy = {
         "schema_version": int(raw.get("schema_version") or 0),
         "source": str(path),

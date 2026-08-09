@@ -1,10 +1,10 @@
-"""Failing contract tests for project-owned LIF detector v2 semantics.
+"""Contract tests for the project-owned detector-v2-only semantics.
 
 The intended boundary is deliberately narrow:
 
 * ``lif_peak_detection`` is a project-level, hash-bound configuration.
-* Existing projects without that key are interpreted in memory as detector v1;
-  opening them must not rewrite their manifest or peak parquet.
+* Existing projects without that key or with detector v1 are rejected without
+  rewriting their manifest or peak parquet.
 * Detector v2 calls both ``core`` and ``weak`` peaks. Weak peaks are optional
   manual-review evidence: they do not train alignment/delta or create automatic
   candidates, but a user-confirmed manual pair remains exportable.
@@ -154,7 +154,7 @@ def peak_rows() -> pd.DataFrame:
 
 
 class DetectorV2ManifestContractTest(unittest.TestCase):
-    def test_legacy_manifest_is_adapted_in_memory_without_migration(self):
+    def test_legacy_manifest_is_rejected_without_migration(self):
         adapter = require_callable(self, app_module, "lif_peak_detection_from_manifest")
         legacy_manifest = {
             "project_id": "legacy-project",
@@ -163,29 +163,23 @@ class DetectorV2ManifestContractTest(unittest.TestCase):
         }
         before = copy.deepcopy(legacy_manifest)
 
-        config = adapter(legacy_manifest)
+        with self.assertRaisesRegex(BadRequest, "V3|v1|v2|重新"):
+            adapter(legacy_manifest)
 
         self.assertEqual(legacy_manifest, before)
         self.assertNotIn("lif_peak_detection", legacy_manifest)
-        self.assertEqual(config["detector_version"], 1)
-        self.assertTrue(str(config.get("compatibility_mode", "")).startswith("legacy"))
-        self.assertEqual(config["profile"], "legacy_v3_fixed")
-        self.assertFalse(config["weak"]["enabled"])
-        self.assertEqual(config["weak_usage"], "disabled")
 
-    def test_missing_preprocessing_protocol_uses_v1_in_memory_without_writing(self):
+    def test_missing_preprocessing_protocol_is_rejected_without_writing(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             before = sorted(path.relative_to(root) for path in root.rglob("*"))
 
-            policy = project_protocol.load_project_protocol(root)
+            with self.assertRaisesRegex(ValueError, "protocol|V3|v1|v2"):
+                project_protocol.load_project_protocol(root)
 
             after = sorted(path.relative_to(root) for path in root.rglob("*"))
 
         self.assertEqual(after, before)
-        self.assertEqual(policy["lif_peak_detection"]["detector_version"], 1)
-        self.assertEqual(policy["lif_peak_detection"]["profile"], "legacy_v3_fixed")
-        self.assertFalse(policy["lif_peak_detection"]["weak"]["enabled"])
 
     def test_preprocessing_protocol_exposes_project_detector_config(self):
         payload = {
@@ -204,7 +198,9 @@ class DetectorV2ManifestContractTest(unittest.TestCase):
             },
             "post_qc_strategy": {"mode": "disabled"},
             "annotation_config": {"annotation_start_min": 24.0},
-            "lif_peak_detection": copy.deepcopy(DETECTOR_V2_CONFIG),
+            "lif_peak_detection": app_module.normalize_lif_peak_detection(
+                DETECTOR_V2_CONFIG
+            ),
         }
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
@@ -381,7 +377,7 @@ class DetectorV2UiAndExportContractTest(unittest.TestCase):
         self.assertFalse(core_view["display_options"]["include_weak_lif_peaks"])
         self.assertTrue(all_view["display_options"]["include_weak_lif_peaks"])
 
-    def test_legacy_peak_table_without_tier_is_read_as_core_without_mutation(self):
+    def test_in_memory_peak_table_without_tier_uses_active_v2_without_mutation(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = self.prepare_app(Path(tmp))
             legacy_table = peak_rows().query("peak_tier == 'core'").drop(
@@ -400,15 +396,10 @@ class DetectorV2UiAndExportContractTest(unittest.TestCase):
 
         self.assertEqual([row["peak_id"] for row in view["lif_peaks"]], ["g1-core"])
         self.assertEqual(view["lif_peaks"][0]["peak_tier"], "core")
-        self.assertEqual(meta["lif_peak_detection"]["detector_version"], 1)
+        self.assertEqual(meta["lif_peak_detection"]["detector_version"], 2)
         self.assertEqual(
             meta["project_config"]["lif_peak_detection"]["profile"],
-            "legacy_v3_fixed",
-        )
-        self.assertTrue(
-            str(meta["lif_peak_detection"].get("compatibility_mode", "")).startswith(
-                "legacy"
-            )
+            "core_weak",
         )
         pd.testing.assert_frame_equal(legacy_table, before)
 
@@ -487,9 +478,11 @@ class DetectorV2UiAndExportContractTest(unittest.TestCase):
         self.assertEqual(preserved["lif_peak_tier"], "weak")
 
     def test_ui_names_detector_profile_and_weak_display_semantics(self):
-        self.assertRegex(HTML, r'id="importLifPeakDetectorVersion"')
+        visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
+        self.assertNotRegex(HTML, r'id="importLifPeakDetectorVersion"')
+        self.assertRegex(HTML, r'id="importLifPeakDetectorStandard"')
         config_control = re.search(
-            r'<(?P<tag>select|input|output|span)[^>]*id="cfgLifPeakDetectorVersion"[^>]*>',
+            r'<(?P<tag>select|input|output|span)[^>]*id="cfgLifPeakStandard"[^>]*>',
             HTML,
         )
         self.assertIsNotNone(config_control)
@@ -497,19 +490,24 @@ class DetectorV2UiAndExportContractTest(unittest.TestCase):
             self.assertRegex(config_control.group(0), r"disabled|readonly")
         self.assertRegex(HTML, r'id="showWeakLifPeaks"')
         self.assertIn('id="cfgLifPeakDetectorDetails"', HTML)
-        self.assertIn('id="cfgLifPeakDetectorHash"', HTML)
+        self.assertNotIn('id="cfgLifPeakDetectorHash"', HTML)
         self.assertIn("weakToggle.disabled = !weakAvailable", HTML)
         self.assertIn("if (weakPeak && !cellMode) return", HTML)
         self.assertIn("state.stage === 'event_annotation'", HTML)
         self.assertIn("state.manualAnnotationKind === 'cell'", HTML)
-        self.assertRegex(HTML, r'v1[^<]{0,80}(?:兼容|旧项目)|(?:兼容|旧项目)[^<]{0,80}v1')
-        self.assertRegex(HTML, r'v2[^<]{0,80}core[^<]{0,80}weak')
-        self.assertRegex(
-            HTML,
-            r'弱峰[^<]{0,160}(?:仅供|只用于|人工)[^<]{0,160}不参与自动匹配',
+        self.assertNotIn("legacy_v3_fixed", HTML)
+        self.assertNotRegex(HTML, r"detector_version\s*:\s*1")
+        self.assertNotRegex(
+            visible_markup,
+            r">[^<]*(?:\bv1\b|\bv2\b|detector|配置 hash|检测器版本)[^<]*<",
         )
-        self.assertRegex(HTML, r'弱峰[^<]{0,180}人工[^<]{0,180}(?:接受|确认)[^<]{0,180}(?:导出|主 CSV)')
-        self.assertRegex(HTML, r'(?:新建项目|项目副本)[^<]{0,180}(?:重跑|重建)[^<]{0,180}中间表')
+        self.assertIn("自适应双层峰识别", visible_markup)
+        self.assertRegex(
+            visible_markup,
+            r'弱候选峰[^<]{0,180}人工[^<]{0,180}不参与自动',
+        )
+        self.assertRegex(visible_markup, r'弱候选峰[^<]{0,220}人工[^<]{0,220}(?:接受|确认)[^<]{0,220}导出')
+        self.assertRegex(visible_markup, r'新的空目录[^<]{0,180}(?:重跑|重建)[^<]{0,180}预处理')
         self.assertIn("include_weak_lif_peaks", HTML)
         self.assertIn("lif_peak_detection", HTML)
         self.assertRegex(HTML, r"peak_tier[^\n]{0,120}weak|weak[^\n]{0,120}peak_tier")

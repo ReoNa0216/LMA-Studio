@@ -11,13 +11,13 @@ The macOS package is a native Cocoa/WebKit window around the same local LMA Stud
 Build from the repository root:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.0-rc1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.0-rc2 bash packaging/macos/build_macos.sh
 ```
 
 Output:
 
 ```text
-release/LMA-Studio-v0.4.0-rc1-macos-arm64.zip
+release/LMA-Studio-v0.4.0-rc2-macos-arm64.zip
 ```
 
 The public package is ad-hoc signed because this project does not currently have an Apple Developer ID certificate or notarization credentials. Gatekeeper may therefore require Control-clicking the app and choosing **Open** on first launch.

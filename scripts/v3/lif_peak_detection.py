@@ -1,10 +1,15 @@
-"""Versioned, project-owned LIF peak-detection semantics.
+"""Project-owned LIF peak-detection semantics.
 
-The historical V3 caller used one channel-wide prominence threshold.  That is
-kept byte-for-byte compatible as detector version 1.  Detector version 2 keeps
-those high-specificity calls as ``core`` evidence and adds a separate ``weak``
-tier from local robust noise and pulse morphology.  Weak evidence is never an
-automatic alignment/cell-training input; a human may still pair and accept it.
+Detector version 2 is the only active LMA Studio standard.  It preserves the
+historical high-specificity calls as ``core`` evidence and adds a separate
+``weak`` tier from local robust noise and pulse morphology.  Weak evidence is
+never an automatic alignment/cell-training input; a human may still pair and
+accept it.
+
+The historical V3 fixed-threshold implementation remains importable only for
+offline scientific comparison and reproducibility.  Active project boundaries
+must call :func:`require_active_lif_peak_detection`, which rejects detector-v1
+instead of silently adapting old artifacts.
 """
 from __future__ import annotations
 
@@ -68,6 +73,30 @@ def legacy_lif_peak_detection(*, compatibility_mode: bool = False) -> dict[str, 
 
 def adaptive_lif_peak_detection() -> dict[str, Any]:
     return copy.deepcopy(ADAPTIVE_LIF_PEAK_DETECTION)
+
+
+def require_active_lif_peak_detection(
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the canonical active detector or reject a retired configuration."""
+
+    normalized = normalize_lif_peak_detection(
+        adaptive_lif_peak_detection() if raw is None else raw
+    )
+    if (
+        int(normalized.get("detector_version", 0)) != 2
+        or str(normalized.get("profile") or "") != "core_weak"
+        or not bool((normalized.get("weak") or {}).get("enabled"))
+        or str(normalized.get("weak_usage") or "") != "manual_review_only"
+        or bool(str(normalized.get("compatibility_mode") or "").strip())
+    ):
+        raise ValueError(
+            "该项目使用已停用的旧峰识别标准；当前只支持自适应双层峰识别"
+            "（高置信峰用于自动流程，弱候选峰仅供人工复核）。请在新的空目录中"
+            "重新选择原始输入并重跑预处理；原项目不会被修改，旧人工标注不会"
+            "自动迁移。"
+        )
+    return normalized
 
 
 def _finite_positive(value: Any, label: str) -> float:

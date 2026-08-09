@@ -339,11 +339,41 @@ class DetectorV2AutomaticEvidenceBoundaryTest(unittest.TestCase):
 
 
 class DetectorV2HashBindingTest(unittest.TestCase):
+    def test_peak_audit_columns_cannot_contradict_project_detector(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            project_dir, db_path = create_legacy_project(Path(tmp))
+            manifest_path = project_dir / "lifms_project.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            peak_entry = manifest["intermediate_tables"]["lif_peaks"]
+            peak_path = project_dir / peak_entry["path"]
+            peaks = pd.read_parquet(peak_path)
+            peaks["detector_profile"] = "contradictory-profile"
+            peaks["weak_usage"] = "disabled"
+            peaks.to_parquet(peak_path, index=False)
+            manifest["intermediate_tables"]["lif_peaks"] = {
+                "path": peak_entry["path"],
+                **raw_file_fingerprint(peak_path, full_hash_limit_bytes=None),
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(BadRequest, "峰表|识别规则|不一致"):
+                AppData.load(
+                    ProjectPaths.from_args(
+                        project_dir=str(project_dir),
+                        annotation_db=str(db_path),
+                    )
+                )
+
     def test_legacy_adapter_rejects_unbound_v2_metadata_in_peak_table(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             project_dir, db_path = create_legacy_project(Path(tmp))
             manifest_path = project_dir / "lifms_project.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("lif_peak_detection", None)
+            manifest.pop("lif_peak_detection_hash", None)
             peak_entry = manifest["intermediate_tables"]["lif_peaks"]
             peak_path = project_dir / peak_entry["path"]
             peaks = pd.read_parquet(peak_path)
@@ -362,7 +392,7 @@ class DetectorV2HashBindingTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(BadRequest, "detector|manifest|peak"):
+            with self.assertRaisesRegex(BadRequest, "旧峰识别|重新|原项目"):
                 AppData.load(
                     ProjectPaths.from_args(
                         project_dir=str(project_dir),
@@ -377,7 +407,7 @@ class DetectorV2HashBindingTest(unittest.TestCase):
             "lif_peak_detection_hash": "0" * 64,
         }
 
-        with self.assertRaisesRegex(BadRequest, "detector|hash|SHA"):
+        with self.assertRaisesRegex(BadRequest, "峰识别|绑定|不一致"):
             lif_peak_detection_from_manifest(manifest)
 
     def test_v2_peak_parquet_rows_must_match_project_detector_hash(self):
@@ -406,7 +436,7 @@ class DetectorV2HashBindingTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(BadRequest, "detector|hash|peak"):
+            with self.assertRaisesRegex(BadRequest, "峰表|识别规则|不一致"):
                 AppData.load(
                     ProjectPaths.from_args(
                         project_dir=str(project_dir),
@@ -446,7 +476,7 @@ class DetectorV2HashBindingTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(BadRequest, "detector|hash|peak"):
+            with self.assertRaisesRegex(BadRequest, "峰表|识别规则|不一致"):
                 AppData.load(
                     ProjectPaths.from_args(
                         project_dir=str(project_dir),

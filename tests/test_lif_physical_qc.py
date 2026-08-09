@@ -88,11 +88,17 @@ class VariableChannelInputTest(unittest.TestCase):
                 with self.subTest(channels=channels), tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
                     self.make_lock(root, channels)
-                    lif_qc.configure_project_root(root)
+                    lif_qc.configure_project_root(
+                        root,
+                        allow_unbound_module_default=True,
+                    )
                     specs = lif_qc.load_channel_specs()
                     self.assertEqual([spec.channel for spec in specs], channels)
         finally:
-            lif_qc.configure_project_root(original_root)
+            lif_qc.configure_project_root(
+                original_root,
+                allow_unbound_module_default=True,
+            )
 
     def test_overview_plot_allocates_one_axis_per_channel(self):
         traces = pd.DataFrame(

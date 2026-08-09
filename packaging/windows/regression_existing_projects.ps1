@@ -1,19 +1,30 @@
 param(
-    [string]$PythonExe = "D:\Miniconda\envs\lifms_annotation_win\python.exe",
+    # Retained for command-line compatibility. This regression no longer opens
+    # project SQLite files through Python; it snapshots every file as bytes.
+    [string]$PythonExe = "",
     [string]$ProjectsRoot = "",
     [string]$CopyRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+$null = $PythonExe
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $Exe = (Resolve-Path (Join-Path $RepoRoot "dist\LMAStudio\LMAStudio.exe")).Path
-$Python = (Resolve-Path $PythonExe).Path
-$ProjectsRoot = if ($ProjectsRoot) { (Resolve-Path $ProjectsRoot).Path } else { (Resolve-Path (Join-Path $RepoRoot "..")).Path }
+$ProjectsRoot = if ($ProjectsRoot) {
+    (Resolve-Path $ProjectsRoot).Path
+} else {
+    (Resolve-Path (Join-Path $RepoRoot "..")).Path
+}
 $TempBase = [IO.Path]::GetFullPath($env:TEMP).TrimEnd("\")
 $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
-$CopyRoot = if ($CopyRoot) { [IO.Path]::GetFullPath($CopyRoot) } else { Join-Path $TempBase "LMAStudioProjectRegression_Codex_01" }
+$CopyRoot = if ($CopyRoot) {
+    [IO.Path]::GetFullPath($CopyRoot)
+} else {
+    Join-Path $TempBase "LMAStudioProjectRegression_RetiredDetector_rc2"
+}
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
-$SnapshotScript = Join-Path $PSScriptRoot "project_snapshot.py"
+$ProjectNames = @("Batch03Test", "CART_Exp1-3", "CART_Exp2-1", "Young_HSC3")
 
 function Test-SafeRegressionRoot([string]$Path) {
     $FullPath = [IO.Path]::GetFullPath($Path)
@@ -23,245 +34,257 @@ function Test-SafeRegressionRoot([string]$Path) {
     )
 }
 
+function Get-FileTreeSnapshot([string]$RootPath) {
+    $FullRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $RootPath).Path).TrimEnd("\")
+    $EntryPrefix = $FullRoot + [IO.Path]::DirectorySeparatorChar
+    $Entries = @(
+        [pscustomobject][ordered]@{
+            relative_path = "."
+            kind = "directory"
+            length = $null
+            # Directory timestamps are not a stable copy invariant on Windows:
+            # metadata propagation and indexing can update them without any
+            # project file changing. Directory paths still protect structure.
+            last_write_time_utc_ticks = $null
+            sha256 = $null
+        }
+        Get-ChildItem -LiteralPath $FullRoot -Force -Recurse |
+            Sort-Object FullName |
+            ForEach-Object {
+                $RelativePath = $_.FullName.Substring($EntryPrefix.Length).Replace("\", "/")
+                $IsDirectory = $_.PSIsContainer
+                $ContentHash = $null
+                if (!$IsDirectory) {
+                    $ContentHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+                [pscustomobject][ordered]@{
+                    relative_path = $RelativePath
+                    kind = if ($IsDirectory) { "directory" } else { "file" }
+                    length = if ($IsDirectory) { $null } else { [long]$_.Length }
+                    last_write_time_utc_ticks = if ($IsDirectory) { $null } else { [long]$_.LastWriteTimeUtc.Ticks }
+                    sha256 = $ContentHash
+                }
+            }
+    )
+    $CanonicalJson = ConvertTo-Json -InputObject ([object[]]$Entries) -Compress -Depth 4
+    $Hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $DigestBytes = $Hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($CanonicalJson))
+    }
+    finally {
+        $Hasher.Dispose()
+    }
+    $TreeHash = ([BitConverter]::ToString($DigestBytes)).Replace("-", "").ToLowerInvariant()
+    return [pscustomobject]@{
+        entries = [object[]]$Entries
+        canonical_json = $CanonicalJson
+        tree_sha256 = $TreeHash
+        entry_count = $Entries.Count
+        file_count = @($Entries | Where-Object { $_.kind -eq "file" }).Count
+    }
+}
+
+function Get-RetiredDetectorKind([string]$ProjectPath) {
+    $ManifestPath = Join-Path $ProjectPath "lifms_project.json"
+    if (!(Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Retired-detector fixture has no lifms_project.json: $ProjectPath"
+    }
+    $Manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $ManifestPath | ConvertFrom-Json
+    $DetectorProperty = $Manifest.PSObject.Properties["lif_peak_detection"]
+    if ($null -eq $DetectorProperty -or $null -eq $DetectorProperty.Value) {
+        return "missing"
+    }
+    $Version = 0
+    if (![int]::TryParse([string]$DetectorProperty.Value.detector_version, [ref]$Version)) {
+        throw "Retired-detector fixture has an unreadable detector_version: $ProjectPath"
+    }
+    if ($Version -ne 1) {
+        throw "Expected a missing/v1 retired detector fixture, found detector_version=$Version in $ProjectPath"
+    }
+    return "v1"
+}
+
+function Wait-ApplicationServer([Diagnostics.Process]$Process) {
+    for ($Index = 0; $Index -lt 120; $Index++) {
+        Start-Sleep -Milliseconds 500
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "LMAStudio.exe exited before its bootstrap server became ready."
+        }
+        $Connection = Get-NetTCPConnection -OwningProcess $Process.Id -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($Connection) {
+            return $Connection
+        }
+    }
+    throw "LMAStudio.exe did not open a loopback listener."
+}
+
+function Get-ApplicationMeta([string]$BaseUrl) {
+    for ($Index = 0; $Index -lt 120; $Index++) {
+        try {
+            return Invoke-RestMethod -Uri "$BaseUrl/api/meta" -TimeoutSec 10
+        }
+        catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    throw "LMAStudio.exe did not expose /api/meta."
+}
+
+function Invoke-ExpectedProjectRejection(
+    [string]$BaseUrl,
+    [string]$WriteToken,
+    [string]$ProjectPath
+) {
+    $StatusCode = 0
+    $Content = ""
+    try {
+        $Response = Invoke-WebRequest -Method Post -Uri "$BaseUrl/api/open-project" `
+            -Headers @{ "X-Annotation-Write-Token" = $WriteToken } `
+            -ContentType "application/json; charset=utf-8" `
+            -Body (@{ project_dir = $ProjectPath } | ConvertTo-Json -Compress) `
+            -TimeoutSec 60 -UseBasicParsing
+        $StatusCode = [int]$Response.StatusCode
+        $Content = [string]$Response.Content
+    }
+    catch {
+        $ErrorResponse = $_.Exception.Response
+        if ($null -eq $ErrorResponse) {
+            throw
+        }
+        $StatusCode = [int]$ErrorResponse.StatusCode
+        $Content = [string]$_.ErrorDetails.Message
+        if ([string]::IsNullOrWhiteSpace($Content) -and
+            $ErrorResponse.PSObject.Methods.Name -contains "GetResponseStream") {
+            $Reader = New-Object IO.StreamReader($ErrorResponse.GetResponseStream())
+            try {
+                $Content = $Reader.ReadToEnd()
+            }
+            finally {
+                $Reader.Dispose()
+            }
+        }
+    }
+    if ($StatusCode -ne 400) {
+        throw "Expected HTTP 400 for retired project $ProjectPath; received $StatusCode. Body: $Content"
+    }
+    try {
+        $Payload = $Content | ConvertFrom-Json
+    }
+    catch {
+        throw "Retired-project rejection was not JSON: $Content"
+    }
+    $Message = [string]$Payload.error
+    if ([string]::IsNullOrWhiteSpace($Message) -or $Message.Length -lt 20) {
+        throw "Retired-project rejection did not provide a readable rebuild instruction: $Content"
+    }
+    # Keep this PS1 ASCII-only so Windows PowerShell 5 can parse it without a
+    # UTF-8 BOM. These code points spell the expected peak-detector labels.
+    $PeakDetectionLabel = -join ([char[]]@(0x5CF0, 0x8BC6, 0x522B))
+    $RetiredLabel = -join ([char[]]@(0x5DF2, 0x505C, 0x7528))
+    $InvalidLabel = -join ([char[]]@(0x65E0, 0x6548))
+    if (!$Message.Contains($PeakDetectionLabel) -or
+        (!$Message.Contains($RetiredLabel) -and !$Message.Contains($InvalidLabel))) {
+        throw "HTTP 400 did not explicitly reject the retired peak detector: $Content"
+    }
+    return $Message
+}
+
 if (!(Test-SafeRegressionRoot $CopyRoot)) {
     throw "Regression copies must stay under the system temp directory with the LMAStudioProjectRegression_ prefix."
 }
 if (Test-Path -LiteralPath $CopyRoot) {
     throw "Regression root already exists: $CopyRoot"
 }
-
-function Get-ProjectSnapshot([string]$ProjectPath) {
-    $output = & $Python $SnapshotScript $ProjectPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Snapshot failed for $ProjectPath"
-    }
-    return $output | ConvertFrom-Json
-}
-
-function Wait-ApplicationServer([Diagnostics.Process]$Process) {
-    for ($index = 0; $index -lt 120; $index++) {
-        Start-Sleep -Milliseconds 500
-        $Process.Refresh()
-        if ($Process.HasExited) {
-            throw "LMAStudio.exe exited before its project finished loading."
-        }
-        $connection = Get-NetTCPConnection -OwningProcess $Process.Id -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($connection) {
-            return $connection
-        }
-    }
-    throw "LMAStudio.exe did not open a loopback listener."
-}
-
-function Test-SameJson($Before, $After) {
-    return ($Before | ConvertTo-Json -Compress) -eq ($After | ConvertTo-Json -Compress)
+if (Get-Process LMAStudio -ErrorAction SilentlyContinue) {
+    throw "Close the running LMA Studio window before starting project regression."
 }
 
 $Results = @()
 $TestProcesses = @()
-if (Get-Process LMAStudio -ErrorAction SilentlyContinue) {
-    throw "Close the running LMA Studio window before starting project regression."
-}
 New-Item -ItemType Directory -Path $CopyRoot | Out-Null
 try {
-    foreach ($Name in @("Batch03Test", "CART_Exp1-3", "CART_Exp2-1", "Young_HSC3")) {
+    foreach ($Name in $ProjectNames) {
         $Source = (Resolve-Path (Join-Path $ProjectsRoot $Name)).Path
         $Copy = Join-Path $CopyRoot $Name
-        # Snapshot the original before copying so the regression proves that the
-        # packaged application never writes through to an existing user project.
-        $SourceBefore = Get-ProjectSnapshot $Source
+
+        # Originals are only read for copy and full-tree snapshots. The EXE is
+        # pointed exclusively at the temporary copy.
+        $SourceBefore = Get-FileTreeSnapshot $Source
         Copy-Item -LiteralPath $Source -Destination $Copy -Recurse
-        $Before = Get-ProjectSnapshot $Copy
+        $CopyBefore = Get-FileTreeSnapshot $Copy
+        $RetiredDetector = Get-RetiredDetectorKind $Copy
 
-        $Process = Start-Process -FilePath $Exe -ArgumentList @("--project-dir", "`"$Copy`"") -WorkingDirectory (Split-Path $Exe) -PassThru
+        $Process = Start-Process -FilePath $Exe -WorkingDirectory (Split-Path $Exe) `
+            -WindowStyle Hidden -PassThru
         $TestProcesses += $Process
         $Connection = Wait-ApplicationServer $Process
         $BaseUrl = "http://127.0.0.1:$($Connection.LocalPort)"
-        $Meta = $null
-        for ($index = 0; $index -lt 120; $index++) {
-            try {
-                $Meta = Invoke-RestMethod -Uri "$BaseUrl/api/meta" -TimeoutSec 10
-                break
-            }
-            catch {
-                Start-Sleep -Milliseconds 500
-            }
-        }
-        if (!$Meta -or $Meta.bootstrap) {
-            throw "$Name did not load as a project."
+        $MetaBefore = Get-ApplicationMeta $BaseUrl
+        if (!$MetaBefore.bootstrap) {
+            throw "$Name regression did not start from the project-selection bootstrap."
         }
 
-        Invoke-RestMethod -Uri "$BaseUrl/api/window?start_min=0&window_min=2.5&time_mode=aligned" -TimeoutSec 30 | Out-Null
-        $AnnotationStart = [double]$Meta.project_config.annotation_start_min
-        Invoke-RestMethod -Uri "$BaseUrl/api/window?start_min=$AnnotationStart&window_min=2.5&time_mode=aligned" -TimeoutSec 30 | Out-Null
-        Invoke-RestMethod -Uri "$BaseUrl/api/local-delta-preview" -TimeoutSec 30 | Out-Null
-
-        $QcPending = $null
-        $QcManualDuplicates = $null
-        if ($Name -eq "Young_HSC3") {
-            $QcPending = 0
-            $QcManualDuplicates = 0
-            $QcEnd = [double]$Meta.project_config.qc_calibration_end_min
-            for ($QcStart = 0.0; $QcStart -lt $QcEnd; $QcStart += 2.5) {
-                $QcWindow = Invoke-RestMethod -Uri "$BaseUrl/api/window?start_min=$QcStart&window_min=2.5&time_mode=aligned" -TimeoutSec 30
-                $AnnotationIds = @{}
-                foreach ($Row in @($QcWindow.annotations)) {
-                    $AnnotationIds[[string]$Row.annotation_id] = $true
-                }
-                foreach ($Group in @($QcWindow.alignment_groups)) {
-                    if ([string]$Group.review_status -eq "pending") {
-                        $QcPending++
-                    }
-                    if ([string]$Group.source -eq "manual_created" -and $AnnotationIds.ContainsKey([string]$Group.annotation_id)) {
-                        $QcManualDuplicates++
-                    }
-                }
-            }
-            if ($QcPending -ne 0 -or $QcManualDuplicates -ne 0) {
-                throw "Young_HSC3 QC reconciliation failed: pending=$QcPending, manual_duplicates=$QcManualDuplicates."
-            }
+        $RejectionMessage = Invoke-ExpectedProjectRejection `
+            $BaseUrl ([string]$MetaBefore.write_token) $Copy
+        $MetaAfterRejection = Get-ApplicationMeta $BaseUrl
+        if (!$MetaAfterRejection.bootstrap) {
+            throw "$Name rejection replaced the bootstrap with a retired project."
         }
 
-        $ExportRows = $null
-        if ($Name -eq "Batch03Test") {
-            $Response = Invoke-WebRequest -Method Post -Uri "$BaseUrl/api/export-accepted-csv" `
-                -Headers @{ "X-Annotation-Write-Token" = $Meta.write_token } `
-                -ContentType "application/json; charset=utf-8" -Body "{}" -TimeoutSec 30 -UseBasicParsing
-            if ($Response.StatusCode -ne 200 -or $Response.Content.Length -lt 10) {
-                throw "Packaged CSV export failed."
-            }
-            $ExpectedExportHeader = @(
-                "CellNumber",
-                "scan_Id",
-                "scan_start_time",
-                "TIC",
-                "PC(34:1)_mz",
-                "PC(34:1)_intensity",
-                "UMAP1",
-                "UMAP2",
-                "Type",
-                "annotation_kind",
-                "review_stage",
-                "LIF_channel",
-                "LIF_peak_id",
-                "MS_event_id",
-                "residual_sec",
-                "annotation_id"
-            ) -join ","
-            $HeaderLine = (($Response.Content -split "`r?`n", 2)[0]).TrimStart([char]0xFEFF)
-            if ($HeaderLine -cne $ExpectedExportHeader) {
-                throw "Packaged CSV header mismatch.`nExpected: $ExpectedExportHeader`nActual:   $HeaderLine"
-            }
-            $ExportRows = @($Response.Content | ConvertFrom-Csv).Count
-        }
-
-        $Process.Refresh()
-        $Process.CloseMainWindow() | Out-Null
+        # A hidden pywebview window has no reliable MainWindowHandle. Terminate
+        # only the exact bootstrap process created above after the rejection.
+        Stop-Process -Id $Process.Id -Force
         if (!$Process.WaitForExit(20000)) {
-            throw "$Name did not exit after its window closed."
+            throw "$Name bootstrap process did not exit after rejection."
         }
         if (Get-NetTCPConnection -LocalPort $Connection.LocalPort -State Listen -ErrorAction SilentlyContinue) {
-            throw "$Name left its HTTP listener running after exit."
+            throw "$Name left its loopback listener running after exit."
         }
 
-        $AfterMigration = Get-ProjectSnapshot $Copy
-        $ImmutableChecks = [ordered]@{
-            annotations_sha256 = $Before.annotations_sha256 -eq $AfterMigration.annotations_sha256
-            annotation_count = $Before.annotation_count -eq $AfterMigration.annotation_count
-            audit_count = $Before.audit_count -eq $AfterMigration.audit_count
-            audit_sha256 = $Before.audit_sha256 -eq $AfterMigration.audit_sha256
-            counts = Test-SameJson $Before.counts $AfterMigration.counts
-            manifest_sha256 = $Before.manifest_sha256 -eq $AfterMigration.manifest_sha256
-            parquets = Test-SameJson $Before.parquets $AfterMigration.parquets
-        }
-        $ChangedImmutableFields = @($ImmutableChecks.Keys | Where-Object { !$ImmutableChecks[$_] })
-        if ($ChangedImmutableFields.Count -ne 0) {
-            throw "$Name first-open migration changed protected data: $($ChangedImmutableFields -join ', ')."
-        }
-
-        # The first open may bind a legacy time model to the acquisition layout.
-        # A second open must be fully idempotent after that documented migration.
-        $Before = $AfterMigration
-        $Process = Start-Process -FilePath $Exe -ArgumentList @("--project-dir", "`"$Copy`"") -WorkingDirectory (Split-Path $Exe) -PassThru
-        $TestProcesses += $Process
-        $Connection = Wait-ApplicationServer $Process
-        $BaseUrl = "http://127.0.0.1:$($Connection.LocalPort)"
-        $Meta = $null
-        for ($index = 0; $index -lt 120; $index++) {
-            try {
-                $Meta = Invoke-RestMethod -Uri "$BaseUrl/api/meta" -TimeoutSec 10
-                break
+        $CopyAfter = Get-FileTreeSnapshot $Copy
+        $SourceAfter = Get-FileTreeSnapshot $Source
+        $CopyStable = $CopyBefore.canonical_json -ceq $CopyAfter.canonical_json
+        $SourceStable = $SourceBefore.canonical_json -ceq $SourceAfter.canonical_json
+        if (!$CopyStable) {
+            $BeforeRows = @{}
+            foreach ($Row in $CopyBefore.entries) {
+                $BeforeRows[[string]$Row.relative_path] = ($Row | ConvertTo-Json -Compress)
             }
-            catch {
-                Start-Sleep -Milliseconds 500
+            $AfterRows = @{}
+            foreach ($Row in $CopyAfter.entries) {
+                $AfterRows[[string]$Row.relative_path] = ($Row | ConvertTo-Json -Compress)
             }
+            $ChangedPaths = @(
+                @($BeforeRows.Keys) + @($AfterRows.Keys) |
+                    Sort-Object -Unique |
+                    Where-Object {
+                        !$BeforeRows.ContainsKey($_) -or
+                        !$AfterRows.ContainsKey($_) -or
+                        $BeforeRows[$_] -cne $AfterRows[$_]
+                    }
+            )
+            Write-Host "Changed temporary-copy entries: $($ChangedPaths -join ', ')"
+            throw "$Name temporary copy changed during rejection: before=$($CopyBefore.tree_sha256), after=$($CopyAfter.tree_sha256)."
         }
-        if (!$Meta -or $Meta.bootstrap) {
-            throw "$Name did not reload as a project."
-        }
-        $Process.Refresh()
-        $Process.CloseMainWindow() | Out-Null
-        if (!$Process.WaitForExit(20000)) {
-            throw "$Name did not exit after its reload window closed."
-        }
-        if (Get-NetTCPConnection -LocalPort $Connection.LocalPort -State Listen -ErrorAction SilentlyContinue) {
-            throw "$Name left its reload HTTP listener running after exit."
-        }
-
-        $After = Get-ProjectSnapshot $Copy
-        $Checks = [ordered]@{
-            annotations_sha256 = $Before.annotations_sha256 -eq $After.annotations_sha256
-            annotation_count = $Before.annotation_count -eq $After.annotation_count
-            audit_count = $Before.audit_count -eq $After.audit_count
-            audit_sha256 = $Before.audit_sha256 -eq $After.audit_sha256
-            counts = Test-SameJson $Before.counts $After.counts
-            project_config_sha256 = $Before.project_config_sha256 -eq $After.project_config_sha256
-            time_models_sha256 = $Before.time_models_sha256 -eq $After.time_models_sha256
-            time_model_audit_sha256 = $Before.time_model_audit_sha256 -eq $After.time_model_audit_sha256
-            input_manifest_sha256 = $Before.input_manifest_sha256 -eq $After.input_manifest_sha256
-            manifest_sha256 = $Before.manifest_sha256 -eq $After.manifest_sha256
-            parquets = Test-SameJson $Before.parquets $After.parquets
-        }
-        $ChangedFields = @($Checks.Keys | Where-Object { !$Checks[$_] })
-        $Stable = $ChangedFields.Count -eq 0
-        if (!$Stable) {
-            throw "$Name regression changed: $($ChangedFields -join ', ')."
-        }
-
-        $SourceAfter = Get-ProjectSnapshot $Source
-        $SourceChecks = [ordered]@{
-            annotations_sha256 = $SourceBefore.annotations_sha256 -eq $SourceAfter.annotations_sha256
-            annotation_count = $SourceBefore.annotation_count -eq $SourceAfter.annotation_count
-            audit_count = $SourceBefore.audit_count -eq $SourceAfter.audit_count
-            audit_sha256 = $SourceBefore.audit_sha256 -eq $SourceAfter.audit_sha256
-            counts = Test-SameJson $SourceBefore.counts $SourceAfter.counts
-            project_config_sha256 = $SourceBefore.project_config_sha256 -eq $SourceAfter.project_config_sha256
-            time_models_sha256 = $SourceBefore.time_models_sha256 -eq $SourceAfter.time_models_sha256
-            time_model_audit_sha256 = $SourceBefore.time_model_audit_sha256 -eq $SourceAfter.time_model_audit_sha256
-            input_manifest_sha256 = $SourceBefore.input_manifest_sha256 -eq $SourceAfter.input_manifest_sha256
-            manifest_sha256 = $SourceBefore.manifest_sha256 -eq $SourceAfter.manifest_sha256
-            parquets = Test-SameJson $SourceBefore.parquets $SourceAfter.parquets
-        }
-        $ChangedSourceFields = @($SourceChecks.Keys | Where-Object { !$SourceChecks[$_] })
-        $SourceStable = $ChangedSourceFields.Count -eq 0
         if (!$SourceStable) {
-            throw "$Name original project changed during copy regression: $($ChangedSourceFields -join ', ')."
+            throw "$Name original project changed during rejection: before=$($SourceBefore.tree_sha256), after=$($SourceAfter.tree_sha256)."
         }
 
         $Results += [pscustomobject]@{
             Project = $Name
-            Channels = $Meta.lif_channels.channel -join "/"
-            Annotations = $After.annotation_count
-            Accepted = $After.counts.accepted
-            Rejected = $After.counts.rejected
-            Audit = $After.audit_count
-            AnnotationHash = $After.annotations_sha256
-            ExportRows = $ExportRows
-            QcPending = $QcPending
-            QcManualDuplicates = $QcManualDuplicates
-            DataStable = $Stable
+            RetiredDetector = $RetiredDetector
+            HttpStatus = 400
+            RejectionMessage = $RejectionMessage
+            CopyEntries = $CopyAfter.entry_count
+            CopyFiles = $CopyAfter.file_count
+            CopyTreeHash = $CopyAfter.tree_sha256
+            OriginalTreeHash = $SourceAfter.tree_sha256
+            CopyStable = $CopyStable
             OriginalStable = $SourceStable
-            ClosedCleanly = $true
+            BootstrapPreserved = [bool]$MetaAfterRejection.bootstrap
+            ProcessExited = $true
         }
     }
     $Results | Format-Table -AutoSize
@@ -271,10 +294,8 @@ finally {
         try {
             $TestProcess.Refresh()
             if (!$TestProcess.HasExited) {
-                $TestProcess.CloseMainWindow() | Out-Null
-                if (!$TestProcess.WaitForExit(10000)) {
-                    Stop-Process -Id $TestProcess.Id -Force -ErrorAction SilentlyContinue
-                }
+                Stop-Process -Id $TestProcess.Id -Force -ErrorAction SilentlyContinue
+                $TestProcess.WaitForExit(10000) | Out-Null
             }
         }
         catch {

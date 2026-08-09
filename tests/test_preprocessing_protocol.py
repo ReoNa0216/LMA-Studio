@@ -13,6 +13,7 @@ from scripts.v3.project_protocol import (
     load_project_protocol,
     phase_boundaries_min,
 )
+from scripts.v3.lif_peak_detection import adaptive_lif_peak_detection
 
 
 def write_protocol(root: Path, *, boundaries_confirmed: bool = True) -> None:
@@ -45,6 +46,7 @@ def write_protocol(root: Path, *, boundaries_confirmed: bool = True) -> None:
                 },
                 "post_qc_strategy": {"mode": "disabled"},
                 "annotation_config": {"annotation_start_min": 24.0},
+                "lif_peak_detection": adaptive_lif_peak_detection(),
             }
         )
         + "\n",
@@ -145,8 +147,14 @@ class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
                 self.assertIn("calibration_reference_only:lsk_reference", roles)
                 self.assertIn("annotation_region", roles)
         finally:
-            lif_qc.configure_project_root(lif_root)
-            ms_qc.configure_project_root(ms_root)
+            lif_qc.configure_project_root(
+                lif_root,
+                allow_unbound_module_default=True,
+            )
+            ms_qc.configure_project_root(
+                ms_root,
+                allow_unbound_module_default=True,
+            )
 
     def test_plot_boundaries_come_from_project_not_fixed_minutes(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

@@ -1,6 +1,6 @@
-# Windows v0.4 Candidate Smoke Test
+# Windows v0.4.0-rc2 Candidate Smoke Test
 
-Goal: verify that the packaged LMA Studio candidate can create and open projects, run the split calibration/post-QC workflow, preserve legacy projects, and export the compact downstream CSV without requiring a user Python installation.
+Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
 ## Safety and release boundary
 
@@ -44,9 +44,9 @@ Expected:
 Create only in a new empty project directory. Configure:
 
 - Two to four distinct LIF raw files and one MS raw file.
-- A project-bound LIF detector: adaptive v2 `core + weak` for new work, or legacy v1 only for a deliberate compatibility run.
+- One automatically configured adaptive two-tier LIF peak standard. The UI must not expose detector version choices or internal configuration keys.
 - One event-coordinate CSV in which `scan_start_time`, `UMAP1`, and `UMAP2` can be found; unrelated columns are allowed.
-- For every LIF channel: channel name, detector, scientific identity/sample label, and cell-annotation role. The shared physical time axis is assigned automatically from the detector.
+- For every LIF channel: channel name, signal color, scientific identity/sample label, and cell-annotation role. The shared acquisition-time group is assigned automatically from the signal color.
 - One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
 - A project-specific event annotation start and unlabeled-delta seed window.
 - An independent later QC policy: `disabled`, `signature` plus channels, or `scheduled_windows` plus ordered non-overlapping windows and channels.
@@ -70,20 +70,20 @@ After creation, verify:
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
 - Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.
 
-For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc1_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc2_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
-## 4. Open legacy projects on copies
+## 4. Reject retired peak-standard projects without writes
 
-Use a temporary copy of a v0.3 G2+R1 project.
+Use a temporary copy of a project whose peak tables were created with the retired detector.
 
 Expected:
 
-- The project opens through the compatibility adapter.
-- Existing `qc_anchor_channels` retain their historical v0.3 meaning.
-- Opening does not rewrite the legacy manifest, accepted/rejected annotations, audits, or parquet inputs.
-- Existing labels and review semantics remain visible.
-- A project without an event map stays in its documented legacy workflow until a map is explicitly attached.
-- Attaching a map preserves annotations and time models and rejects a map missing an already accepted post-start event.
+- Opening is refused with a readable instruction to rebuild from original LIF/MS/coordinate inputs in a new empty directory.
+- No manifest, annotation database, parquet table, timestamp, or other file-tree entry changes.
+- The currently loaded project, if any, remains open.
+- The dialog offers a clear route back to new-project creation without implying that annotations are migrated automatically.
+
+Separately, exercise a current-standard fixture that uses the historical G2+R1 calibration/post-QC semantics. Its annotation meanings remain unchanged; detector retirement and calibration-protocol compatibility are independent boundaries.
 
 Do not interpret historical fixed boundaries as defaults for a new project.
 
@@ -104,19 +104,19 @@ Expected:
 
 Wrong-order, overlapping, missing, or unconfirmed segments must block saving or preprocessing with a readable error.
 
-## 5a. LIF detector-v2 evidence boundary
+## 5a. LIF peak evidence boundary
 
-On a newly built adaptive-v2 project:
+On a newly built project:
 
 - The legacy high-specificity calls are tagged `core`; automatic alignment, delta, and cell candidates use only core peaks.
 - `显示 weak 弱峰` is off by default. Enabling it adds hollow/dashed weak markers without changing automatic candidates or the time model.
 - Weak evidence is learned only on a channel with enough core pulse evidence. Pure/no-signal channels must not be expanded into dense weak calls.
 - A user-confirmed weak peak/MS event cell pair remains exportable, while any attempt to use weak evidence as a QC or delta training anchor is rejected clearly.
-- An existing v1 project exposes its detector as read-only. Switching v1/v2 requires a new project/project copy and regenerated intermediate tables; opening or saving unrelated settings does not rewrite legacy manifests or parquet inputs.
+- A retired-standard project is rejected before any write and must be rebuilt in a new empty directory. There is no detector-version selector in the desktop UI.
 
 ## 6. Unlabeled later delta and freeze gate
 
-Open `无标签后段 delta`.
+Open `后段时间差校正`.
 
 Expected:
 
@@ -191,18 +191,18 @@ powershell -ExecutionPolicy Bypass -File packaging/windows/regression_existing_p
 Expected:
 
 - The script refuses a copy root outside system temp or without the `LMAStudioProjectRegression_*` prefix.
-- It copies `Batch03Test`, `CART_Exp1-3`, `CART_Exp2-1`, and `Young_HSC3` before opening them.
-- Original-project protected snapshots match before and after the run.
-- Copy manifest, SQLite annotations/audits/models, and parquet hashes satisfy compatibility checks.
-- The packaged export has the exact 16-column header above.
-- The result reports `DataStable=True`, `OriginalStable=True`, and `ClosedCleanly=True`.
+- It copies `Batch03Test`, `CART_Exp1-3`, `CART_Exp2-1`, and `Young_HSC3`; the EXE is never pointed at an original project.
+- Every copied manifest is first confirmed to have a missing or v1 retired detector binding.
+- `/api/open-project` returns HTTP 400 with a readable rebuild instruction, and the bootstrap project-selection state remains active.
+- Copy and original full-tree snapshots match before and after rejection, including every relative file/directory path plus each file's SHA256, length, and UTC modification time. Directory modification times are intentionally excluded because Windows can update copied-directory metadata without changing any project file.
+- The result reports `CopyStable=True`, `OriginalStable=True`, `BootstrapPreserved=True`, and `ProcessExited=True`.
 - The temporary regression root is removed even after failure.
 
 After a real HSC1 candidate project has been created outside `HSC1_data`, run the optional packaged smoke on another temporary copy:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packaged.ps1 `
-  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc1_candidate" `
+  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc2_candidate" `
   -HscDataDir "E:\path\to\HSC1_data"
 ```
 

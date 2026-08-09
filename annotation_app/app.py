@@ -56,10 +56,9 @@ from annotation_app.cell_event_map import (
 )
 from annotation_app.umap_page import UMAP_HTML
 from scripts.v3.lif_peak_detection import (
-    adaptive_lif_peak_detection,
-    legacy_lif_peak_detection,
     lif_peak_detection_hash,
     normalize_lif_peak_detection,
+    require_active_lif_peak_detection,
 )
 
 
@@ -87,7 +86,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.0-rc1"
+APP_VERSION = "lma_studio_v0.4.0-rc2"
 APP_DISPLAY_NAME = "LMA Studio"
 
 DEFAULT_WINDOW_MIN = 2.5
@@ -1186,7 +1185,7 @@ def read_project_manifest(project_dir: Path) -> dict[str, Any] | None:
 def lif_peak_detection_from_manifest(
     manifest: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Return detector semantics without migrating an older project on read."""
+    """Return the active detector without migrating retired project artifacts."""
 
     configured = (
         manifest.get("lif_peak_detection")
@@ -1195,18 +1194,29 @@ def lif_peak_detection_from_manifest(
     )
     if isinstance(configured, dict):
         try:
-            normalized = normalize_lif_peak_detection(copy.deepcopy(configured))
+            normalized = require_active_lif_peak_detection(
+                copy.deepcopy(configured)
+            )
         except ValueError as exc:
-            raise BadRequest(f"项目 lif_peak_detection 配置无效: {exc}") from exc
+            raise BadRequest(f"项目峰识别配置无效：{exc}") from exc
+        if configured != normalized:
+            raise BadRequest(
+                "项目峰识别配置不完整；请在新的空目录中从原始输入重跑预处理，"
+                "原项目不会被修改。"
+            )
         expected_hash = lif_peak_detection_hash(normalized)
         declared_hash = str((manifest or {}).get("lif_peak_detection_hash") or "").strip().lower()
         if declared_hash != expected_hash:
             raise BadRequest(
-                "项目 LIF detector hash 与 lif_peak_detection 配置不一致；"
+                "项目峰识别配置与中间表绑定不一致；"
                 "请使用原项目副本重新生成中间表，不要继续加载可能混用的峰表。"
             )
         return normalized
-    return legacy_lif_peak_detection(compatibility_mode=True)
+    raise BadRequest(
+        "该项目使用已停用的旧峰识别标准。"
+        "请不要修改原项目；请在新的空目录中重新选择原始 LIF、MS 和事件坐标 "
+        "CSV，并用当前版本重跑预处理。旧人工标注不会自动迁移。"
+    )
 
 
 def validate_and_adapt_lif_peak_detector_binding(
@@ -1230,15 +1240,14 @@ def validate_and_adapt_lif_peak_detector_binding(
                 "LIF peak 表缺少项目 detector 绑定字段: " + ", ".join(missing)
             )
     elif not present:
-        # Genuine v0.3 parquet tables predate all three columns. Adapt only the
-        # loaded frame; never rewrite the table or manifest.
-        peaks["peak_tier"] = "core"
-        peaks["detector_version"] = expected_version
-        peaks["detector_config_hash"] = expected_hash
-        return peaks
+        raise BadRequest(
+            "LIF 峰表没有当前峰识别规则所需的绑定信息。"
+            "请在新的空目录中从原始输入重跑预处理；原项目不会被修改，"
+            "旧人工标注不会自动迁移。"
+        )
     elif present != required:
         raise BadRequest(
-            "旧项目 LIF peak 表只包含部分 detector 元数据，无法安全绑定；"
+            "旧项目 LIF 峰表的识别规则绑定信息不完整，无法安全加载；"
             "请使用未改动的原项目副本。"
         )
 
@@ -1253,6 +1262,16 @@ def validate_and_adapt_lif_peak_detector_binding(
         .str.strip()
         .str.lower()
     )
+    profile_series = (
+        peaks["detector_profile"].fillna("").astype(str).str.strip().str.lower()
+        if "detector_profile" in peaks.columns
+        else None
+    )
+    weak_usage_series = (
+        peaks["weak_usage"].fillna("").astype(str).str.strip().str.lower()
+        if "weak_usage" in peaks.columns
+        else None
+    )
     invalid = bool(
         len(peaks)
         and (
@@ -1261,16 +1280,32 @@ def validate_and_adapt_lif_peak_detector_binding(
             or not version_series.eq(expected_version).all()
             or not hash_series.eq(expected_hash).all()
             or (expected_version == 1 and tier_series.eq("weak").any())
+            or (
+                profile_series is not None
+                and not profile_series.eq(
+                    str(peak_detection["profile"]).strip().lower()
+                ).all()
+            )
+            or (
+                weak_usage_series is not None
+                and not weak_usage_series.eq(
+                    str(peak_detection["weak_usage"]).strip().lower()
+                ).all()
+            )
         )
     )
     if invalid:
         raise BadRequest(
-            "LIF peak detector hash/version/tier 与项目配置不一致；"
+            "LIF 峰表的识别规则或证据级别与项目配置不一致；"
             "请从原始输入在新项目或项目副本中重跑预处理。"
         )
     peaks["peak_tier"] = tier_series
     peaks["detector_version"] = version_series.astype("Int64")
     peaks["detector_config_hash"] = hash_series
+    if profile_series is not None:
+        peaks["detector_profile"] = profile_series
+    if weak_usage_series is not None:
+        peaks["weak_usage"] = weak_usage_series
     return peaks
 
 
@@ -1288,7 +1323,6 @@ def write_project_manifest(
     annotation_config: dict[str, Any] | None = None,
     lif_peak_detection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    project_dir.mkdir(parents=True, exist_ok=True)
     binding = project_table_binding(intermediate_tables) if intermediate_tables else {}
     layout = normalize_acquisition_layout(acquisition_layout, identities=channel_identity_prior)
     if calibration_protocol is None:
@@ -1330,13 +1364,11 @@ def write_project_manifest(
         }
     normalized_post_qc = normalize_post_qc_strategy(post_qc_strategy, layout)
     try:
-        normalized_peak_detection = normalize_lif_peak_detection(
+        normalized_peak_detection = require_active_lif_peak_detection(
             lif_peak_detection
-            if lif_peak_detection is not None
-            else legacy_lif_peak_detection()
         )
     except ValueError as exc:
-        raise BadRequest(f"lif_peak_detection 配置无效: {exc}") from exc
+        raise BadRequest(f"LIF 峰识别配置无效：{exc}") from exc
     validate_post_qc_strategy_timing(normalized_post_qc, protocol_end_min)
     raw_annotation_config = annotation_config or {}
     try:
@@ -1390,6 +1422,7 @@ def write_project_manifest(
     }
     if cell_event_map is not None:
         manifest["cell_event_map"] = copy.deepcopy(cell_event_map)
+    project_dir.mkdir(parents=True, exist_ok=True)
     project_manifest_path(project_dir).write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1887,6 +1920,7 @@ def suggest_calibration_windows_from_raw_inputs(
     validate_distinct_lif_input_files(prepared)
 
     module = load_preprocessing_module("run_v3_01_lif_trace_physical_qc.py")
+    detection_config = require_active_lif_peak_detection()
     merged_tables: list[pd.DataFrame] = []
     summaries: list[dict[str, Any]] = []
     for item in prepared:
@@ -1908,8 +1942,15 @@ def suggest_calibration_windows_from_raw_inputs(
             trace["label"] = item["label"]
             trace["detector"] = item["detector"]
             trace["phase"] = "calibration_window_preview"
-            trace, meta = module.add_baseline_and_noise(trace)
-            raw_peaks = module.call_raw_peaks(trace, meta)
+            trace, meta = module.add_baseline_and_noise(
+                trace,
+                detection_config=detection_config,
+            )
+            raw_peaks = module.call_raw_peaks(
+                trace,
+                meta,
+                detection_config=detection_config,
+            )
             merged = module.merge_close_raw_peaks(raw_peaks)
         except BadRequest:
             raise
@@ -2231,6 +2272,7 @@ def validate_staged_project_artifacts(project: ProjectPaths) -> ProjectPaths:
     manifest = read_project_manifest(project.project_dir)
     if manifest is None:
         raise BadRequest("staging 项目缺少 lifms_project.json")
+    peak_detection = lif_peak_detection_from_manifest(manifest)
     validate_project_manifest_against_files(project.project_dir, manifest)
     resolved = project_with_manifest_paths(project, manifest)
     for path in [resolved.lif_traces_path, resolved.ms_scan_path]:
@@ -2250,7 +2292,6 @@ def validate_staged_project_artifacts(project: ProjectPaths) -> ProjectPaths:
         )
     except Exception as exc:
         raise BadRequest("staging 项目中间表缺少 event-map 绑定所需字段") from exc
-    peak_detection = lif_peak_detection_from_manifest(manifest)
     validate_and_adapt_lif_peak_detector_binding(
         lif_peaks,
         peak_detection,
@@ -3646,6 +3687,95 @@ class AnnotationStore:
 
 class BadRequest(ValueError):
     pass
+
+
+_PUBLIC_ERROR_FALLBACK = (
+    "操作未完成。请检查当前页面中的项目设置和所选记录；"
+    "如果刚修改过设置，请重新生成预览后再试。"
+)
+
+
+def user_facing_error_message(error: Any) -> str:
+    """Translate implementation-facing failures before they reach the UI.
+
+    Internal exceptions remain unchanged for logs and tests.  The HTTP boundary
+    uses this function so a desktop alert never asks a scientist to interpret
+    schema keys, hashes, matcher modes, or implementation version numbers.
+    """
+
+    message = str(error or "").strip()
+    if not message:
+        return _PUBLIC_ERROR_FALLBACK
+    lowered = message.lower()
+    if any(
+        token in lowered
+        for token in (
+            "lif_peak_detection",
+            "detector_config_hash",
+            "detector_version",
+            "peak_tier",
+            "detector",
+        )
+    ):
+        return (
+            "项目的峰识别设置无效或不完整。请保留原项目不变，"
+            "并在新的空目录中重新选择原始 LIF、MS 和事件坐标 CSV。"
+        )
+    if "preview_hash" in lowered or "protocol_hash" in lowered or " hash" in lowered:
+        return "当前预览或项目设置已经变化，请重新打开对应步骤并生成新的预览。"
+    if re.search(r"(?i)\bv(?:0\.3|1|2)(?:\.\d+)*\b", message):
+        return (
+            "该项目的设置格式无法由当前软件安全读取。请保留原项目不变，"
+            "并在新的空目录中从原始输入重新创建。"
+        )
+
+    replacements = (
+        ("post_qc_strategy", "后段质控巡检设置"),
+        ("calibration_protocol", "前段参考设置"),
+        ("qc_anchor_channels", "前段参考通道"),
+        ("scheduled_windows", "按指定时间窗口巡检"),
+        ("signature", "按参考通道巡检"),
+        ("disabled", "不进行后段巡检"),
+        ("green_axis", "绿色信号时间轴"),
+        ("red_axis", "红色信号时间轴"),
+        ("lif_anchor_peak_ids", "LIF 参考峰"),
+        ("anchor_peak_id", "参考峰"),
+        ("frozen time-axis model", "已锁定的时间校正结果"),
+        ("frozen time model", "已锁定的时间校正结果"),
+        ("draft time model", "尚未锁定的时间校正结果"),
+        ("time-axis model", "时间校正结果"),
+        ("time_axis", "采集时间基准"),
+        ("time-axis", "采集时间基准"),
+        ("preview_ms_delta_sec", "预览 MS 时间差"),
+        ("local_delta_seed_window_min", "自动估计时间差的范围"),
+        ("annotation_start_min", "事件标注起点"),
+        ("window_min", "窗口宽度"),
+        ("start_min", "开始时间"),
+        ("end_min", "结束时间"),
+        ("reference_channels", "参考通道"),
+        ("project_dir", "项目保存路径"),
+        ("candidate_id", "候选关系"),
+        ("ms_event_id", "MS 事件"),
+        ("lif_peak_id", "LIF 峰"),
+        ("segment_id", "参考段"),
+        ("frozen", "已锁定"),
+        ("draft", "草稿"),
+        ("anchor", "参考峰"),
+        ("delta", "MS 时间差"),
+    )
+    translated = message
+    for internal, visible in replacements:
+        translated = re.sub(re.escape(internal), visible, translated, flags=re.IGNORECASE)
+
+    forbidden = re.compile(
+        r"(?i)(?:detector|\bhash\b|calibration_protocol|post_qc_strategy|"
+        r"qc_anchor_channels|signature|scheduled_windows|disabled|green_axis|"
+        r"red_axis|preview_hash|\banchor\b|\bdelta\b|\bfrozen\b|\bdraft\b|"
+        r"time[-_]axis|peak_tier|\bv(?:0\.3|1|2)\b)"
+    )
+    if forbidden.search(translated) or re.search(r"\b[A-Za-z]+_[A-Za-z0-9_]+\b", translated):
+        return _PUBLIC_ERROR_FALLBACK
+    return translated
 
 
 def display_phase_from_time_min(
@@ -6433,13 +6563,27 @@ class AppData:
     cell_event_map: pd.DataFrame | None = None
     cell_event_map_info: dict[str, Any] | None = None
 
+    def active_lif_peak_detection(self) -> dict[str, Any]:
+        """Resolve the active v2 detector for loaded or in-memory app data."""
+
+        if self.lif_peak_detection is not None:
+            try:
+                return require_active_lif_peak_detection(
+                    self.lif_peak_detection
+                )
+            except ValueError as exc:
+                raise BadRequest(f"项目峰识别配置无效：{exc}") from exc
+        # Directly constructed AppData objects are used by deterministic unit
+        # and scientific tests. AppData.load() validates a real manifest before
+        # constructing this object; a missing field here therefore means there
+        # is no artifact to adapt, so use the one active standard.
+        return require_active_lif_peak_detection()
+
     @classmethod
     def load(cls, project: ProjectPaths | None = None) -> "AppData":
         project = project or ProjectPaths.from_args()
-        manifest_was_missing = False
         manifest = read_project_manifest(project.project_dir)
-        if manifest is None:
-            manifest_was_missing = True
+        peak_detection = lif_peak_detection_from_manifest(manifest)
         validate_project_manifest_against_files(project.project_dir, manifest)
         project = project_with_manifest_paths(project, manifest)
         for path in [project.lif_traces_path, project.lif_peaks_path, project.ms_events_path, project.ms_scan_path]:
@@ -6449,7 +6593,6 @@ class AppData:
 
         lif_traces = pd.read_parquet(project.lif_traces_path).sort_values(["channel", "time_min"]).reset_index(drop=True)
         all_lif_peaks = pd.read_parquet(project.lif_peaks_path)
-        peak_detection = lif_peak_detection_from_manifest(manifest)
         explicit_peak_detection = isinstance(
             (manifest or {}).get("lif_peak_detection"), dict
         )
@@ -6482,7 +6625,7 @@ class AppData:
         assert_no_legacy_annotation_state(project.annotation_db_path)
         annotation_count_before_load = sqlite_annotation_count(project.annotation_db_path)
         db_existed_before_load = project.annotation_db_path.exists()
-        allow_adopt = manifest_was_missing or annotation_count_before_load == 0
+        allow_adopt = annotation_count_before_load == 0
         if allow_adopt:
             validate_sqlite_input_manifest_against_files(project.annotation_db_path, project.project_dir, intermediate_tables)
         binding_status = validate_sqlite_project_binding(
@@ -6677,8 +6820,7 @@ class AppData:
             "calibration_protocol": copy.deepcopy(self.calibration_protocol),
             "post_qc_strategy": copy.deepcopy(self.post_qc_strategy),
             "lif_peak_detection": copy.deepcopy(
-                self.lif_peak_detection
-                or lif_peak_detection_from_manifest(self.manifest)
+                self.active_lif_peak_detection()
             ),
             "cell_event_map": {
                 "available": self.cell_event_map is not None,
@@ -7381,6 +7523,15 @@ class AppData:
     ) -> "AppData | ProjectPaths":
         project_dir = project_dir.expanduser().resolve()
         mode = normalize_raw_input_mode(raw_input_mode)
+        try:
+            # The server owns the single active scientific standard.  Validate
+            # before inspecting inputs or creating staging artifacts so a
+            # forged detector-v1 request is a zero-write failure.
+            lif_peak_detection = require_active_lif_peak_detection(
+                lif_peak_detection
+            )
+        except ValueError as exc:
+            raise BadRequest(f"LIF 峰识别配置无效：{exc}") from exc
         if lif_inputs is None:
             if not (lif_g2_path and lif_r1_path and lif_r2_path):
                 raise BadRequest("必须提供 3 个 LIF 原始文件")
@@ -7503,13 +7654,11 @@ class AppData:
                 post_qc_strategy, acquisition_layout
             )
         try:
-            effective_lif_peak_detection = normalize_lif_peak_detection(
+            effective_lif_peak_detection = require_active_lif_peak_detection(
                 lif_peak_detection
-                if lif_peak_detection is not None
-                else adaptive_lif_peak_detection()
             )
         except ValueError as exc:
-            raise BadRequest(f"LIF 峰检测配置无效: {exc}") from exc
+            raise BadRequest(f"LIF 峰识别配置无效：{exc}") from exc
         effective_annotation_start_min = float(
             DEFAULT_ANNOTATION_START_MIN
             if annotation_start_min is None
@@ -7812,12 +7961,10 @@ class AppData:
                 strategy, self.acquisition_layout
             ),
             "lif_peak_detection": copy.deepcopy(
-                self.lif_peak_detection
-                or lif_peak_detection_from_manifest(self.manifest)
+                self.active_lif_peak_detection()
             ),
             "lif_peak_detection_hash": lif_peak_detection_hash(
-                self.lif_peak_detection
-                or lif_peak_detection_from_manifest(self.manifest)
+                self.active_lif_peak_detection()
             ),
         }
 
@@ -8418,11 +8565,14 @@ class AppData:
                     action="sync_draft_time_model_to_project_config",
                 )
         except Exception as exc:
-            warning = f"项目时间节点已保存，但 draft time model 同步失败: {exc}"
+            warning = (
+                "项目时间节点已保存，但尚未锁定的时间校正结果同步失败："
+                f"{user_facing_error_message(exc)}"
+            )
         if strategy_changed:
             strategy_warning = (
-                "后段 QC 策略已修改；既有人工 QC 标注完整保留为历史记录，"
-                "但不再作为当前策略结果，后段 QC 候选与导出已按新策略重算。"
+                "后段质控巡检设置已修改；既有人工质控记录完整保留为历史记录，"
+                "但不再作为当前设置的结果，后段质控候选与导出已按新设置重算。"
             )
             warning = f"{warning} {strategy_warning}".strip()
         if not proposed_protocol_ready:
@@ -10062,6 +10212,7 @@ class AppData:
         trace_window = pd.concat(trace_parts, ignore_index=True) if trace_parts else pd.DataFrame()
 
         peak_parts = []
+        active_peak_detection = self.active_lif_peak_detection()
         for channel, sub in self.lif_peaks.groupby("channel", sort=False):
             shift_min = self.channel_shift_sec(str(channel), time_mode) / 60.0
             part = sub.copy()
@@ -10069,12 +10220,11 @@ class AppData:
                 part["peak_tier"] = "core"
             if "detector_version" not in part.columns:
                 part["detector_version"] = int(
-                    (self.lif_peak_detection or {}).get("detector_version", 1)
+                    active_peak_detection["detector_version"]
                 )
             if "detector_config_hash" not in part.columns:
                 part["detector_config_hash"] = lif_peak_detection_hash(
-                    self.lif_peak_detection
-                    or lif_peak_detection_from_manifest(self.manifest)
+                    active_peak_detection
                 )
             if not bool(include_weak_lif_peaks):
                 part = automatic_lif_peak_evidence(part).copy()
@@ -10856,6 +11006,28 @@ HTML = r"""<!doctype html>
       height: 28px;
       padding: 0 6px;
     }
+    .detector-config-grid {
+      display: grid;
+      grid-template-columns: 124px minmax(0, 1fr);
+      gap: 8px 12px;
+      align-items: start;
+      color: #475467;
+      font-size: 12px;
+    }
+    .detector-config-grid output {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      user-select: text;
+      line-height: 1.45;
+    }
+    .detector-standard-card {
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+      padding: 9px 11px;
+      background: #f8fafc;
+      color: #344054;
+      line-height: 1.45;
+    }
     .config-save-status {
       min-height: 18px;
       margin-top: 10px;
@@ -11603,8 +11775,8 @@ HTML = r"""<!doctype html>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
       <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
-      <span id="exportHint" class="header-export-hint">主 CSV 仅含 Cell/后段 QC；前段 anchor 留在 SQLite</span>
-      <button id="exportAcceptedCsv" class="header-export-button">导出 Cell/QC 主 CSV</button>
+      <span id="exportHint" class="header-export-hint">主 CSV 仅含细胞与后段质控；前段参考记录留在项目审计库</span>
+      <button id="exportAcceptedCsv" class="header-export-button">导出细胞/质控主 CSV</button>
     </div>
   </header>
 
@@ -11630,30 +11802,30 @@ HTML = r"""<!doctype html>
       <p class="side-title" style="margin-top:18px;">任务阶段</p>
       <div class="stage-tabs">
         <button class="stage-tab active" data-stage="qc_calibration">前段参考校准</button>
-        <button class="stage-tab" data-stage="local_calibration">无标签后段 delta</button>
-        <button class="stage-tab" data-stage="event_annotation">事件标注 / QC 巡检</button>
+        <button class="stage-tab" data-stage="local_calibration">后段时间差校正</button>
+        <button class="stage-tab" data-stage="event_annotation">事件标注 / 质控巡检</button>
       </div>
-      <div id="stageNote" class="stage-note">按项目协议逐段审核前段参考 anchor，用于确认各物理时间轴的 shift-only 校正。</div>
+      <div id="stageNote" class="stage-note">逐段审核前段参考峰，用于确认各组 LIF 信号相对 MS 只需做时间平移。</div>
       <div id="eventFilter" class="segmented" style="display:none;" aria-label="事件类型筛选">
         <button type="button" class="active" data-event-filter="all">全部</button>
-        <button type="button" data-event-filter="qc">QC</button>
+        <button type="button" data-event-filter="qc">质控</button>
         <button type="button" data-event-filter="cell">细胞</button>
       </div>
       <div id="qcRefitPanel" class="manual-box" style="display:none; margin-top:8px;">
-        <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考 anchors 预览重算</button>
+        <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考峰预览重算</button>
         <div id="qcRefitStats" class="empty" style="margin-top:6px;">尚未生成重算预览。</div>
-        <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用 QC 对齐（按物理轴）</button>
+        <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用参考峰时间校正</button>
       </div>
       <div id="localDeltaPanel" class="manual-box" style="display:none; margin-top:8px;">
-        <button id="estimateDelta" class="small-button" style="width:100%;">用无标签峰拓扑估计 MS delta</button>
-        <div id="deltaBaseSummary" class="empty" style="margin-top:6px;">base shift: -</div>
-        <div class="metric"><span>当前 delta</span><strong id="deltaReadout">0.00 sec</strong></div>
+        <button id="estimateDelta" class="small-button" style="width:100%;">用无需身份标签的峰估计 MS 时间差</button>
+        <div id="deltaBaseSummary" class="empty" style="margin-top:6px;">基础时间平移：-</div>
+        <div class="metric"><span>当前 MS 时间差</span><strong id="deltaReadout">0.00 sec</strong></div>
         <input id="deltaSlider" class="delta-slider" type="range" min="-20" max="20" step="0.25" value="0" />
         <div class="row-actions">
           <button id="deltaMinus" class="small-button secondary">-0.25 sec</button>
           <button id="deltaPlus" class="small-button secondary">+0.25 sec</button>
         </div>
-        <button id="freezeDelta" class="small-button" style="width:100%; margin-top:7px;">确认并冻结无标签 delta</button>
+        <button id="freezeDelta" class="small-button" style="width:100%; margin-top:7px;">确认并锁定 MS 时间差</button>
         <div id="deltaStats" class="empty" style="margin-top:6px;">未加载预览。</div>
       </div>
       <p class="side-title" style="margin-top:18px;">轨道</p>
@@ -11664,8 +11836,8 @@ HTML = r"""<!doctype html>
         <p id="baseTimeTitle" class="side-title" style="margin-top:18px;">自动时间校正</p>
         <div class="metric"><span id="modeMetricLabel">模式</span><strong id="modeLabel">-</strong></div>
         <div id="axisShiftMetrics"></div>
-        <div id="msDeltaMetric" class="metric"><span>MS 后段 delta</span><strong id="msDeltaShift">-</strong></div>
-        <div class="metric"><span id="matchMetricLabel">QC anchor 组</span><strong id="matchCount">-</strong></div>
+        <div id="msDeltaMetric" class="metric"><span>MS 后段时间差</span><strong id="msDeltaShift">-</strong></div>
+        <div class="metric"><span id="matchMetricLabel">参考峰组</span><strong id="matchCount">-</strong></div>
       </div>
       <div id="reviewPanel">
         <p class="side-title" style="margin-top:18px;">人工审核</p>
@@ -11681,15 +11853,15 @@ HTML = r"""<!doctype html>
         <button id="acceptWindow" class="small-button" style="width:100%; margin:8px 0 2px;">接受本窗口待审自动候选</button>
         <div id="acceptWindowHint" class="empty" style="margin:0 0 6px;">将接受 0 条</div>
         <div id="reviewHelp" class="empty" style="margin:4px 0 8px;">
-          残差 = MS760 时间 - QC anchor 双 LIF 校正后组合时间，单位 sec；越接近 0 表示时间对齐越好。
+          残差 = MS760 时间减去 LIF 参考峰校正后的组合时间，单位为秒；越接近 0 表示时间对齐越好。
         </div>
         <div id="candidateList" class="candidate-list"></div>
       </div>
       <div id="manualPanel">
-        <p id="manualPanelTitle" class="side-title" style="margin-top:18px;">手动 QC anchor</p>
+        <p id="manualPanelTitle" class="side-title" style="margin-top:18px;">手动参考峰关系</p>
         <div class="manual-box">
           <div id="manualAnnotationKind" class="segmented two" style="display:none;" aria-label="手工标注类型">
-            <button type="button" class="active" data-manual-kind="qc">QC anchor</button>
+            <button type="button" class="active" data-manual-kind="qc">质控参考峰</button>
             <button type="button" data-manual-kind="cell">细胞二元组</button>
           </div>
           <button id="manualMode" class="small-button secondary">选择峰</button>
@@ -11700,7 +11872,7 @@ HTML = r"""<!doctype html>
             <div>MS760: <strong id="manualMS">-</strong></div>
           </div>
           <button id="createManual" class="small-button">建立并接受</button>
-        <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的两个 QC anchor LIF 峰和 MS760 峰。</div>
+        <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的 LIF 参考峰和对应的 MS760 峰。</div>
         </div>
       </div>
     </aside>
@@ -11739,9 +11911,9 @@ HTML = r"""<!doctype html>
             <option value="hidden">隐藏</option>
           </select>
         </label>
-        <label id="showWeakLifPeaksLabel" class="checkbox-row" style="margin:0; white-space:nowrap;" title="weak 峰只供人工复核，不参与自动匹配">
+        <label id="showWeakLifPeaksLabel" class="checkbox-row" style="margin:0; white-space:nowrap;" title="弱候选峰只供人工复核，不参与自动匹配">
           <input id="showWeakLifPeaks" type="checkbox" />
-          显示 weak 弱峰
+          显示弱候选峰（仅人工细胞配对）
         </label>
         <button id="go">显示窗口</button>
       </div>
@@ -11759,7 +11931,7 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="importTitle" class="modal-title">新建标注项目</p>
-          <div class="empty">配置 2–4 个 LIF 通道的科学角色；共享时间轴由检测器自动设置。再逐段确认前段参考窗口，并独立配置后段 QC。</div>
+          <div class="empty">配置 2–4 个 LIF 通道的样本含义与信号颜色；软件会自动安排共享采集时间基准。随后核对前段参考窗口，并单独选择是否进行后段质控巡检。</div>
         </div>
         <button id="closeImportProject" class="small-button secondary">关闭</button>
       </div>
@@ -11767,11 +11939,11 @@ HTML = r"""<!doctype html>
         <summary>可选：实验配置模板</summary>
         <div class="project-template-body">
           <button id="applyHsc1Preset" type="button" class="small-button secondary">应用 HSC1 模板</button>
-          <span>HSC1：G1/LSK → G2/Lin−，自动共享 Green 时间轴；事件起点 24 min；不进行后段 QC 巡检。参考窗口仍须由你确认。</span>
+          <span>HSC1：G1/LSK → G2/Lin−，两者自动共享绿色信号时间轴；事件起点 24 min；不进行后段质控巡检。参考窗口仍须由你确认。</span>
         </div>
       </details>
       <div class="import-grid">
-        <label>Raw 数据管理</label>
+        <label>原始文件保存方式</label>
         <div class="mode-options">
           <label class="mode-option"><input type="radio" name="rawInputMode" value="external_reference" checked /> 外部引用</label>
           <label class="mode-option"><input type="radio" name="rawInputMode" value="copy_into_project" /> 复制到项目</label>
@@ -11786,8 +11958,8 @@ HTML = r"""<!doctype html>
           <div class="lif-input-head" aria-hidden="true">
             <span>输入</span>
             <span>通道<small>G1–R2</small></span>
-            <span>检测器<small>Green / Red</small></span>
-            <span>采集时间基准<small>由检测器自动设置</small></span>
+            <span>信号颜色<small>绿色 / 红色</small></span>
+            <span>采集时间基准<small>按信号颜色自动设置</small></span>
             <span>样本标签<small>细胞用途必填</small></span>
             <span>科学角色<small>细胞标注</small></span>
             <span>LIF 原始文件</span>
@@ -11812,13 +11984,10 @@ HTML = r"""<!doctype html>
           </div>
           <div class="coordinate-source-help">必须包含 scan_start_time、UMAP1、UMAP2；CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
         </div>
-        <label for="importLifPeakDetectorVersion">LIF 峰检测</label>
-        <div>
-          <select id="importLifPeakDetectorVersion">
-            <option value="2" selected>v2：core + weak 自适应（推荐）</option>
-            <option value="1">v1：复现 v0.3 / 旧 V3 固定阈值</option>
-          </select>
-          <div class="coordinate-source-help">v2 保留高置信 core 峰，并补充局部稳健噪声与峰形筛选的 weak 峰。弱峰仅供人工复核，不参与自动匹配或时间模型训练；人工确认配对后可以导出到主 CSV。</div>
+        <span>LIF 峰识别方式</span>
+        <div id="importLifPeakDetectorStandard" class="detector-standard-card">
+          <strong>自适应双层峰识别（自动配置）</strong>
+          <div class="coordinate-source-help">高置信峰是自动流程唯一使用的证据；弱候选峰结合局部噪声与峰形筛选，仅供人工细胞配对，不参与自动校准、质量巡检、时间差估计、候选生成或时间模型训练。人工明确配对并接受后才可导出。</div>
         </div>
       </div>
       <section class="import-section" aria-labelledby="calibrationProtocolTitle">
@@ -11829,34 +11998,34 @@ HTML = r"""<!doctype html>
             <button id="addImportSegment" type="button" class="small-button secondary">＋ 添加参考段</button>
           </span>
         </div>
-        <div class="qc-anchor-rule">每段按时间顺序填写；通道可为 Green-only、Red-only 或 Red+Green。可先创建项目并把建议边界保留为待确认草稿；确认边界前（须全部确认）只能查看原始峰形，前段校准及其下游阶段保持锁定。</div>
+        <div class="qc-anchor-rule">每段按时间顺序填写；可选择仅绿色通道、仅红色通道或红绿联合参考。可以先创建草稿并查看原始峰形；所有边界确认前，时间校准及后续阶段保持锁定。</div>
         <div id="importSuggestionStatus" class="qc-anchor-rule">尚未分析原始峰形。</div>
         <div id="importCalibrationSegments" class="protocol-editor"></div>
       </section>
       <section class="import-section" aria-labelledby="postQcPolicyTitle">
-        <div class="import-section-title"><span id="postQcPolicyTitle">事件起点与后段 QC 策略</span></div>
+        <div class="import-section-title"><span id="postQcPolicyTitle">事件起点与后段质控巡检</span></div>
         <div class="policy-fields">
           <label>事件标注起点 (min)
             <input id="importAnnotationStart" type="number" min="0" step="0.1" value="40" />
           </label>
-          <label>无标签 delta 取证范围 (min)
+          <label>自动估计时间差的范围 (min)
             <input id="importSeedWindow" type="number" min="0.1" step="0.5" value="2.5" />
           </label>
-          <label>后段 QC 策略
+          <label>后段质控巡检方式
             <select id="importPostQcMode">
-              <option value="disabled" selected>disabled（不巡检）</option>
-              <option value="signature">signature（按通道特征）</option>
-              <option value="scheduled_windows">scheduled_windows（定时窗口）</option>
+              <option value="disabled" selected>不进行后段巡检</option>
+              <option value="signature">按参考通道巡检</option>
+              <option value="scheduled_windows">按指定时间窗口巡检</option>
             </select>
           </label>
-          <label id="importPostQcChannelsLabel">后段 QC 通道（signature）
-            <select id="importPostQcChannels" multiple size="2" aria-label="后段 QC signature 参考通道"></select>
+          <label id="importPostQcChannelsLabel">后段巡检参考通道
+            <select id="importPostQcChannels" multiple size="2" aria-label="后段巡检参考通道"></select>
           </label>
         </div>
         <div id="importScheduledQcPanel" style="display:none; margin-top:8px;">
           <div class="import-section-title">
-            <span>定时 QC 窗口</span>
-            <button id="addImportScheduledQc" type="button" class="small-button secondary">＋ 添加 QC 窗口</button>
+            <span>指定时间巡检窗口</span>
+            <button id="addImportScheduledQc" type="button" class="small-button secondary">＋ 添加巡检窗口</button>
           </div>
           <div id="importScheduledQcWindows" class="protocol-editor"></div>
         </div>
@@ -11872,7 +12041,7 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="openProjectTitle" class="modal-title">打开已有项目</p>
-          <div class="empty">选择包含中间表和 annotation.sqlite 的项目目录；如果存在 lifms_project.json 会优先作为项目说明。</div>
+          <div class="empty">当前版本只打开使用现行峰识别标准建立的项目。旧标准项目不会被修改；请在新的空目录中重新选择原始输入并重跑预处理。</div>
         </div>
         <button id="closeOpenProject" class="small-button secondary">关闭</button>
       </div>
@@ -11883,8 +12052,9 @@ HTML = r"""<!doctype html>
           <button class="small-button secondary path-picker-button" aria-label="选择已有项目目录" data-picker-target="openProjectDir" data-picker-kind="directory" data-picker-title="选择已有项目目录">选择</button>
         </div>
       </div>
-      <div id="openProjectHint" class="empty" style="margin-top:10px;">项目目录应包含 data/interim/v3 和 annotation_app/annotations/annotation.sqlite。</div>
+      <div id="openProjectHint" class="empty" style="margin-top:10px;">项目目录应包含完整的项目说明、中间表和标注数据库；旧标准项目的人工标注不会自动迁移。</div>
       <div class="modal-actions">
+        <button id="openAsNewStandardProject" class="small-button secondary">改用现行标准新建项目</button>
         <button id="runOpenProject" class="small-button">打开项目</button>
       </div>
     </div>
@@ -11894,40 +12064,39 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="projectConfigTitle" class="modal-title">配置</p>
-          <div class="empty">项目级校准协议、事件起点与后段 QC 策略。修改已冻结模型所依赖的参数时会明确要求确认失效。</div>
+          <div class="empty">设置前段参考窗口、事件起点与后段质控巡检。修改已锁定时间模型所依赖的参数时，软件会先说明哪些结果需要重算。</div>
         </div>
         <button id="closeConfigProject" class="small-button secondary">关闭</button>
       </div>
       <div id="timeConfigPanel" class="config-grid">
         <span>前段协议结束(min)</span><input id="cfgQcEnd" type="number" step="0.1" />
         <span>事件标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
-        <span>后段预校准取证范围(min)（无标签 delta）</span><input id="cfgSeedWindow" type="number" step="0.5" />
+        <span>自动估计时间差的范围(min)</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
       <section class="import-section">
-        <div class="import-section-title"><span>LIF 峰检测（预处理绑定，只读）</span></div>
-        <div class="config-grid">
-          <span>检测器版本</span><output id="cfgLifPeakDetectorVersion">-</output>
-          <span>科学参数</span><output id="cfgLifPeakDetectorDetails">-</output>
-          <span>配置 hash</span><output id="cfgLifPeakDetectorHash">-</output>
+        <div class="import-section-title"><span>LIF 峰识别规则（项目创建时固定）</span></div>
+        <div class="detector-config-grid">
+          <span>识别方式</span><output id="cfgLifPeakStandard">-</output>
+          <span>识别规则</span><output id="cfgLifPeakDetectorDetails">-</output>
         </div>
-        <div class="qc-anchor-rule">如需切换 v1/v2，请新建项目或项目副本并重跑中间表；本页不会让新 detector 配置静默套用旧峰表。</div>
+        <div class="qc-anchor-rule">识别规则与项目中间表固定绑定，本页只读，不会把其他规则静默套用到已有峰表。技术审计信息保存在项目说明文件中。</div>
       </section>
       <section id="cfgProtocolPanel" class="import-section">
-        <div class="import-section-title"><span>分段 calibration_protocol</span></div>
+        <div class="import-section-title"><span>前段分段参考窗口</span></div>
         <div class="qc-anchor-rule">通道与顺序保持不变；可先保存待确认边界。全部勾选“边界已确认”后，才会计算前段校准并解锁后段阶段。</div>
         <div id="cfgCalibrationSegments" class="protocol-editor"></div>
       </section>
       <section id="cfgPostQcPanel" class="import-section">
-        <div class="import-section-title"><span>后段 QC 策略（与前段参考段独立）</span><button id="cfgAddScheduledQc" type="button" class="small-button secondary">＋ 添加定时窗口</button></div>
+        <div class="import-section-title"><span>后段质控巡检（与前段参考段独立）</span><button id="cfgAddScheduledQc" type="button" class="small-button secondary">＋ 添加巡检窗口</button></div>
         <div class="policy-fields">
           <label>策略
             <select id="cfgPostQcMode">
-              <option value="disabled">disabled</option>
-              <option value="signature">signature</option>
-              <option value="scheduled_windows">scheduled_windows</option>
+              <option value="disabled">不进行后段巡检</option>
+              <option value="signature">按参考通道巡检</option>
+              <option value="scheduled_windows">按指定时间窗口巡检</option>
             </select>
           </label>
-          <label id="cfgPostQcChannelsLabel">signature 通道
+          <label id="cfgPostQcChannelsLabel">巡检参考通道
             <select id="cfgPostQcChannels" multiple size="2"></select>
           </label>
         </div>
@@ -11958,7 +12127,7 @@ HTML = r"""<!doctype html>
       </div>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
-        <button id="saveConfig" class="small-button">保存项目协议与时间配置</button>
+        <button id="saveConfig" class="small-button">保存项目配置</button>
       </div>
     </div>
   </div>
@@ -12187,7 +12356,7 @@ HTML = r"""<!doctype html>
       const cfg = state.current?.project_config || state.meta?.project_config || {};
       const seedWidth = Number(cfg.local_delta_seed_window_min || 2.5);
       el('windowPolicy').textContent = state.stage === 'local_calibration'
-        ? `浏览宽度可在 0.25–15 min 内调整；无标签 delta 取证范围仍由项目配置决定（当前 ${fmt(seedWidth, 2)} min）。边界额外载入 ±0.08 min。`
+        ? `浏览宽度可在 0.25–15 min 内调整；自动估计 MS 时间差的取证范围仍由项目配置决定（当前 ${fmt(seedWidth, 2)} min）。边界额外载入 ±0.08 min。`
         : '浏览宽度可在 0.25–15 min 内调整；边界额外载入 ±0.08 min，各轨道刻度和峰旁数字仍为原始时间(min)。';
     }
 
@@ -12289,15 +12458,52 @@ HTML = r"""<!doctype html>
       return { text, filename };
     }
 
+    function user_facing_error_message(value) {
+      const raw = String(value || '').trim();
+      if (!raw) return '操作未完成，请检查当前页面中的设置后重试。';
+      if (/lif_peak_detection|detector(?:_config_hash|_version)?|peak_tier|\bv(?:0\.3|1|2)\b/i.test(raw)) {
+        return '项目的峰识别设置无效或不完整。请保留原项目不变，并在新的空目录中重新选择原始 LIF、MS 和事件坐标 CSV。';
+      }
+      if (/preview_hash|protocol_hash|\bhash\b/i.test(raw)) {
+        return '当前预览或项目设置已经变化，请重新打开对应步骤并生成新的预览。';
+      }
+      const replacements = [
+        [/post_qc_strategy/gi, '后段质控巡检设置'],
+        [/calibration_protocol/gi, '前段参考设置'],
+        [/qc_anchor_channels/gi, '前段参考通道'],
+        [/scheduled_windows/gi, '按指定时间窗口巡检'],
+        [/signature/gi, '按参考通道巡检'],
+        [/disabled/gi, '不进行后段巡检'],
+        [/green_axis/gi, '绿色信号时间轴'],
+        [/red_axis/gi, '红色信号时间轴'],
+        [/lif_anchor_peak_ids/gi, 'LIF 参考峰'],
+        [/anchor_peak_id/gi, '参考峰'],
+        [/frozen time-axis model/gi, '已锁定的时间校正结果'],
+        [/frozen time model/gi, '已锁定的时间校正结果'],
+        [/draft time model/gi, '尚未锁定的时间校正结果'],
+        [/time[-_]axis/gi, '采集时间基准'],
+        [/\bfrozen\b/gi, '已锁定'],
+        [/\bdraft\b/gi, '草稿'],
+        [/\banchor\b/gi, '参考峰'],
+        [/\bdelta\b/gi, 'MS 时间差'],
+      ];
+      let translated = raw;
+      replacements.forEach(([pattern, label]) => { translated = translated.replace(pattern, label); });
+      if (/detector|\bhash\b|calibration_protocol|post_qc_strategy|qc_anchor_channels|signature|scheduled_windows|disabled|green_axis|red_axis|preview_hash|\banchor\b|\bdelta\b|\bfrozen\b|\bdraft\b|time[-_]axis|peak_tier|\bv(?:0\.3|1|2)\b/i.test(translated)) {
+        return '操作未完成。请检查当前页面中的项目设置和所选记录；如果刚修改过设置，请重新生成预览后再试。';
+      }
+      return translated;
+    }
+
     async function responseErrorMessage(res) {
       const text = await res.text();
       try {
         const parsed = JSON.parse(text);
-        if (parsed && parsed.error) return parsed.error;
+        if (parsed && parsed.error) return user_facing_error_message(parsed.error);
       } catch (err) {
         // Fall back to raw response text below.
       }
-      return text || `${res.status} ${res.statusText}`;
+      return user_facing_error_message(text || `${res.status} ${res.statusText}`);
     }
 
     function syncBootstrapMode() {
@@ -12331,8 +12537,8 @@ HTML = r"""<!doctype html>
       weakToggle.checked = false;
       weakToggle.disabled = !weakAvailable;
       el('showWeakLifPeaksLabel').title = weakAvailable
-        ? 'weak 峰只供人工复核；仅在事件标注的细胞手工配对模式可点击'
-        : '当前 v1 项目没有 weak 峰；如需 v2，请新建项目或项目副本并重跑中间表';
+        ? '弱候选峰只供人工复核；仅在事件标注的细胞手工配对模式可点击'
+        : '当前项目的峰识别配置异常；请停止标注并检查项目文件';
       applyStageWindowWidth();
       state.selectedCandidateId = null;
       state.previewDeltaSec = null;
@@ -12381,9 +12587,9 @@ HTML = r"""<!doctype html>
 
     function physicalTimeAxisLabel(detector) {
       const normalized = String(detector || '').trim().toLowerCase();
-      if (normalized === 'green') return 'Green 共享时间轴（自动）';
-      if (normalized === 'red') return 'Red 共享时间轴（自动）';
-      return '选择检测器后自动设置';
+      if (normalized === 'green') return '绿色信号共享时间轴（自动）';
+      if (normalized === 'red') return '红色信号共享时间轴（自动）';
+      return '选择信号颜色后自动设置';
     }
 
     function newImportLifRow(initial = {}) {
@@ -12429,11 +12635,11 @@ HTML = r"""<!doctype html>
             </select>
           </div>
           <div class="lif-field lif-detector">
-            <span class="lif-mobile-label">检测器</span>
-            <select data-import-field="detector" aria-label="LIF ${index + 1} 检测器">
+            <span class="lif-mobile-label">信号颜色</span>
+            <select data-import-field="detector" aria-label="LIF ${index + 1} 信号颜色">
               <option value="">选择</option>
-              <option value="green"${row.detector === 'green' ? ' selected' : ''}>Green</option>
-              <option value="red"${row.detector === 'red' ? ' selected' : ''}>Red</option>
+              <option value="green"${row.detector === 'green' ? ' selected' : ''}>绿色</option>
+              <option value="red"${row.detector === 'red' ? ' selected' : ''}>红色</option>
             </select>
           </div>
           <div class="lif-field lif-axis">
@@ -12770,7 +12976,6 @@ HTML = r"""<!doctype html>
         el('importAnnotationStart').value = '40';
         el('importSeedWindow').value = '2.5';
         el('importPostQcMode').value = 'disabled';
-        el('importLifPeakDetectorVersion').value = '2';
         const templateOptions = el('importProjectTemplates');
         if (templateOptions) templateOptions.open = false;
         renderImportLifRows();
@@ -12788,7 +12993,7 @@ HTML = r"""<!doctype html>
       if (open) {
         const projectDir = state.meta?.project?.project_dir || '';
         el('openProjectDir').placeholder = projectDir || '/path/to/existing_project';
-        el('openProjectHint').textContent = '项目目录应包含 data/interim/v3 和 annotation_app/annotations/annotation.sqlite。';
+        el('openProjectHint').textContent = '只支持使用现行峰识别标准建立的项目。旧标准项目不会被修改；请改用新的空目录重建。';
       }
       setModalVisibility('openProjectModal', open, 'openProjectDir');
     }
@@ -12952,8 +13157,32 @@ HTML = r"""<!doctype html>
     }
 
     function updateExportHint() {
-      el('exportHint').textContent = '主 CSV 仅含 Cell/后段 QC；前段 anchor 留在 SQLite';
+      el('exportHint').textContent = '主 CSV 仅含细胞与后段质控；前段参考记录留在项目审计库';
     }
+
+    function postQcModeLabel(mode) {
+      if (mode === 'disabled') return '不进行后段巡检';
+      if (mode === 'signature') return '按参考通道巡检';
+      if (mode === 'scheduled_windows') return '按指定时间窗口巡检';
+      return '后段巡检配置';
+    }
+
+    function physicalAxisName(axis) {
+      const normalized = String(axis || '').trim().toLowerCase();
+      if (normalized === 'green_axis') return '绿色信号时间轴';
+      if (normalized === 'red_axis') return '红色信号时间轴';
+      return '共享信号时间轴';
+    }
+
+    function referenceModeLabel(mode) {
+      const normalized = String(mode || '').trim().toLowerCase();
+      if (normalized === 'green_only') return '仅绿色通道';
+      if (normalized === 'red_only') return '仅红色通道';
+      if (normalized === 'red_green') return '红绿联合';
+      return '组合参考';
+    }
+
+    function calibrationSegmentDisplayName(segment) { const label = String(segment?.population_label || '').trim(); return label || '未命名参考段'; }
 
     function stageNote() {
       const tm = state.current?.time_model || state.meta?.time_model || {};
@@ -12963,24 +13192,24 @@ HTML = r"""<!doctype html>
       if (!calibrationBoundariesConfirmed()) {
         return '参考段边界待确认：当前只显示原始峰形。请在“配置”中核对并确认全部边界，随后才会计算前段校准并解锁后段阶段。';
       }
-      if (state.stage === 'local_calibration') return '标注起点后的未标注峰拓扑预校准：只估计 MS 后段局部平移，不产生 annotation。';
+      if (state.stage === 'local_calibration') return '使用标注起点后的无身份标签峰，只估计 MS 的局部时间差；此步骤不会写入人工标注。';
       if (state.stage === 'event_annotation') {
         const strategy = cfg.post_qc_strategy || {};
         const policy = strategy.mode === 'disabled'
-          ? '后段 QC 已禁用，只显示细胞候选'
-          : `后段 QC=${strategy.mode}（${(strategy.reference_channels || []).join('/') || '按窗口'}）`;
+          ? '不进行后段巡检，只显示细胞候选'
+          : `${postQcModeLabel(strategy.mode)}（${(strategy.reference_channels || []).join('/') || '按窗口设置'}）`;
         return frozen
-        ? `同一阶段审核 map 白名单内的事件；${policy}；跨通道命中同一 MS event 时必须人工仲裁。`
-        : '请先在“后段局部校正”中冻结 delta，再进入事件标注。';
+        ? `审核事件坐标表范围内的事件；${policy}；多个通道指向同一 MS 事件时必须人工选择唯一关系。`
+        : '请先在“后段时间差校正”中确认并锁定 MS 时间差，再进入事件标注。';
       }
       const segment = activeCalibrationSegment();
       if (!segment) return '当前项目未找到可显示的校准参考段。';
-      return `参考段 #${segment.order} ${segment.population_label || segment.segment_id}：${fmt(segment.start_min, 2)}-${fmt(segment.end_min, 2)} min；审核 ${anchors.join('/')} 与 MS 的 shift-only 对齐。`;
+      return `参考段 #${segment.order} ${calibrationSegmentDisplayName(segment)}：${fmt(segment.start_min, 2)}-${fmt(segment.end_min, 2)} min；审核 ${anchors.join('/')} 与 MS 是否可通过单一时间平移对齐。`;
     }
 
     function timeModelDisplayName(tm) {
       if (tm.status === 'calibration_boundaries_unconfirmed') return '边界待确认';
-      const status = tm.status === 'frozen' ? '冻结' : (tm.status === 'exploratory' ? '探索' : '草稿');
+      const status = tm.status === 'frozen' ? '已锁定' : (tm.status === 'exploratory' ? '试算' : '草稿');
       const delta = Number(tm.ms_local_delta_sec || 0);
       return `${status} ${delta >= 0 ? '+' : ''}${fmt(delta, 2)}s`;
     }
@@ -13003,7 +13232,7 @@ HTML = r"""<!doctype html>
         if (!Number.isFinite(Number(value)) && axis === 'green_axis') value = alignment.green_to_ms_shift_sec;
         if (!Number.isFinite(Number(value)) && axis === 'red_axis') value = alignment.red_to_ms_shift_sec;
         const display = !calibrationBlocked && Number.isFinite(Number(value)) ? `${fmt(Number(value), 2)} sec` : '未估计';
-        return `<div class="metric" data-physical-axis="${escapeText(axis)}"><span>${escapeText(axis)} ${escapeText(suffix)}</span><strong>${escapeText(display)}</strong></div>`;
+        return `<div class="metric" data-physical-axis="${escapeText(axis)}"><span>${escapeText(physicalAxisName(axis))} ${escapeText(suffix)}</span><strong>${escapeText(display)}</strong></div>`;
       }).join('');
     }
 
@@ -13021,21 +13250,21 @@ HTML = r"""<!doctype html>
           ? (w.time_mode === 'aligned' ? '校正后' : '原始')
           : '仅原始浏览';
         el('msDeltaMetric').style.display = 'none';
-        el('matchMetricLabel').textContent = 'QC anchor 组';
+        el('matchMetricLabel').textContent = '参考峰组';
         el('matchCount').textContent = w.time_mode === 'aligned' ? `${visibleGroups}/${totalGroups}` : '-';
         return;
       }
-      renderAxisShiftMetrics(w, physicalAxes, 'base shift');
+      renderAxisShiftMetrics(w, physicalAxes, '基础平移');
       el('baseTimeTitle').textContent = '当前时间模型';
       el('modeMetricLabel').textContent = '状态';
       el('modeLabel').textContent = tm.status === 'calibration_boundaries_unconfirmed'
         ? '边界待确认'
-        : (tm.status === 'frozen' ? '已冻结' : 'draft');
+        : (tm.status === 'frozen' ? '已锁定' : '草稿');
       el('msDeltaMetric').style.display = 'grid';
       el('msDeltaShift').textContent = `${fmt(tm.ms_local_delta_sec || 0, 2)} sec`;
       el('matchMetricLabel').textContent = '时间模型';
       el('matchCount').textContent = timeModelDisplayName(tm);
-      el('matchCount').title = String(tm.time_model_version || '');
+      el('matchCount').title = '前段基础平移与 MS 后段时间差的组合结果';
     }
 
     function stageCounts() {
@@ -13247,7 +13476,7 @@ HTML = r"""<!doctype html>
       el('acceptWindow').textContent = `批量接受唯一匹配（${n}）`;
       if (state.stage === 'event_annotation' || state.stage === 'local_calibration') {
         if (state.stage === 'local_calibration') {
-          el('acceptWindowHint').textContent = '局部校正只做 preview，不写入 annotation';
+          el('acceptWindowHint').textContent = '后段时间差校正只生成预览，不会写入人工标注';
         } else {
           el('acceptWindowHint').textContent = '事件标注阶段的 QC / 细胞候选均需逐条确认';
         }
@@ -13266,24 +13495,16 @@ HTML = r"""<!doctype html>
       el('cfgAnnotationStart').value = fmt(cfg.annotation_start_min ?? 40.0, 1);
       el('cfgSeedWindow').value = fmt(cfg.local_delta_seed_window_min ?? 2.5, 1);
       const detector = cfg.lif_peak_detection || state.meta?.lif_peak_detection || {};
-      const detectorVersion = Number(detector.detector_version || 1);
-      el('cfgLifPeakDetectorVersion').textContent = detectorVersion === 2
-        ? 'v2 · core + weak（weak 仅人工复核）'
-        : 'v1 · 旧 V3 固定阈值兼容模式';
+      el('cfgLifPeakStandard').textContent = '自适应双层峰识别';
       const core = detector.core || {};
       const weak = detector.weak || {};
-      el('cfgLifPeakDetectorDetails').textContent = detectorVersion === 2
-        ? `${detector.profile || 'core_weak'}；core prominence ≥ ${fmt(core.prominence_snr_min, 2)}σ；weak prominence ≥ ${fmt(weak.prominence_snr_min, 2)}σ；峰形相似度 ≥ ${fmt(weak.template_similarity_min, 2)}；局部噪声窗 ${fmt(weak.local_noise_block_sec, 1)} s；至少 ${weak.min_core_template_peaks ?? '-'} 个 core 且 ${fmt(weak.min_core_rate_per_min, 2)} core/min`
-        : `${detector.profile || 'legacy_v3_fixed'}；core prominence ≥ ${fmt(core.prominence_snr_min, 2)}σ；不生成 weak`;
-      el('cfgLifPeakDetectorHash').textContent = String(
-        cfg.lif_peak_detection_hash || '-'
-      );
+      el('cfgLifPeakDetectorDetails').textContent = `高置信峰阈值 ≥ ${fmt(core.prominence_snr_min, 2)}σ；弱候选峰阈值 ≥ ${fmt(weak.prominence_snr_min, 2)}σ；峰形相似度 ≥ ${fmt(weak.template_similarity_min, 2)}；局部噪声窗口 ${fmt(weak.local_noise_block_sec, 1)} s；至少 ${weak.min_core_template_peaks ?? '-'} 个高置信峰且平均 ${fmt(weak.min_core_rate_per_min, 2)} 个/分钟；弱候选峰仅供人工细胞配对，不参与自动流程`;
       const protocol = cfg.calibration_protocol || null;
       const legacy = Boolean(protocol?.compatibility_mode);
       el('cfgQcEnd').disabled = true;
       el('cfgQcEnd').title = legacy
-        ? '旧项目 v0.3 只读兼容边界；如需新协议，请新建项目副本并显式配置。'
-        : '由最后一个 calibration segment 的已确认结束边界自动计算。';
+        ? '此项目的参考窗口按原规则只读显示；如需改变结构，请用原始输入在新目录中重建项目。'
+        : '由最后一个已确认参考段的结束时间自动计算。';
       el('cfgProtocolPanel').style.display = protocol ? 'block' : 'none';
       if (resetDraft || !state.configProtocolDraft) {
         state.configProtocolDraft = protocol ? JSON.parse(JSON.stringify(protocol)) : null;
@@ -13301,15 +13522,15 @@ HTML = r"""<!doctype html>
       if (!box || !protocol) return;
       const legacy = Boolean(protocol.compatibility_mode);
       const legacyNotice = legacy
-        ? '<div class="qc-anchor-rule">旧项目 v0.3 协议以只读兼容方式显示；不会静默迁移或写回 calibration_protocol。</div>'
+        ? '<div class="qc-anchor-rule">此项目的前段参考窗口按原规则只读显示；软件不会静默改写。</div>'
         : '';
       box.innerHTML = legacyNotice + (protocol.segments || []).map((segment, index) => `
         <div class="protocol-row" data-cfg-segment-index="${index}">
           <strong>#${segment.order}</strong>
-          <span><strong>${escapeText(segment.population_label || segment.segment_id)}</strong><br><small>${escapeText((segment.reference_channels || []).join('/'))}</small></span>
-          <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(segment.segment_id)} 开始时间"${legacy ? ' disabled' : ''} /></label>
-          <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(segment.segment_id)} 结束时间"${legacy ? ' disabled' : ''} /></label>
-          <span>${escapeText(segment.reference_mode || '')} · ${(segment.time_axes || []).map(escapeText).join('/')}</span>
+          <span><strong>${escapeText(calibrationSegmentDisplayName(segment))}</strong><br><small>${escapeText((segment.reference_channels || []).join('/'))}</small></span>
+          <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(calibrationSegmentDisplayName(segment))} 开始时间"${legacy ? ' disabled' : ''} /></label>
+          <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(calibrationSegmentDisplayName(segment))} 结束时间"${legacy ? ' disabled' : ''} /></label>
+          <span>${escapeText(referenceModeLabel(segment.reference_mode))} · ${(segment.time_axes || []).map(axis => escapeText(physicalAxisName(axis))).join('/')}</span>
           <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
           <span></span>
         </div>
@@ -13356,13 +13577,23 @@ HTML = r"""<!doctype html>
       const activeDelta = Number(tm.ms_local_delta_sec || 0);
       const displayDelta = state.previewDeltaSec === null ? activeDelta : Number(state.previewDeltaSec);
       const previewChanged = Math.abs(displayDelta - activeDelta) > 1e-9;
-      const statusLabel = tm.status === 'frozen' && previewChanged ? '预览' : (tm.status || 'draft');
+      const statusLabel = tm.status === 'frozen' && previewChanged
+        ? '预览'
+        : (tm.status === 'frozen' ? '已锁定' : '草稿');
       el('deltaReadout').textContent = `${fmt(displayDelta, 2)} sec (${escapeText(statusLabel)})`;
-      el('freezeDelta').textContent = tm.status === 'frozen' ? (previewChanged ? '重新冻结' : '已冻结') : '冻结 delta';
+      el('freezeDelta').textContent = tm.status === 'frozen' ? (previewChanged ? '重新锁定时间差' : '时间差已锁定') : '锁定 MS 时间差';
       el('freezeDelta').disabled = tm.status === 'frozen' && !previewChanged;
       const align = state.current?.alignment || state.meta?.alignment || {};
-      const axisSummary = Object.entries(align.axis_shifts_sec || {}).map(([axis, shift]) => `${axis} ${fmt(shift, 2)} sec`).join('；') || `green_axis ${fmt(align.green_to_ms_shift_sec, 2)} sec；red_axis ${fmt(align.red_to_ms_shift_sec, 2)} sec`;
-      el('deltaBaseSummary').textContent = `base shift: ${axisSummary}；MS 后段 delta 单独调节`;
+      const configuredAxes = configuredPhysicalAxes();
+      const fallbackShifts = configuredAxes.map(axis => {
+        const shift = axis === 'green_axis' ? align.green_to_ms_shift_sec : align.red_to_ms_shift_sec;
+        return [axis, shift];
+      });
+      const shiftEntries = Object.entries(align.axis_shifts_sec || {});
+      const axisSummary = (shiftEntries.length ? shiftEntries : fallbackShifts)
+        .map(([axis, shift]) => `${physicalAxisName(axis)} ${fmt(shift, 2)} sec`)
+        .join('；') || '尚未估计';
+      el('deltaBaseSummary').textContent = `基础时间平移：${axisSummary}；MS 后段时间差可单独调节`;
       el('deltaSlider').value = String(Math.max(-20, Math.min(20, displayDelta)));
       const p = state.localDeltaPreview;
       if (!p) {
@@ -13374,13 +13605,13 @@ HTML = r"""<!doctype html>
         : (p.recommendation_status === 'insufficient_evidence' ? '自动建议证据不足' : '');
       el('deltaStats').textContent = [
         `证据 ${p.evidence_count || 0} 条`,
-        p.complete_anchor_set_count !== undefined ? `完整 anchor ${p.complete_anchor_set_count || 0} 条` : '',
+        p.complete_anchor_set_count !== undefined ? `完整参考峰组 ${p.complete_anchor_set_count || 0} 条` : '',
         `冲突 ${p.conflict_count || 0}`,
         `median |残差| ${fmt(p.median_abs_residual_sec, 3)} sec`,
         `p90 |残差| ${fmt(p.p90_abs_residual_sec, 3)} sec`,
         `取证范围 ${fmt(p.seed_start_min, 2)}-${fmt(p.seed_end_min, 2)} min`,
         recommendationText,
-        previewChanged ? '未冻结预览，不写入数据库' : '当前已保存'
+        previewChanged ? '尚未锁定，仅为预览' : '当前结果已保存'
       ].filter(Boolean).join('；');
     }
 
@@ -13404,20 +13635,20 @@ HTML = r"""<!doctype html>
       button.disabled = !preview || state.actionBusy;
       if (preview) {
         const axes = Object.entries(preview.axes || {}).map(([axis, details]) => (
-          `${axis}: ${fmt(details.previous_shift_sec, 2)} → ${fmt(details.shift_sec, 2)} sec `
+          `${physicalAxisName(axis)}：${fmt(details.previous_shift_sec, 2)} → ${fmt(details.shift_sec, 2)} sec `
           + `(${details.inlier_count || 0}/${details.evidence_count || 0} 条)`
         ));
         el('qcRefitStats').textContent = [
           ...axes,
-          `使用 ${preview.used_annotation_count || 0} 条 accepted annotation`,
+          `使用 ${preview.used_annotation_count || 0} 条已接受人工记录`,
           `冲突 ${preview.conflict_count || 0} 条`,
           '预览尚未应用'
         ].join('；');
         return;
       }
       if (active) {
-        const axes = Object.entries(active.axis_shifts_sec || {}).map(([axis, shift]) => `${axis} ${fmt(shift, 2)} sec`);
-        el('qcRefitStats').textContent = `已应用 ${active.model_id || 'QC 对齐模型'}：${axes.join('；')}`;
+        const axes = Object.entries(active.axis_shifts_sec || {}).map(([axis, shift]) => `${physicalAxisName(axis)} ${fmt(shift, 2)} sec`);
+        el('qcRefitStats').textContent = `已应用参考峰时间校正：${axes.join('；')}`;
         return;
       }
       el('qcRefitStats').textContent = '尚未生成重算预览。';
@@ -13455,26 +13686,26 @@ HTML = r"""<!doctype html>
       el('eventFilter').style.display = eventAnnotation ? 'grid' : 'none';
       el('manualAnnotationKind').style.display = eventAnnotation ? 'grid' : 'none';
       el('manualLifRow').style.display = cellMode ? 'block' : 'none';
-      el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动 QC anchor';
+      el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动参考峰关系';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
         if (button.dataset.eventFilter === 'qc') {
           button.disabled = !postQcEnabled;
-          button.title = postQcEnabled ? `后段 QC 策略：${postQcMode}` : '本项目后段 QC 策略为 disabled';
+          button.title = postQcEnabled ? postQcModeLabel(postQcMode) : '本项目不进行后段巡检';
         }
       });
       document.querySelectorAll('[data-manual-kind]').forEach(button => {
         button.classList.toggle('active', button.dataset.manualKind === state.manualAnnotationKind);
         if (button.dataset.manualKind === 'qc') {
           button.disabled = !postQcEnabled;
-          button.title = postQcEnabled ? `后段 QC 策略：${postQcMode}` : '本项目后段 QC 策略为 disabled';
+          button.title = postQcEnabled ? postQcModeLabel(postQcMode) : '本项目不进行后段巡检';
         }
       });
       if (eventAnnotation) {
         el('reviewHelp').textContent = postQcEnabled
-          ? `后段 QC=${postQcMode}；QC 与细胞候选共享同一 event-map 白名单，均需逐条确认；同一 MS event 只能接受一个跨通道关系。`
-          : '后段 QC=disabled；本阶段仅显示细胞候选。同一 MS event 跨通道冲突时必须人工选择唯一关系。';
+          ? `${postQcModeLabel(postQcMode)}；质控与细胞候选都只使用事件坐标表中的事件，均需逐条确认；同一 MS 事件只能接受一个跨通道关系。`
+          : '本项目不进行后段巡检；当前只显示细胞候选。同一 MS 事件出现跨通道冲突时，必须人工选择唯一关系。';
       } else {
         const anchors = qcAnchorChannels();
         el('reviewHelp').textContent = `残差 = MS760 时间 - ${anchors.join('/')} 按时间轴聚合后的组合时间，单位 sec；越接近 0 表示时间对齐越好。`;
@@ -13482,9 +13713,9 @@ HTML = r"""<!doctype html>
       const anchors = qcAnchorChannels();
       el('manualHelp').textContent = eventAnnotation
         ? (cellMode
-            ? '细胞二元组：选择一个启用细胞用途的 LIF 峰和一个 map 内 MS760 event。'
-            : `QC anchor：MS760 必选；${anchors.join('/')} 至少选择一个，缺失通道保存为 NA。`)
-        : `QC 校正：选择覆盖全部时间轴的 ${anchors.join('/')} 峰和 MS760 峰。`;
+            ? '细胞二元组：选择一个用于细胞标注的 LIF 峰和一个事件坐标表内的 MS760 事件。'
+            : `质控参考关系：必须选择 MS760；并从 ${anchors.join('/')} 中至少选择一个 LIF 峰，缺失通道会明确记为空值。`)
+        : `前段时间校正：选择 ${anchors.join('/')} 中能够覆盖全部信号时间轴的峰，以及对应的 MS760 峰。`;
     }
 
     function setConfigSaveStatus(message, type = '') {
@@ -13565,9 +13796,9 @@ HTML = r"""<!doctype html>
           || (tm.status === 'frozen' && protocolChanged);
         if (changedFrozenConfig || clearsQcAlignment || clearsProtocolAlignment) {
           const effects = [];
-          if (clearsQcAlignment || clearsProtocolAlignment) effects.push('已应用的参考 anchor QC 对齐');
-          if (changedFrozenConfig) effects.push('当前已冻结的后段 time model');
-          const ok = window.confirm(`修改这些项目级校准参数会明确失效${effects.join('和')}。已有人工标注会保留为旧版本记录，但后段 delta 与第三阶段候选必须重算。是否继续？`);
+          if (clearsQcAlignment || clearsProtocolAlignment) effects.push('已应用的前段参考峰时间校正');
+          if (changedFrozenConfig) effects.push('当前已锁定的后段时间模型');
+          const ok = window.confirm(`修改这些项目级校准参数会使${effects.join('和')}失效。已有人工标注会保留为历史记录，但 MS 后段时间差与事件候选必须重算。是否继续？`);
           if (!ok) {
             setConfigSaveStatus('未保存，项目时间节点保持不变。');
             return;
@@ -13610,7 +13841,7 @@ HTML = r"""<!doctype html>
           state.start = 0;
         }
         applyStageWindowWidth();
-        const savedMessage = `已保存：前段协议结束 ${String(Number(cfg.qc_calibration_end_min))} min；事件起点 ${String(Number(cfg.annotation_start_min))} min；无标签 delta 取证 ${String(Number(cfg.local_delta_seed_window_min))} min；后段 QC=${cfg.post_qc_strategy?.mode || 'disabled'}。`;
+        const savedMessage = `已保存：前段参考结束 ${String(Number(cfg.qc_calibration_end_min))} min；事件起点 ${String(Number(cfg.annotation_start_min))} min；自动估计时间差范围 ${String(Number(cfg.local_delta_seed_window_min))} min；${postQcModeLabel(cfg.post_qc_strategy?.mode || 'disabled')}。`;
         setConfigSaveStatus(
           result.warning ? `${savedMessage} ${result.warning}` : savedMessage,
           result.warning ? 'warning' : 'success'
@@ -13645,7 +13876,7 @@ HTML = r"""<!doctype html>
       } catch (err) {
         state.qcRefitPreview = null;
         renderQcRefitPanel();
-        alert(`QC 对齐预览失败: ${err.message}`);
+        alert(`参考峰时间校正预览失败：${err.message}`);
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
@@ -13657,9 +13888,9 @@ HTML = r"""<!doctype html>
       const tm = state.current?.time_model || state.meta?.time_model || {};
       const frozen = tm.status === 'frozen';
       const consequence = frozen
-        ? '应用后会清除当前已冻结的后段 time model，并要求重新进行后段局部校正。'
-        : '应用后会重置后段 delta，并创建新的 draft time model。';
-      if (!confirm(`应用当前 accepted anchors 的 QC 基础对齐？${consequence}`)) return;
+        ? '应用后会清除当前已锁定的后段时间模型，并要求重新进行后段时间差校正。'
+        : '应用后会重置 MS 后段时间差，并创建新的时间模型草稿。';
+      if (!confirm(`应用当前已接受参考峰得到的基础时间校正？${consequence}`)) return;
       state.actionBusy = true;
       renderQcRefitPanel();
       try {
@@ -13672,9 +13903,9 @@ HTML = r"""<!doctype html>
         state.meta.time_model = result.time_model;
         state.qcRefitPreview = null;
         await loadWindow();
-        alert(result.warning ? `QC 对齐已应用。${result.warning}` : 'QC 对齐已应用；请重新进行后段局部校正。');
+        alert(result.warning ? `参考峰时间校正已应用。${result.warning}` : '参考峰时间校正已应用；请重新进行后段时间差校正。');
       } catch (err) {
-        alert(`应用 QC 对齐失败: ${err.message}`);
+        alert(`应用参考峰时间校正失败：${err.message}`);
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
@@ -13727,7 +13958,7 @@ HTML = r"""<!doctype html>
         state.previewDeltaSec = Number(deltaSec);
         await loadWindow();
       } catch (err) {
-        alert(`预览 delta 失败: ${err.message}`);
+        alert(`预览 MS 时间差失败：${err.message}`);
       } finally {
         state.actionBusy = false;
       }
@@ -13740,8 +13971,8 @@ HTML = r"""<!doctype html>
       const desiredDelta = state.previewDeltaSec === null ? activeDelta : Number(state.previewDeltaSec);
       const previewChanged = Math.abs(desiredDelta - activeDelta) > 1e-9;
       if (tm.status === 'frozen' && !previewChanged) return;
-      const actionText = tm.status === 'frozen' ? '重新冻结当前预览 delta' : '冻结当前 MS 后段局部平移';
-      if (!confirm(`${actionText}？冻结后才会解锁 QC 巡检写入和细胞标注候选。`)) return;
+      const actionText = tm.status === 'frozen' ? '重新锁定当前预览时间差' : '锁定当前 MS 后段时间差';
+      if (!confirm(`${actionText}？锁定后才会解锁后段质控巡检和细胞标注候选。`)) return;
       state.actionBusy = true;
       try {
         if (previewChanged) {
@@ -13753,7 +13984,7 @@ HTML = r"""<!doctype html>
         state.previewDeltaSec = null;
         await loadWindow();
       } catch (err) {
-        alert(`冻结 delta 失败: ${err.message}`);
+        alert(`锁定 MS 时间差失败：${err.message}`);
       } finally {
         state.actionBusy = false;
       }
@@ -13893,7 +14124,7 @@ HTML = r"""<!doctype html>
               <button data-action="rejected" data-id="${escapeText(id)}">拒绝</button>
               ${row.source === 'auto_candidate' ? `<button data-action="pending" data-id="${escapeText(id)}">待审</button>` : ''}
               ${row.source === 'manual_created' ? `<button data-action="clear_manual" data-id="${escapeText(id)}">清除</button>` : ''}
-        ` : '<span class="empty">preview only</span>';
+        ` : '<span class="empty">仅供预览</span>';
         return `
           <div class="candidate-row${selected}${rejected}" data-candidate-id="${escapeText(id)}">
             <div class="row-title"><span>${escapeText(sourceText(row.source))} #${escapeText(row.rank ?? '')}</span><span>${escapeText(statusText(displayStatus))}</span></div>
@@ -13931,8 +14162,8 @@ HTML = r"""<!doctype html>
         || state.meta?.project_config?.qc_alignment_model;
       if (!active) return {};
       const ok = confirm(
-        '修改 QC 校正证据会清除已应用的 QC 对齐和下游 time model。'
-        + '完成修改后必须重新预览并应用 QC 对齐，再进行后段局部校正。是否继续？'
+        '修改前段参考峰记录会清除已应用的时间校正和后续时间模型。'
+        + '完成修改后必须重新预览并应用前段时间校正，再进行后段时间差校正。是否继续？'
       );
       return ok ? { clear_qc_alignment_model: true } : null;
     }
@@ -13993,7 +14224,7 @@ HTML = r"""<!doctype html>
       try {
         const result = await postCsv('/api/export-accepted-csv', {});
         downloadTextFile(result.filename, result.text, 'text/csv;charset=utf-8');
-        hint.textContent = '主 CSV 已导出；前段 anchor 仍保留在 SQLite 审计';
+        hint.textContent = '主 CSV 已导出；前段参考记录仍保留在项目审计库';
       } catch (err) {
         hint.textContent = '导出失败';
         alert(`导出失败: ${err.message}`);
@@ -14031,7 +14262,7 @@ HTML = r"""<!doctype html>
           throw new Error('LIF 输入必须为 2–4 个。');
         }
         if (lifInputs.some(row => !row.path || !row.channel || !row.detector || !row.time_axis)) {
-          throw new Error('请为每个 LIF 输入选择文件并填写通道和检测器。');
+          throw new Error('请为每个 LIF 输入选择文件，并填写通道和信号颜色。');
         }
         if (new Set(channels).size !== channels.length) {
           throw new Error('LIF 通道名不能重复。');
@@ -14065,13 +14296,13 @@ HTML = r"""<!doctype html>
         const requiredAxes = new Set(cellRows.map(row => row.time_axis));
         const coveredAxes = new Set(calibrationProtocol.segments.flatMap(segment => segment.reference_channels.map(channel => axesByChannel[channel])));
         const missingAxes = Array.from(requiredAxes).filter(axis => !coveredAxes.has(axis));
-        if (missingAxes.length) throw new Error(`前段校准协议未覆盖细胞通道物理轴：${missingAxes.join('、')}。`);
+        if (missingAxes.length) throw new Error('前段参考段尚未覆盖所有用于细胞标注的信号颜色。');
         const annotationStart = Number(el('importAnnotationStart').value);
         const seedWindow = Number(el('importSeedWindow').value);
         if (!Number.isFinite(annotationStart) || annotationStart < Number(previousEnd)) {
           throw new Error('事件标注起点必须不早于最后一个校准参考段的结束时间。');
         }
-        if (!Number.isFinite(seedWindow) || seedWindow <= 0) throw new Error('无标签 delta 取证范围必须大于 0。');
+        if (!Number.isFinite(seedWindow) || seedWindow <= 0) throw new Error('自动估计 MS 时间差的范围必须大于 0。');
         const postQcStrategy = postQcStrategyPayload();
         if (!el('importProjectDir').value.trim() || !el('importMs').value.trim() || !el('importCellEventMap').value.trim()) {
           throw new Error('请选择项目保存路径、MS 原始文件和事件坐标 CSV。');
@@ -14090,30 +14321,6 @@ HTML = r"""<!doctype html>
           annotation_start_min: annotationStart,
           local_delta_seed_window_min: seedWindow,
           post_qc_strategy: postQcStrategy,
-          lif_peak_detection: el('importLifPeakDetectorVersion').value === '1'
-            ? {
-                detector_version: 1,
-                profile: 'legacy_v3_fixed',
-                core: { prominence_snr_min: 10.0 },
-                weak: { enabled: false, prominence_snr_min: null },
-                geometry: { min_distance_sec: 0.02, merge_gap_sec: 0.12, min_width_sec: 0.02, max_width_sec: 1.0 },
-                weak_usage: 'disabled'
-              }
-            : {
-                detector_version: 2,
-                profile: 'core_weak',
-                core: { prominence_snr_min: 10.0 },
-                weak: {
-                  enabled: true,
-                  prominence_snr_min: 3.5,
-                  template_similarity_min: 0.75,
-                  local_noise_block_sec: 10.0,
-                  min_core_template_peaks: 3,
-                  min_core_rate_per_min: 0.50,
-                },
-                geometry: { min_distance_sec: 0.02, merge_gap_sec: 0.12, min_width_sec: 0.02, max_width_sec: 1.0 },
-                weak_usage: 'manual_review_only'
-              },
           cell_event_map_path: el('importCellEventMap').value,
         });
         applyLoadedProjectMeta(result.meta);
@@ -14144,7 +14351,7 @@ HTML = r"""<!doctype html>
       const button = el('runOpenProject');
       const oldText = button.textContent;
       button.textContent = '打开中...';
-      el('openProjectHint').textContent = '正在读取项目中间表和 SQLite。';
+      el('openProjectHint').textContent = '正在读取项目数据与人工标注，请稍候。';
       try {
         const result = await postJson('/api/open-project', {
           project_dir: el('openProjectDir').value
@@ -14168,13 +14375,13 @@ HTML = r"""<!doctype html>
         setConfigSaveStatus('请选择事件坐标 CSV。', 'error');
         return;
       }
-      if (!window.confirm('事件坐标将清洗为 canonical 五列表并一次性绑定到当前项目；当前版本不支持替换。继续？')) return;
+      if (!window.confirm('软件会读取必需坐标列并一次性绑定到当前项目；绑定后不能直接替换。继续？')) return;
       state.actionBusy = true;
       const button = el('attachMap');
       const oldText = button.textContent;
       button.disabled = true;
       button.textContent = '校验中…';
-      setConfigSaveStatus('正在校验 CSV 与当前 MS event 的一对一关系…');
+      setConfigSaveStatus('正在校验 CSV 坐标与当前 MS 事件的一对一关系…');
       try {
         const result = await postJson('/api/attach-cell-event-map', { source_path: sourcePath });
         state.meta = result.meta;
@@ -14375,8 +14582,8 @@ HTML = r"""<!doctype html>
       const coversAllAxes = Array.from(requiredAxes).every(axis => coveredAxes.has(axis));
       if (!state.manual.MS760 || (qcSurvey ? selectedAnchorChannels.length === 0 : !coversAllAxes)) {
         alert(qcSurvey
-          ? `QC 巡检需选择 MS760，并至少选择 ${anchors.join('/')} 中的一个峰。`
-          : `QC 校正需选择 MS760，并用 ${anchors.join('/')} 中的峰覆盖全部时间轴。`);
+          ? `后段质控巡检需要选择 MS760，并至少选择 ${anchors.join('/')} 中的一个峰。`
+          : `前段时间校正需要选择 MS760，并用 ${anchors.join('/')} 中的峰覆盖全部信号时间轴。`);
         return;
       }
       const selectedAnchorIds = Object.fromEntries(
@@ -14407,7 +14614,7 @@ HTML = r"""<!doctype html>
         await loadWindow();
         notifyStateChannel();
       } catch (err) {
-        alert(`手动 QC anchor 写入失败: ${err.message}`);
+        alert(`手动参考峰关系保存失败：${err.message}`);
       } finally {
         state.actionBusy = false;
       }
@@ -15230,6 +15437,10 @@ HTML = r"""<!doctype html>
     el('bootstrapOpenProject').addEventListener('click', () => setOpenProjectModal(true));
     el('closeImportProject').addEventListener('click', () => setImportModal(false));
     el('closeOpenProject').addEventListener('click', () => setOpenProjectModal(false));
+    el('openAsNewStandardProject').addEventListener('click', () => {
+      setOpenProjectModal(false);
+      setImportModal(true);
+    });
     el('closeConfigProject').addEventListener('click', () => setProjectConfigModal(false));
     el('openProjectModal').addEventListener('click', (ev) => {
       if (ev.target === el('openProjectModal')) setOpenProjectModal(false);
@@ -15287,7 +15498,7 @@ HTML = r"""<!doctype html>
       if (['path', 'channel', 'detector'].includes(field) && row[field] !== previousValue) {
         state.importSuggestionRevision += 1;
         invalidateImportCalibrationConfirmations(
-          'LIF 文件、通道或检测器已变化，旧窗口建议已失效，请重新分析并确认。',
+          'LIF 文件、通道或信号颜色已变化，旧窗口建议已失效，请重新分析并确认。',
           false
         );
       }
@@ -15450,7 +15661,7 @@ HTML = r"""<!doctype html>
       renderImportSegments();
       renderImportPostQcControls();
       el('importSuggestionStatus').textContent = '选择 G1/G2 原始文件后，可点击“分析已选 LIF 并建议窗口”；建议不会自动确认。';
-      el('importHint').textContent = '已应用 HSC1 科学角色；G1/G2 将自动共享 Green 时间轴。请选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
+      el('importHint').textContent = '已应用 HSC1 科学角色；G1/G2 将自动共享绿色信号时间轴。请选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
     });
     document.querySelectorAll('[data-event-filter]').forEach(button => {
       button.addEventListener('click', () => {
@@ -15622,7 +15833,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not self.request_is_local():
-            self.send_json({"error": "Request host is not allowed"}, HTTPStatus.FORBIDDEN)
+            self.send_json({"error": "该请求不是从本机应用发出的，已安全阻止。"}, HTTPStatus.FORBIDDEN)
             return
         parsed = urlparse(self.path)
         try:
@@ -15687,17 +15898,24 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/annotations":
                 self.send_json({"summary": self.data.store.summary(), "records": self.data.store.records()})
                 return
-            self.send_json({"error": f"Not found: {parsed.path}"}, HTTPStatus.NOT_FOUND)
+            self.send_json({"error": "未找到请求的页面或操作。"}, HTTPStatus.NOT_FOUND)
         except BadRequest as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            self.send_json(
+                {"error": user_facing_error_message(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             LOGGER.info("Client disconnected before GET response completed: %s", parsed.path)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            LOGGER.exception("Unhandled GET request failure for %s", parsed.path)
+            self.send_json(
+                {"error": user_facing_error_message(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def do_POST(self) -> None:
         if not self.request_is_local():
-            self.send_json({"error": "Request origin is not allowed"}, HTTPStatus.FORBIDDEN)
+            self.send_json({"error": "该请求不是从本机应用发出的，已安全阻止。"}, HTTPStatus.FORBIDDEN)
             return
         activity = getattr(self.server, "request_activity", None)
         if activity is None:
@@ -15992,13 +16210,20 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 self.__class__.data = new_data
                 self.send_json({"ok": True, "meta": new_data.meta()})
                 return
-            self.send_json({"error": f"Not found: {parsed.path}"}, HTTPStatus.NOT_FOUND)
+            self.send_json({"error": "未找到请求的页面或操作。"}, HTTPStatus.NOT_FOUND)
         except BadRequest as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            self.send_json(
+                {"error": user_facing_error_message(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             LOGGER.info("Client disconnected before POST response completed: %s", parsed.path)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            LOGGER.exception("Unhandled POST request failure for %s", parsed.path)
+            self.send_json(
+                {"error": user_facing_error_message(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
 
 class RequestActivity:

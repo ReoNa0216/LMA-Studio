@@ -21,7 +21,7 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc1"
+    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc2"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
 $CopyProject = Join-Path $CopyRoot "HSC1"

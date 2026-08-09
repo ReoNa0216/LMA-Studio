@@ -1,5 +1,6 @@
 import copy
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -25,9 +26,14 @@ from annotation_app.app import (
     normalize_calibration_protocol,
     normalize_post_qc_strategy,
     post_qc_strategy_from_manifest,
+    raw_file_fingerprint,
     read_project_manifest,
     suggest_calibration_segment_windows,
     write_project_manifest,
+)
+from scripts.v3.lif_peak_detection import (
+    adaptive_lif_peak_detection,
+    lif_peak_detection_hash,
 )
 
 
@@ -525,11 +531,16 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
                     for channel in channels
                 ]
             ).to_parquet(paths["lif_traces"], index=False)
+            detector_config = adaptive_lif_peak_detection()
+            detector_hash = lif_peak_detection_hash(detector_config)
             pd.DataFrame(
                 [
                     {
                         **lif_peak(channel, f"{channel.lower()}-1", 60.0),
                         "peak_stage": "merged",
+                        "peak_tier": "core",
+                        "detector_version": 2,
+                        "detector_config_hash": detector_hash,
                     }
                     for channel in channels
                 ]
@@ -547,6 +558,42 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
                     }
                 ]
             ).to_parquet(paths["ms_scan_summary"], index=False)
+            manifest = {
+                "project_schema_version": 2,
+                "acquisition_layout": {
+                    "layout_version": 3,
+                    "lif_channels": [
+                        {
+                            "input_id": f"lif_{channel.lower()}_raw",
+                            "channel": channel,
+                            "identity_prior": channel,
+                            "time_axis": "green_axis" if channel == "G2" else "red_axis",
+                            "detector": "green" if channel == "G2" else "red",
+                            "use_for_cell_annotation": True,
+                        }
+                        for channel in channels
+                    ],
+                    "qc_anchor_channels": ["G2", "R1"],
+                },
+                "channel_identity_prior": {channel: channel for channel in channels},
+                "lif_peak_detection": detector_config,
+                "lif_peak_detection_hash": detector_hash,
+                "intermediate_tables": {
+                    key: {
+                        "path": path.relative_to(root).as_posix(),
+                        **raw_file_fingerprint(path, full_hash_limit_bytes=None),
+                    }
+                    for key, path in paths.items()
+                },
+                "annotation_db": {
+                    "path": "annotation_app/annotations/annotation.sqlite",
+                    "schema_version": 2,
+                },
+            }
+            (root / "lifms_project.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             db_path = root / "annotation_app/annotations/annotation.sqlite"
             legacy_store = AnnotationStore(db_path)
             legacy_store.update_project_config(
