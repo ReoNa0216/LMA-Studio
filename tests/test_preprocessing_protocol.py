@@ -246,6 +246,58 @@ class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
         self.assertGreaterEqual(params["preliminary_peak_count"], 3)
         self.assertAlmostEqual(params["min_distance_sec"], 0.2, places=9)
 
+    def test_pc34_fallback_does_not_collapse_to_the_noise_localmax_median(self):
+        signal_col = "pc34_760_max_intensity"
+        time_sec = np.arange(1200, dtype=float) * 0.1
+        signal = np.zeros(1200, dtype=float)
+        noise_indices = np.arange(10, 900, 20)
+        signal[noise_indices] = 20.0
+        true_peak_indices = np.asarray([950, 1050, 1150])
+        signal[true_peak_indices] = [1000.0, 2000.0, 3000.0]
+        all_peak_indices = np.concatenate([noise_indices, true_peak_indices])
+        scan = pd.DataFrame(
+            {
+                "scan_start_time_sec": time_sec,
+                "scan_start_time_min": time_sec / 60.0,
+                signal_col: signal,
+            }
+        )
+        localmax = pd.DataFrame(
+            {
+                "scan_row_index": all_peak_indices,
+                "time_min": time_sec[all_peak_indices] / 60.0,
+                "height": signal[all_peak_indices],
+            }
+        )
+        bins = pd.DataFrame(
+            [
+                {
+                    "start_min": 0.0,
+                    "end_min": 2.0,
+                    "scan_count": 1200,
+                    "localmax_p99": 2980.0,
+                    "scan_p99": 2500.0,
+                    "positive_scan_fraction": 0.04,
+                }
+            ]
+        )
+
+        params, _quiet = ms_qc.estimate_parameters(
+            scan,
+            signal_col,
+            bins,
+            localmax,
+            0.1,
+        )
+
+        self.assertEqual(
+            params["threshold_fallback_reason"],
+            "quiet_threshold_exceeded_signal_range",
+        )
+        self.assertAlmostEqual(params["peak_height"], 300.0, places=9)
+        self.assertLessEqual(params["peak_prominence"], 30.0)
+        self.assertEqual(params["preliminary_peak_count"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

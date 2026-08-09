@@ -51,6 +51,8 @@ LOW_TIC_THRESHOLD = 1e6
 LOW_ARRAY_LENGTH_THRESHOLD = 6000
 LOW_ARRAY_LENGTH_SEVERE = 1000
 TIC_SUPPORT_TOL_SEC = 0.75
+PC34_FALLBACK_HEIGHT_FRACTION = 0.10
+PC34_FALLBACK_PROMINENCE_FRACTION = 0.10
 PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
 
 FORBIDDEN_PATH_PARTS = [
@@ -541,25 +543,23 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         and signal_max > 0
         and (not np.isfinite(height) or height >= signal_max)
     ):
-        positive_localmax = pd.to_numeric(
-            localmax.loc[localmax["height"].gt(0), "height"],
-            errors="coerce",
-        ).dropna()
-        localmax_median = (
-            float(positive_localmax.median())
-            if len(positive_localmax)
-            else signal_max
-        )
+        # A contaminated "quiet" run can put its estimated threshold above
+        # the entire trace.  Falling back to the median positive local maximum
+        # is unsafe for sparse MS traces: the median is then the electronic
+        # noise floor and turns thousands of scan-level fluctuations into
+        # events.  Keep this fallback project-adaptive by scaling it to the
+        # observed trace range; no author event count or event-map label is
+        # consulted here.
         height = float(
             max(
                 np.nextafter(0.0, 1.0),
-                min(0.10 * signal_max, localmax_median),
+                PC34_FALLBACK_HEIGHT_FRACTION * signal_max,
             )
         )
         prominence = float(
             max(
                 np.nextafter(0.0, 1.0),
-                min(prominence, 0.50 * height),
+                min(prominence, PC34_FALLBACK_PROMINENCE_FRACTION * height),
             )
         )
         threshold_fallback_reason = "quiet_threshold_exceeded_signal_range"
