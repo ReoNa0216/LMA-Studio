@@ -55,6 +55,12 @@ from annotation_app.cell_event_map import (
     write_canonical_map,
 )
 from annotation_app.umap_page import UMAP_HTML
+from scripts.v3.lif_peak_detection import (
+    adaptive_lif_peak_detection,
+    legacy_lif_peak_detection,
+    lif_peak_detection_hash,
+    normalize_lif_peak_detection,
+)
 
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -153,13 +159,13 @@ CALIBRATION_PROTOCOL_VERSION = 1
 POST_QC_STRATEGY_VERSION = 1
 CALIBRATION_REFERENCE_MODES = {"green_only", "red_only", "red_green"}
 POST_QC_STRATEGY_MODES = {"signature", "scheduled_windows", "disabled"}
-SEGMENTED_CALIBRATION_MATCHER_VERSION = "segmented_axis_reference_v1"
+SEGMENTED_CALIBRATION_MATCHER_VERSION = "segmented_axis_reference_v2_monotone"
 PROJECT_TABLE_BINDING_SCHEMA_VERSION = 1
 MIN_LIF_INPUTS = 2
 MAX_LIF_INPUTS = 4
 MIN_QC_ANCHOR_CHANNELS = 2
 MAX_QC_ANCHOR_CHANNELS = 4
-QC_MATCHER_VERSION = "axis_aware_anchor_set_v2"
+QC_MATCHER_VERSION = "axis_aware_anchor_set_v3_monotone"
 RAW_INPUT_MODE_COPY = "copy_into_project"
 RAW_INPUT_MODE_EXTERNAL = "external_reference"
 RAW_INPUT_MODES = {RAW_INPUT_MODE_COPY, RAW_INPUT_MODE_EXTERNAL}
@@ -634,7 +640,11 @@ def suggest_calibration_segment_windows(
             }
         )
 
-    peaks = lif_peaks.copy() if isinstance(lif_peaks, pd.DataFrame) else pd.DataFrame()
+    peaks = (
+        automatic_lif_peak_evidence(lif_peaks).copy()
+        if isinstance(lif_peaks, pd.DataFrame)
+        else pd.DataFrame()
+    )
     if not peaks.empty and "peak_stage" in peaks.columns and peaks["peak_stage"].eq("merged").any():
         peaks = peaks[peaks["peak_stage"].eq("merged")].copy()
     if "channel" not in peaks.columns or "time_min" not in peaks.columns:
@@ -817,7 +827,7 @@ def calibration_protocol_hash(
         "matcher_semantics": (
             "legacy_qc_anchor_channels"
             if normalized.get("compatibility_mode")
-            else "segmented_calibration_v1"
+            else "segmented_calibration_v2_monotone_sequence"
         ),
         "channel_physics": channel_physics,
         "segments": [
@@ -1045,7 +1055,7 @@ def post_qc_strategy_hash(
     payload["matcher_semantics"] = (
         "legacy_qc_anchor_channels"
         if normalized.get("compatibility_mode")
-        else "post_qc_strategy_v1"
+        else "post_qc_strategy_v2_monotone_sequence"
     )
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1173,6 +1183,97 @@ def read_project_manifest(project_dir: Path) -> dict[str, Any] | None:
     return data
 
 
+def lif_peak_detection_from_manifest(
+    manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return detector semantics without migrating an older project on read."""
+
+    configured = (
+        manifest.get("lif_peak_detection")
+        if isinstance(manifest, dict)
+        else None
+    )
+    if isinstance(configured, dict):
+        try:
+            normalized = normalize_lif_peak_detection(copy.deepcopy(configured))
+        except ValueError as exc:
+            raise BadRequest(f"项目 lif_peak_detection 配置无效: {exc}") from exc
+        expected_hash = lif_peak_detection_hash(normalized)
+        declared_hash = str((manifest or {}).get("lif_peak_detection_hash") or "").strip().lower()
+        if declared_hash != expected_hash:
+            raise BadRequest(
+                "项目 LIF detector hash 与 lif_peak_detection 配置不一致；"
+                "请使用原项目副本重新生成中间表，不要继续加载可能混用的峰表。"
+            )
+        return normalized
+    return legacy_lif_peak_detection(compatibility_mode=True)
+
+
+def validate_and_adapt_lif_peak_detector_binding(
+    lif_peaks: pd.DataFrame,
+    peak_detection: dict[str, Any],
+    *,
+    explicit_peak_detection: bool,
+) -> pd.DataFrame:
+    """Validate every raw/merged peak row against its immutable detector."""
+
+    peaks = lif_peaks.copy()
+    required = {"peak_tier", "detector_version", "detector_config_hash"}
+    present = required.intersection(peaks.columns)
+    expected_version = int(peak_detection["detector_version"])
+    expected_hash = lif_peak_detection_hash(peak_detection)
+
+    if explicit_peak_detection:
+        missing = sorted(required - set(peaks.columns))
+        if missing:
+            raise BadRequest(
+                "LIF peak 表缺少项目 detector 绑定字段: " + ", ".join(missing)
+            )
+    elif not present:
+        # Genuine v0.3 parquet tables predate all three columns. Adapt only the
+        # loaded frame; never rewrite the table or manifest.
+        peaks["peak_tier"] = "core"
+        peaks["detector_version"] = expected_version
+        peaks["detector_config_hash"] = expected_hash
+        return peaks
+    elif present != required:
+        raise BadRequest(
+            "旧项目 LIF peak 表只包含部分 detector 元数据，无法安全绑定；"
+            "请使用未改动的原项目副本。"
+        )
+
+    tier_series = (
+        peaks["peak_tier"].fillna("").astype(str).str.strip().str.lower()
+    )
+    version_series = pd.to_numeric(peaks["detector_version"], errors="coerce")
+    hash_series = (
+        peaks["detector_config_hash"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    invalid = bool(
+        len(peaks)
+        and (
+            not tier_series.isin({"core", "weak"}).all()
+            or version_series.isna().any()
+            or not version_series.eq(expected_version).all()
+            or not hash_series.eq(expected_hash).all()
+            or (expected_version == 1 and tier_series.eq("weak").any())
+        )
+    )
+    if invalid:
+        raise BadRequest(
+            "LIF peak detector hash/version/tier 与项目配置不一致；"
+            "请从原始输入在新项目或项目副本中重跑预处理。"
+        )
+    peaks["peak_tier"] = tier_series
+    peaks["detector_version"] = version_series.astype("Int64")
+    peaks["detector_config_hash"] = hash_series
+    return peaks
+
+
 def write_project_manifest(
     *,
     project_dir: Path,
@@ -1185,6 +1286,7 @@ def write_project_manifest(
     calibration_protocol: dict[str, Any] | None = None,
     post_qc_strategy: dict[str, Any] | None = None,
     annotation_config: dict[str, Any] | None = None,
+    lif_peak_detection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_dir.mkdir(parents=True, exist_ok=True)
     binding = project_table_binding(intermediate_tables) if intermediate_tables else {}
@@ -1227,6 +1329,14 @@ def write_project_manifest(
             "compatibility_mode": "legacy_creation_api",
         }
     normalized_post_qc = normalize_post_qc_strategy(post_qc_strategy, layout)
+    try:
+        normalized_peak_detection = normalize_lif_peak_detection(
+            lif_peak_detection
+            if lif_peak_detection is not None
+            else legacy_lif_peak_detection()
+        )
+    except ValueError as exc:
+        raise BadRequest(f"lif_peak_detection 配置无效: {exc}") from exc
     validate_post_qc_strategy_timing(normalized_post_qc, protocol_end_min)
     raw_annotation_config = annotation_config or {}
     try:
@@ -1264,6 +1374,10 @@ def write_project_manifest(
         "calibration_protocol_hash": calibration_protocol_hash(normalized_protocol, layout),
         "post_qc_strategy": normalized_post_qc,
         "post_qc_strategy_hash": post_qc_strategy_hash(normalized_post_qc, layout),
+        "lif_peak_detection": normalized_peak_detection,
+        "lif_peak_detection_hash": lif_peak_detection_hash(
+            normalized_peak_detection
+        ),
         "annotation_config": normalized_annotation_config,
         "intermediate_tables": intermediate_tables or {},
         "project_table_binding": binding,
@@ -2129,13 +2243,21 @@ def validate_staged_project_artifacts(project: ProjectPaths) -> ProjectPaths:
         except Exception as exc:
             raise BadRequest(f"staging 中间表无法读取: {display_path(path, resolved.project_dir)}") from exc
     try:
-        lif_peaks = pd.read_parquet(resolved.lif_peaks_path, columns=["peak_id"])
+        lif_peaks = pd.read_parquet(resolved.lif_peaks_path)
         ms_events = pd.read_parquet(
             resolved.ms_events_path,
             columns=["event_id", "event_strategy", "primary_signal_col", "scan_id", "time_min"],
         )
     except Exception as exc:
         raise BadRequest("staging 项目中间表缺少 event-map 绑定所需字段") from exc
+    peak_detection = lif_peak_detection_from_manifest(manifest)
+    validate_and_adapt_lif_peak_detector_binding(
+        lif_peaks,
+        peak_detection,
+        explicit_peak_detection=isinstance(
+            manifest.get("lif_peak_detection"), dict
+        ),
+    )
     acquisition_layout_from_manifest(manifest)
     load_project_cell_event_map(resolved.project_dir, manifest, ms_events)
     return resolved
@@ -2987,6 +3109,11 @@ class AnnotationStore:
         clear_frozen_time_model: bool = False,
         clear_qc_alignment_model: bool = False,
     ) -> dict[str, Any]:
+        if "lif_peak_detection" in updates:
+            raise BadRequest(
+                "LIF detector 是预处理峰表的只读绑定，不能只改项目配置。"
+                "请新建项目或项目副本并重跑中间表；现有时间模型和人工标注均未改动。"
+            )
         allowed = {
             "qc_calibration_end_min",
             "annotation_start_min",
@@ -3600,27 +3727,153 @@ def greedy_time_matches(
     shift_sec: float,
     tolerance_sec: float,
 ) -> list[tuple[int, int, float]]:
-    pairs: list[tuple[float, int, int, float]] = []
-    shifted = lif_times_sec + shift_sec
-    for lif_idx, value in enumerate(shifted):
-        left = int(np.searchsorted(ms_times_sec, value - tolerance_sec, side="left"))
-        right = int(np.searchsorted(ms_times_sec, value + tolerance_sec, side="right"))
-        for ms_idx in range(left, right):
-            residual = float(ms_times_sec[ms_idx] - value)
-            pairs.append((abs(residual), lif_idx, ms_idx, residual))
-    pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+    """Return a one-to-one, order-preserving match between two time series.
 
-    used_lif: set[int] = set()
-    used_ms: set[int] = set()
+    The public name is retained for compatibility with older callers.  The old
+    implementation greedily consumed the smallest individual residual.  In a
+    dense peak cluster that can cross two neighbouring relations, or even lose
+    a second feasible relation.  A physical acquisition has a shared forward
+    time direction, so a later LIF pulse cannot represent an earlier MS event
+    when an earlier LIF pulse is assigned to a later event.
+
+    This implementation solves the sparse monotone sequence-matching problem.
+    Its lexicographic objective is: maximise cardinality, minimise total
+    absolute residual, minimise the worst residual, then minimise squared
+    residual.  A Fenwick prefix optimum keeps the work O(E log M), where E is
+    the number of pairs inside the tolerance, rather than O(N*M).  That matters
+    because the same matcher is evaluated over many candidate axis shifts.
+    """
+
+    lif_values = np.asarray(lif_times_sec, dtype=float)
+    ms_values = np.asarray(ms_times_sec, dtype=float)
+    tolerance = float(tolerance_sec)
+    shift = float(shift_sec)
+    if tolerance < 0 or not math.isfinite(tolerance) or not math.isfinite(shift):
+        raise ValueError("time-match shift and tolerance must be finite; tolerance must be >= 0")
+    finite_lif = np.flatnonzero(np.isfinite(lif_values))
+    finite_ms = np.flatnonzero(np.isfinite(ms_values))
+    if not len(finite_lif) or not len(finite_ms):
+        return []
+    lif_order = finite_lif[np.argsort(lif_values[finite_lif], kind="stable")]
+    ms_order = finite_ms[np.argsort(ms_values[finite_ms], kind="stable")]
+    sorted_lif = lif_values[lif_order] + shift
+    sorted_ms = ms_values[ms_order]
+
+    # State: match count, total |residual|, max |residual|, sum residual^2,
+    # predecessor-node index.  Nodes hold only back-pointers, so shift scans do
+    # not repeatedly copy complete match paths.
+    State = tuple[int, float, float, float, int]
+    empty: State = (0, 0.0, 0.0, 0.0, -1)
+    nodes: list[tuple[int, int, int, float]] = []
+    path_cache: dict[int, tuple[tuple[int, int], ...]] = {-1: ()}
+
+    def state_path(node_index: int) -> tuple[tuple[int, int], ...]:
+        cached = path_cache.get(node_index)
+        if cached is not None:
+            return cached
+        missing: list[int] = []
+        cursor = node_index
+        while cursor not in path_cache:
+            missing.append(cursor)
+            cursor = nodes[cursor][0]
+        path = path_cache[cursor]
+        for current in reversed(missing):
+            _previous, lif_index, ms_index, _residual = nodes[current]
+            path = path + ((lif_index, ms_index),)
+            path_cache[current] = path
+        return path_cache[node_index]
+
+    def better(candidate: State, current: State | None) -> bool:
+        if current is None:
+            return True
+        if candidate[0] != current[0]:
+            return candidate[0] > current[0]
+        for index in (1, 2, 3):
+            delta = candidate[index] - current[index]
+            scale = max(1.0, abs(candidate[index]), abs(current[index]))
+            if abs(delta) > 1e-12 * scale:
+                return delta < 0.0
+        # Exact scientific ties are resolved by the earliest index sequence so
+        # output is stable across platforms and Python versions.
+        return state_path(candidate[4]) < state_path(current[4])
+
+    tree: list[State | None] = [None] * (len(sorted_ms) + 1)
+
+    def query(prefix_length: int) -> State:
+        best: State | None = None
+        cursor = int(prefix_length)
+        while cursor > 0:
+            value = tree[cursor]
+            if value is not None and better(value, best):
+                best = value
+            cursor -= cursor & -cursor
+        return best or empty
+
+    def update(position: int, candidate: State) -> None:
+        cursor = int(position)
+        while cursor < len(tree):
+            if better(candidate, tree[cursor]):
+                tree[cursor] = candidate
+            cursor += cursor & -cursor
+
+    for sorted_lif_index, value in enumerate(sorted_lif):
+        left = int(np.searchsorted(sorted_ms, value - tolerance, side="left"))
+        right = int(np.searchsorted(sorted_ms, value + tolerance, side="right"))
+        pending: list[tuple[int, State]] = []
+        for sorted_ms_index in range(left, right):
+            previous = query(sorted_ms_index)  # Strictly earlier MS indices.
+            residual = float(sorted_ms[sorted_ms_index] - value)
+            abs_residual = abs(residual)
+            node_index = len(nodes)
+            nodes.append(
+                (
+                    previous[4],
+                    int(lif_order[sorted_lif_index]),
+                    int(ms_order[sorted_ms_index]),
+                    residual,
+                )
+            )
+            candidate: State = (
+                previous[0] + 1,
+                previous[1] + abs_residual,
+                max(previous[2], abs_residual),
+                previous[3] + residual * residual,
+                node_index,
+            )
+            pending.append((sorted_ms_index + 1, candidate))
+        # Delay updates until the whole LIF row has been considered; otherwise
+        # two edges from one LIF peak could be chained into the same solution.
+        for position, candidate in pending:
+            update(position, candidate)
+
+    best = query(len(sorted_ms))
     out: list[tuple[int, int, float]] = []
-    for _, lif_idx, ms_idx, residual in pairs:
-        if lif_idx in used_lif or ms_idx in used_ms:
-            continue
-        used_lif.add(lif_idx)
-        used_ms.add(ms_idx)
-        out.append((lif_idx, ms_idx, residual))
-    out.sort(key=lambda item: lif_times_sec[item[0]])
+    node_index = best[4]
+    while node_index >= 0:
+        previous, lif_index, ms_index, residual = nodes[node_index]
+        out.append((lif_index, ms_index, residual))
+        node_index = previous
+    out.reverse()
     return out
+
+
+def automatic_lif_peak_evidence(lif_peaks: pd.DataFrame) -> pd.DataFrame:
+    """Exclude weak display evidence from every automatic scientific path.
+
+    A missing tier is interpreted as legacy-v1 ``core`` in memory.  This
+    function never adds a column or rewrites the source table.
+    """
+
+    if "peak_tier" not in lif_peaks.columns:
+        return lif_peaks
+    return lif_peaks[
+        ~lif_peaks["peak_tier"]
+        .fillna("core")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("weak")
+    ]
 
 
 def estimate_channel_shift(
@@ -3629,6 +3882,7 @@ def estimate_channel_shift(
     channel: str,
     qc_calibration_end_min: float = QC_SHIFT_WINDOW_MIN,
 ) -> dict[str, Any]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     qc_end = float(qc_calibration_end_min)
     lif = lif_peaks[
         lif_peaks["channel"].eq(channel)
@@ -3720,6 +3974,7 @@ def build_axis_peak_clusters(
     end_min: float,
     tolerance_sec: float = LIF_PAIR_MATCH_TOL_SEC,
 ) -> list[dict[str, Any]]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     selected = lif_peaks[
         lif_peaks["channel"].isin(channels)
         & lif_peaks["time_min"].between(float(start_min), float(end_min), inclusive="both")
@@ -4018,6 +4273,7 @@ def multi_anchor_groups_for_range(
     ms_shift_sec: float,
     tolerance_sec: float,
 ) -> list[dict[str, Any]]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     anchors = [str(channel).strip().upper() for channel in anchor_channels]
     required_axes = {str(channel_time_axes[channel]) for channel in anchors}
     ms = primary_pc34_events(ms_events)
@@ -4320,18 +4576,21 @@ def ms_qc_support_score(ms_row: pd.Series) -> float:
 def component_group_matches(
     pair_rows: list[tuple[pd.Series, pd.Series, float, float, float, float, float]],
     ms: pd.DataFrame,
+    *,
+    tolerance_sec: float = QC_GROUP_MATCH_TOL_SEC,
 ) -> list[dict[str, Any]]:
     """Match dense QC components without letting weak near-neighbors steal anchors."""
+    tolerance = float(tolerance_sec)
     ms_times = ms["time_sec"].to_numpy(float)
     pair_to_ms: dict[int, set[int]] = {}
     ms_to_pair: dict[int, set[int]] = {}
     for pair_idx, row in enumerate(pair_rows):
         composite = float(row[4])
-        left = int(np.searchsorted(ms_times, composite - QC_GROUP_MATCH_TOL_SEC, side="left"))
-        right = int(np.searchsorted(ms_times, composite + QC_GROUP_MATCH_TOL_SEC, side="right"))
+        left = int(np.searchsorted(ms_times, composite - tolerance, side="left"))
+        right = int(np.searchsorted(ms_times, composite + tolerance, side="right"))
         for ms_idx in range(left, right):
             residual = float(ms_times[ms_idx] - composite)
-            if abs(residual) <= QC_GROUP_MATCH_TOL_SEC + QC_COMPONENT_SELECT_EPS:
+            if abs(residual) <= tolerance + QC_COMPONENT_SELECT_EPS:
                 pair_to_ms.setdefault(pair_idx, set()).add(ms_idx)
                 ms_to_pair.setdefault(ms_idx, set()).add(pair_idx)
 
@@ -4382,13 +4641,16 @@ def component_group_matches(
             selected_pairs = component_pair_list[:selected_count]
         selected_ms_indices = component_ms_list[:selected_count]
         selection_reason = "chronological_dense_component"
+        component_ambiguous = (
+            len(component_pair_list) > 1 or len(component_ms_list) > 1
+        )
 
         local_matches = []
         for pair_local, ms_local in enumerate(range(selected_count)):
             pair_idx = selected_pairs[pair_local]
             ms_idx = selected_ms_indices[ms_local]
             residual = float(ms_times[ms_idx] - float(pair_rows[pair_idx][4]))
-            if abs(residual) <= QC_GROUP_MATCH_TOL_SEC + QC_COMPONENT_SELECT_EPS:
+            if abs(residual) <= tolerance + QC_COMPONENT_SELECT_EPS:
                 local_matches.append((pair_local, ms_local, residual))
 
         matched_pairs = {selected_pairs[pair_local] for pair_local, _, _ in local_matches}
@@ -4406,6 +4668,11 @@ def component_group_matches(
         for pair_local, ms_local, residual in local_matches:
             pair_idx = selected_pairs[int(pair_local)]
             ms_idx = selected_ms_indices[int(ms_local)]
+            alternative_ms_event_ids = [
+                str(ms.iloc[int(candidate_ms_idx)]["event_id"])
+                for candidate_ms_idx in sorted(pair_to_ms.get(pair_idx, set()))
+                if int(candidate_ms_idx) != ms_idx
+            ]
             out.append(
                 {
                     "pair_idx": pair_idx,
@@ -4413,8 +4680,9 @@ def component_group_matches(
                     "residual_sec": float(residual),
                     "component_pair_count": len(component_pair_list),
                     "component_ms_count": len(component_ms_list),
+                    "component_ambiguous": component_ambiguous,
                     "selection_reason": selection_reason,
-                    "alternative_ms_event_ids": [],
+                    "alternative_ms_event_ids": alternative_ms_event_ids,
                     "skipped_pair_ids": skipped_pair_ids,
                     "skipped_ms_event_ids": skipped_ms_ids,
                 }
@@ -4435,6 +4703,7 @@ def build_qc_alignment_groups(
     channel_time_axes: dict[str, str] | None = None,
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     qc_end = float(qc_calibration_end_min)
     anchors = [str(ch).strip().upper() for ch in (qc_anchor_channels or ["G2", "R1"])]
     if len(anchors) != len(set(anchors)) or not MIN_QC_ANCHOR_CHANNELS <= len(anchors) <= MAX_QC_ANCHOR_CHANNELS:
@@ -4568,12 +4837,16 @@ def build_qc_alignment_groups(
                 "axis_coherent": axis_coherent,
                 "max_abs_axis_to_ms_residual_sec": max_abs_axis_to_ms_residual_sec,
                 "complete_anchor_set": axis_coherent,
-                "conflict_count": 0 if axis_coherent else 1,
+                "conflict_count": (
+                    (0 if axis_coherent else 1)
+                    + (1 if bool(match.get("component_ambiguous")) else 0)
+                ),
                 "lif_pair_quality_score": float(quality),
                 "composite_to_ms_residual_sec": float(residual),
                 "abs_composite_to_ms_residual_sec": abs(float(residual)),
                 "component_pair_count": int(match["component_pair_count"]),
                 "component_ms_count": int(match["component_ms_count"]),
+                "component_ambiguous": bool(match.get("component_ambiguous")),
                 "selection_reason": match["selection_reason"],
                 "alternative_ms_event_ids": match["alternative_ms_event_ids"],
                 "skipped_pair_ids": match["skipped_pair_ids"],
@@ -4624,6 +4897,7 @@ def qc_triplets_for_range(
     channel_time_axes: dict[str, str] | None = None,
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     qc_end = float(qc_calibration_end_min)
     anchors = [str(ch).strip().upper() for ch in (qc_anchor_channels or ["G2", "R1"])]
     channel_time_axes = channel_time_axes or {"G2": "green_axis", "G1": "green_axis", "R1": "red_axis", "R2": "red_axis"}
@@ -4686,11 +4960,18 @@ def qc_triplets_for_range(
     if not pair_rows:
         return []
 
-    composite_times = np.asarray([row[4] for row in pair_rows], dtype=float)
-    ms_times = ms["plot_time_sec"].to_numpy(float)
-    matches = greedy_time_matches(composite_times, ms_times, 0.0, tolerance_sec)
+    match_ms = ms.copy()
+    match_ms["time_sec"] = match_ms["plot_time_sec"].astype(float)
+    matches = component_group_matches(
+        pair_rows,
+        match_ms,
+        tolerance_sec=float(tolerance_sec),
+    )
     groups = []
-    for rank, (pair_idx, ms_idx, residual) in enumerate(matches, start=1):
+    for rank, match in enumerate(matches, start=1):
+        pair_idx = int(match["pair_idx"])
+        ms_idx = int(match["ms_idx"])
+        residual = float(match["residual_sec"])
         anchor_a_row, anchor_b_row, anchor_a_plot, anchor_b_plot, composite, lif_pair_residual, quality = pair_rows[int(pair_idx)]
         m_row = ms.iloc[int(ms_idx)]
         axis_span_sec = abs(float(anchor_b_plot - anchor_a_plot))
@@ -4726,12 +5007,21 @@ def qc_triplets_for_range(
                     abs(ms_plot_sec - float(anchor_b_plot)),
                 ),
                 "complete_anchor_set": axis_coherent,
-                "conflict_count": 0 if axis_coherent else 1,
+                "conflict_count": (
+                    (0 if axis_coherent else 1)
+                    + (1 if bool(match.get("component_ambiguous")) else 0)
+                ),
                 "lif_pair_quality_score": float(quality),
                 "composite_to_ms_residual_sec": float(residual),
                 "abs_composite_to_ms_residual_sec": abs(float(residual)),
+                "component_pair_count": int(match["component_pair_count"]),
+                "component_ms_count": int(match["component_ms_count"]),
+                "component_ambiguous": bool(match.get("component_ambiguous")),
+                "alternative_ms_event_ids": list(match.get("alternative_ms_event_ids") or []),
+                "skipped_pair_ids": list(match.get("skipped_pair_ids") or []),
+                "skipped_ms_event_ids": list(match.get("skipped_ms_event_ids") or []),
                 "match_tolerance_sec": float(tolerance_sec),
-                "selection_reason": "post_qc_shift_only_unique_nearest",
+                "selection_reason": str(match.get("selection_reason") or "post_qc_monotone_component"),
             }
         )
     return groups
@@ -4750,6 +5040,7 @@ def high_confidence_cell_pairs(
     excluded_ms_event_ids: set[str] | None = None,
     label: str = "cell",
 ) -> list[dict[str, Any]]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     excluded_ms_event_ids = excluded_ms_event_ids or set()
     lif = lif_peaks[lif_peaks["channel"].eq(channel)].copy()
     lif["plot_time_min"] = lif["time_min"] + shift_sec / 60.0
@@ -4825,6 +5116,7 @@ def local_delta_evidence_pairs(
     ms_delta_sec: float,
     channel_shifts_sec: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     seed_end_min = annotation_start_min + seed_window_min
     lif_parts = []
     if channel_shifts_sec is None:
@@ -5075,6 +5367,7 @@ def local_delta_preview_evidence(
     channel_time_axes: dict[str, str] | None = None,
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     anchors = [str(channel).strip().upper() for channel in (qc_anchor_channels or [])]
     if (
         not is_legacy_qc_anchor_pair(anchors)
@@ -5143,6 +5436,7 @@ def estimate_local_delta_shift(
     channel_time_axes: dict[str, str] | None = None,
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     anchors = [str(channel).strip().upper() for channel in (qc_anchor_channels or [])]
     if (
         not is_legacy_qc_anchor_pair(anchors)
@@ -5716,9 +6010,15 @@ def accepted_qc_alignment_refit(
         axis: float((current_axis_shifts_sec or {}).get(axis, 0.0))
         for axis in required_axes
     }
+    unique_peaks = lif_peaks.drop_duplicates("peak_id", keep=False)
+    weak_peak_ids = {
+        str(row["peak_id"])
+        for _, row in unique_peaks.iterrows()
+        if str(row.get("peak_tier") or "core").strip().lower() == "weak"
+    }
     peak_by_id = {
         str(row["peak_id"]): row
-        for _, row in lif_peaks.drop_duplicates("peak_id", keep=False).iterrows()
+        for _, row in automatic_lif_peak_evidence(unique_peaks).iterrows()
     }
     ms_by_id = {
         str(row["event_id"]): row
@@ -5811,7 +6111,11 @@ def accepted_qc_alignment_refit(
                     continue
                 peak_row = peak_by_id.get(peak_id)
                 if peak_row is None:
-                    invalid_reason = "missing_or_duplicate_lif_peak"
+                    invalid_reason = (
+                        "weak_lif_peak_not_training_evidence"
+                        if peak_id in weak_peak_ids
+                        else "missing_or_duplicate_lif_peak"
+                    )
                     break
                 if str(peak_row["channel"]).strip().upper() != channel:
                     invalid_reason = "lif_peak_channel_mismatch"
@@ -6124,6 +6428,7 @@ class AppData:
     acquisition_layout: dict[str, Any] | None = None
     calibration_protocol: dict[str, Any] | None = None
     post_qc_strategy: dict[str, Any] | None = None
+    lif_peak_detection: dict[str, Any] | None = None
     manifest: dict[str, Any] | None = None
     cell_event_map: pd.DataFrame | None = None
     cell_event_map_info: dict[str, Any] | None = None
@@ -6143,8 +6448,21 @@ class AppData:
         binding = project_table_binding(intermediate_tables)
 
         lif_traces = pd.read_parquet(project.lif_traces_path).sort_values(["channel", "time_min"]).reset_index(drop=True)
-        lif_peaks = pd.read_parquet(project.lif_peaks_path)
-        lif_peaks = lif_peaks[lif_peaks["peak_stage"].eq("merged")].sort_values(["time_min", "channel"]).reset_index(drop=True)
+        all_lif_peaks = pd.read_parquet(project.lif_peaks_path)
+        peak_detection = lif_peak_detection_from_manifest(manifest)
+        explicit_peak_detection = isinstance(
+            (manifest or {}).get("lif_peak_detection"), dict
+        )
+        all_lif_peaks = validate_and_adapt_lif_peak_detector_binding(
+            all_lif_peaks,
+            peak_detection,
+            explicit_peak_detection=explicit_peak_detection,
+        )
+        lif_peaks = (
+            all_lif_peaks[all_lif_peaks["peak_stage"].eq("merged")]
+            .sort_values(["time_min", "channel"])
+            .reset_index(drop=True)
+        )
         ms_events = pd.read_parquet(project.ms_events_path).sort_values("time_min").reset_index(drop=True)
         ms_scan = pd.read_parquet(project.ms_scan_path).sort_values("scan_start_time_min").reset_index(drop=True)
         cell_event_map, cell_event_map_info = load_project_cell_event_map(
@@ -6195,9 +6513,10 @@ class AppData:
             calibration_protocol,
             float(project_config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)),
         )
+        automatic_peaks = automatic_lif_peak_evidence(lif_peaks)
         if protocol_confirmed:
             alignment = estimate_shift_alignment(
-                lif_peaks,
+                automatic_peaks,
                 ms_events,
                 float(project_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
                 acquisition_layout=acquisition_layout,
@@ -6226,7 +6545,7 @@ class AppData:
                 )
             alignment = apply_qc_alignment_model(
                 alignment,
-                lif_peaks,
+                automatic_peaks,
                 ms_events,
                 qc_calibration_end_min=float(project_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
                 acquisition_layout=acquisition_layout,
@@ -6311,6 +6630,7 @@ class AppData:
             acquisition_layout=acquisition_layout,
             calibration_protocol=calibration_protocol,
             post_qc_strategy=post_qc_strategy,
+            lif_peak_detection=peak_detection,
             manifest=manifest,
             cell_event_map=cell_event_map,
             cell_event_map_info=cell_event_map_info,
@@ -6356,6 +6676,10 @@ class AppData:
             "acquisition_layout": normalize_acquisition_layout(self.acquisition_layout),
             "calibration_protocol": copy.deepcopy(self.calibration_protocol),
             "post_qc_strategy": copy.deepcopy(self.post_qc_strategy),
+            "lif_peak_detection": copy.deepcopy(
+                self.lif_peak_detection
+                or lif_peak_detection_from_manifest(self.manifest)
+            ),
             "cell_event_map": {
                 "available": self.cell_event_map is not None,
                 "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
@@ -7049,6 +7373,7 @@ class AppData:
         qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
         calibration_protocol: dict[str, Any] | None = None,
         post_qc_strategy: dict[str, Any] | None = None,
+        lif_peak_detection: dict[str, Any] | None = None,
         annotation_start_min: float | None = None,
         local_delta_seed_window_min: float = DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
         cell_event_map_path: Path | None = None,
@@ -7105,6 +7430,7 @@ class AppData:
                     qc_anchor_channels=qc_anchor_channels,
                     calibration_protocol=calibration_protocol,
                     post_qc_strategy=post_qc_strategy,
+                    lif_peak_detection=lif_peak_detection,
                     annotation_start_min=annotation_start_min,
                     local_delta_seed_window_min=local_delta_seed_window_min,
                     cell_event_map_path=cell_event_map_path,
@@ -7176,6 +7502,14 @@ class AppData:
             effective_post_qc_strategy = normalize_post_qc_strategy(
                 post_qc_strategy, acquisition_layout
             )
+        try:
+            effective_lif_peak_detection = normalize_lif_peak_detection(
+                lif_peak_detection
+                if lif_peak_detection is not None
+                else adaptive_lif_peak_detection()
+            )
+        except ValueError as exc:
+            raise BadRequest(f"LIF 峰检测配置无效: {exc}") from exc
         effective_annotation_start_min = float(
             DEFAULT_ANNOTATION_START_MIN
             if annotation_start_min is None
@@ -7267,6 +7601,7 @@ class AppData:
             "schema_version": PROJECT_SCHEMA_VERSION,
             "calibration_protocol": effective_protocol,
             "post_qc_strategy": effective_post_qc_strategy,
+            "lif_peak_detection": effective_lif_peak_detection,
             "annotation_config": {
                 "qc_calibration_end_min": protocol_end_min,
                 "annotation_start_min": effective_annotation_start_min,
@@ -7298,6 +7633,12 @@ class AppData:
                         )
                     ),
                     f"- 后段 QC 策略：`{effective_post_qc_strategy['mode']}`。",
+                    (
+                        "- LIF 峰检测："
+                        f"`v{effective_lif_peak_detection['detector_version']} "
+                        f"{effective_lif_peak_detection['profile']}`；"
+                        "weak 峰仅供人工复核，不参与自动匹配或时间模型训练。"
+                    ),
                     f"- 事件标注起点：`{effective_annotation_start_min:g} min`。",
                     "",
                     "## 原始输入",
@@ -7370,6 +7711,7 @@ class AppData:
             cell_event_map=map_manifest_entry,
             calibration_protocol=effective_protocol,
             post_qc_strategy=effective_post_qc_strategy,
+            lif_peak_detection=effective_lif_peak_detection,
             annotation_config={
                 "annotation_start_min": effective_annotation_start_min,
                 "local_delta_seed_window_min": float(local_delta_seed_window_min),
@@ -7468,6 +7810,14 @@ class AppData:
             "post_qc_strategy": strategy,
             "post_qc_strategy_hash": post_qc_strategy_hash(
                 strategy, self.acquisition_layout
+            ),
+            "lif_peak_detection": copy.deepcopy(
+                self.lif_peak_detection
+                or lif_peak_detection_from_manifest(self.manifest)
+            ),
+            "lif_peak_detection_hash": lif_peak_detection_hash(
+                self.lif_peak_detection
+                or lif_peak_detection_from_manifest(self.manifest)
             ),
         }
 
@@ -8238,6 +8588,16 @@ class AppData:
         g2_row = g2.iloc[0]
         r1_row = r1.iloc[0]
         ms_row = ms.iloc[0]
+        weak_anchor_ids = [
+            str(row["peak_id"])
+            for row in (g2_row, r1_row)
+            if str(row.get("peak_tier") or "core").strip().lower() == "weak"
+        ]
+        if weak_anchor_ids:
+            raise BadRequest(
+                "Weak LIF peaks cannot be reconstructed as automatic QC candidates: "
+                + ", ".join(weak_anchor_ids)
+            )
         anchor_a_channel = str(g2_row["channel"])
         anchor_b_channel = str(r1_row["channel"])
         g2_plot_sec = float(g2_row["time_sec"]) + self.channel_shift_sec(anchor_a_channel, "aligned")
@@ -8304,6 +8664,12 @@ class AppData:
             "label": self.cell_label_for_channel(lif_channel),
             "lif_channel": lif_channel,
             "lif_peak_id": lif_peak_id,
+            "lif_peak_tier": str(lif_row.get("peak_tier") or "core"),
+            "lif_peak_detection_hash": str(
+                lif_row.get("detector_config_hash")
+                or self.project_config().get("lif_peak_detection_hash")
+                or ""
+            ),
             "g1_peak_id": lif_peak_id if lif_channel == "G1" else None,
             "r2_peak_id": lif_peak_id if lif_channel == "R2" else None,
             "g2_peak_id": lif_peak_id if lif_channel == "G2" else None,
@@ -8337,51 +8703,76 @@ class AppData:
         window_end_min: float | None = None,
     ) -> dict[str, Any]:
         if annotation_id.startswith("auto_qc:"):
-            return self.payload_from_auto_group(self.auto_group_by_id(annotation_id))
+            if window_start_min is None or window_end_min is None:
+                raise BadRequest("Reviewing an automatic front-QC candidate requires its active window")
+            group = self.auto_group_by_id(annotation_id)
+            active_start = float(window_start_min)
+            active_end = float(window_end_min)
+            plot_times = qc_group_plot_times(group)
+            if not plot_times or not all(
+                active_start <= value <= active_end for value in plot_times
+            ):
+                raise BadRequest(
+                    f"Unknown or inactive front-QC candidate_id in active window: {annotation_id}"
+                )
+            return self.payload_from_auto_group(group)
         if annotation_id.startswith("post_qc:"):
             if not self.frozen_time_model():
                 raise BadRequest("Freeze local time model before reviewing QC survey candidates")
-            if annotation_id.startswith(("post_qc:v2:", "post_qc:v3:")):
-                if window_start_min is None or window_end_min is None:
-                    raise BadRequest("Reviewing a multi-anchor QC candidate requires its active window")
-                for group in self.build_post_qc_candidates(
-                    float(window_start_min) - WINDOW_CONTEXT_MARGIN_MIN,
-                    float(window_end_min) + WINDOW_CONTEXT_MARGIN_MIN,
-                    "aligned",
-                ):
-                    if post_qc_candidate_id(group) == annotation_id:
-                        return self.payload_from_post_qc_group(group)
-                raise BadRequest(f"Unknown post-QC candidate_id in active window: {annotation_id}")
-            parts = annotation_id.split(":", 3)
-            if len(parts) != 4:
-                raise BadRequest(f"Malformed post_qc candidate_id: {annotation_id}")
-            return self.payload_from_qc_ids(parts[1], parts[2], parts[3], post_qc=True)
+            if window_start_min is None or window_end_min is None:
+                raise BadRequest("Reviewing a post-QC candidate requires its active window")
+            active_start = float(window_start_min)
+            active_end = float(window_end_min)
+            for group in self.build_post_qc_candidates(
+                active_start - WINDOW_CONTEXT_MARGIN_MIN,
+                active_end + WINDOW_CONTEXT_MARGIN_MIN,
+                "aligned",
+            ):
+                if post_qc_candidate_id(group) != annotation_id:
+                    continue
+                plot_times = qc_group_plot_times(group)
+                if plot_times and all(active_start <= value <= active_end for value in plot_times):
+                    return self.payload_from_post_qc_group(group)
+            raise BadRequest(f"Unknown or inactive post-QC candidate_id in active window: {annotation_id}")
         if annotation_id.startswith("cell:"):
             if not self.frozen_time_model():
                 raise BadRequest("Freeze local time model before reviewing cell candidates")
             parts = annotation_id.split(":", 3)
             if len(parts) != 4:
                 raise BadRequest(f"Malformed cell candidate_id: {annotation_id}")
-            payload = self.payload_from_cell_ids(parts[1], parts[2], parts[3])
-            if window_start_min is not None and window_end_min is not None:
-                for candidate in self.build_cell_candidates(
-                    float(window_start_min) - WINDOW_CONTEXT_MARGIN_MIN,
-                    float(window_end_min) + WINDOW_CONTEXT_MARGIN_MIN,
-                    "aligned",
+            if window_start_min is None or window_end_min is None:
+                raise BadRequest("Reviewing an automatic cell candidate requires its active window")
+            active_start = float(window_start_min)
+            active_end = float(window_end_min)
+            matched_candidate = None
+            for candidate in self.build_cell_candidates(
+                active_start - WINDOW_CONTEXT_MARGIN_MIN,
+                active_end + WINDOW_CONTEXT_MARGIN_MIN,
+                "aligned",
+            ):
+                if cell_candidate_id(candidate) != annotation_id:
+                    continue
+                if all(
+                    active_start <= float(candidate[key]) <= active_end
+                    for key in ("lif_plot_time_min", "ms_plot_time_min")
                 ):
-                    if cell_candidate_id(candidate) != annotation_id:
-                        continue
-                    for key in [
-                        "candidate_type",
-                        "cross_channel_candidate_conflict",
-                        "arbitration_status",
-                        "arbitration_reason",
-                        "cross_channel_alternatives",
-                        "selection_reason",
-                    ]:
-                        if key in candidate:
-                            payload[key] = clean_value(candidate.get(key))
+                    matched_candidate = candidate
                     break
+            if matched_candidate is None:
+                raise BadRequest(
+                    f"Unknown or inactive automatic cell candidate_id in active window: {annotation_id}"
+                )
+            payload = self.payload_from_cell_ids(parts[1], parts[2], parts[3])
+            for key in [
+                "candidate_type",
+                "cross_channel_candidate_conflict",
+                "arbitration_status",
+                "arbitration_reason",
+                "cross_channel_alternatives",
+                "selection_reason",
+            ]:
+                if key in matched_candidate:
+                    payload[key] = clean_value(matched_candidate.get(key))
             return payload
         raise BadRequest(f"Unknown auto candidate_id: {annotation_id}")
 
@@ -8425,6 +8816,10 @@ class AppData:
             row = selected.iloc[0]
             if str(row["channel"]) != channel:
                 raise BadRequest(f"Manual QC anchor expected {channel}, got {row['channel']}")
+            if str(row.get("peak_tier") or "core").strip().lower() == "weak":
+                raise BadRequest(
+                    "weak LIF 峰仅供人工细胞配对复核，不能作为 QC 对齐或后段 delta 的训练 anchor"
+                )
             peak_rows[channel] = row
         covered_axes = {str(channel_time_axes[channel]) for channel in peak_rows}
         required_axes = {str(channel_time_axes[channel]) for channel in anchors}
@@ -8912,11 +9307,21 @@ class AppData:
                     qc_anchor_peak_id_map(group) == normalized_anchor_ids
                     and str(group.get("ms_event_id")) == ms_event_id
                 ):
+                    review_start = window_start_min
+                    review_end = window_end_min
+                    if review_start is None or review_end is None:
+                        group_plot_times = qc_group_plot_times(group)
+                        if not group_plot_times:
+                            raise BadRequest(
+                                "Selected front-QC anchors have no active display-time relation"
+                            )
+                        review_start = min(group_plot_times)
+                        review_end = max(group_plot_times)
                     return self.review_auto_candidate(
                         candidate_id_for_group(group),
                         "accepted",
-                        window_start_min=window_start_min,
-                        window_end_min=window_end_min,
+                        window_start_min=float(review_start),
+                        window_end_min=float(review_end),
                         time_mode=time_mode,
                         clear_qc_alignment_model=clear_qc_alignment_model,
                     )
@@ -9626,6 +10031,7 @@ class AppData:
         time_mode: str = "aligned",
         preview_ms_delta_sec: float | None = None,
         lif_signal_mode: str = DEFAULT_LIF_SIGNAL_MODE,
+        include_weak_lif_peaks: bool = False,
     ) -> dict[str, Any]:
         if not math.isfinite(float(start_min)):
             raise BadRequest("start_min must be a finite number")
@@ -9659,6 +10065,19 @@ class AppData:
         for channel, sub in self.lif_peaks.groupby("channel", sort=False):
             shift_min = self.channel_shift_sec(str(channel), time_mode) / 60.0
             part = sub.copy()
+            if "peak_tier" not in part.columns:
+                part["peak_tier"] = "core"
+            if "detector_version" not in part.columns:
+                part["detector_version"] = int(
+                    (self.lif_peak_detection or {}).get("detector_version", 1)
+                )
+            if "detector_config_hash" not in part.columns:
+                part["detector_config_hash"] = lif_peak_detection_hash(
+                    self.lif_peak_detection
+                    or lif_peak_detection_from_manifest(self.manifest)
+                )
+            if not bool(include_weak_lif_peaks):
+                part = automatic_lif_peak_evidence(part).copy()
             part["raw_time_min"] = part["time_min"]
             part["raw_time_sec"] = part["time_sec"]
             part["plot_time_min"] = part["time_min"] + shift_min
@@ -9750,6 +10169,11 @@ class AppData:
             "close_peak_risk",
             "merge_risk",
             "parent_raw_peak_ids",
+            "peak_tier",
+            "detector_version",
+            "detector_config_hash",
+            "local_snr",
+            "template_similarity",
         ]
         event_cols = [
             "event_id",
@@ -9909,6 +10333,7 @@ class AppData:
                 "lif_signal_mode": lif_signal_mode,
                 "lif_trace_y_col": lif_trace_y_col,
                 "lif_peak_y_col": lif_peak_y_col,
+                "include_weak_lif_peaks": bool(include_weak_lif_peaks),
             },
             "alignment": self.alignment,
             "project_config": self.project_config(),
@@ -10015,6 +10440,7 @@ class BootstrapAppData:
         time_mode: str = "aligned",
         preview_ms_delta_sec: float | None = None,
         lif_signal_mode: str = DEFAULT_LIF_SIGNAL_MODE,
+        include_weak_lif_peaks: bool = False,
     ) -> dict[str, Any]:
         window_min = max(0.25, min(float(window_min), 15.0))
         lif_signal_mode = normalize_lif_signal_mode(lif_signal_mode)
@@ -10032,6 +10458,7 @@ class BootstrapAppData:
                 "lif_signal_mode": lif_signal_mode,
                 "lif_trace_y_col": lif_trace_y_col,
                 "lif_peak_y_col": lif_peak_y_col,
+                "include_weak_lif_peaks": bool(include_weak_lif_peaks),
             },
             "alignment": self.meta()["alignment"],
             "project_config": self.project_config(),
@@ -11312,6 +11739,10 @@ HTML = r"""<!doctype html>
             <option value="hidden">隐藏</option>
           </select>
         </label>
+        <label id="showWeakLifPeaksLabel" class="checkbox-row" style="margin:0; white-space:nowrap;" title="weak 峰只供人工复核，不参与自动匹配">
+          <input id="showWeakLifPeaks" type="checkbox" />
+          显示 weak 弱峰
+        </label>
         <button id="go">显示窗口</button>
       </div>
       <div class="window-readout">
@@ -11380,6 +11811,14 @@ HTML = r"""<!doctype html>
             <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
           </div>
           <div class="coordinate-source-help">必须包含 scan_start_time、UMAP1、UMAP2；CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
+        </div>
+        <label for="importLifPeakDetectorVersion">LIF 峰检测</label>
+        <div>
+          <select id="importLifPeakDetectorVersion">
+            <option value="2" selected>v2：core + weak 自适应（推荐）</option>
+            <option value="1">v1：复现 v0.3 / 旧 V3 固定阈值</option>
+          </select>
+          <div class="coordinate-source-help">v2 保留高置信 core 峰，并补充局部稳健噪声与峰形筛选的 weak 峰。弱峰仅供人工复核，不参与自动匹配或时间模型训练；人工确认配对后可以导出到主 CSV。</div>
         </div>
       </div>
       <section class="import-section" aria-labelledby="calibrationProtocolTitle">
@@ -11464,6 +11903,15 @@ HTML = r"""<!doctype html>
         <span>事件标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
         <span>后段预校准取证范围(min)（无标签 delta）</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
+      <section class="import-section">
+        <div class="import-section-title"><span>LIF 峰检测（预处理绑定，只读）</span></div>
+        <div class="config-grid">
+          <span>检测器版本</span><output id="cfgLifPeakDetectorVersion">-</output>
+          <span>科学参数</span><output id="cfgLifPeakDetectorDetails">-</output>
+          <span>配置 hash</span><output id="cfgLifPeakDetectorHash">-</output>
+        </div>
+        <div class="qc-anchor-rule">如需切换 v1/v2，请新建项目或项目副本并重跑中间表；本页不会让新 detector 配置静默套用旧峰表。</div>
+      </section>
       <section id="cfgProtocolPanel" class="import-section">
         <div class="import-section-title"><span>分段 calibration_protocol</span></div>
         <div class="qc-anchor-rule">通道与顺序保持不变；可先保存待确认边界。全部勾选“边界已确认”后，才会计算前段校准并解锁后段阶段。</div>
@@ -11526,6 +11974,7 @@ HTML = r"""<!doctype html>
       current: null,
       selectedCandidateId: null,
       showRejected: false,
+      showWeakLifPeaks: false,
       manualMode: false,
       stage: 'qc_calibration',
       eventFilter: 'all',
@@ -11874,6 +12323,16 @@ HTML = r"""<!doctype html>
       state.stage = 'qc_calibration';
       state.eventFilter = 'all';
       state.manualAnnotationKind = 'qc';
+      state.showWeakLifPeaks = false;
+      const weakToggle = el('showWeakLifPeaks');
+      const detector = state.meta?.lif_peak_detection || {};
+      const weakAvailable = Number(detector.detector_version || 1) === 2
+        && detector.weak?.enabled === true;
+      weakToggle.checked = false;
+      weakToggle.disabled = !weakAvailable;
+      el('showWeakLifPeaksLabel').title = weakAvailable
+        ? 'weak 峰只供人工复核；仅在事件标注的细胞手工配对模式可点击'
+        : '当前 v1 项目没有 weak 峰；如需 v2，请新建项目或项目副本并重跑中间表';
       applyStageWindowWidth();
       state.selectedCandidateId = null;
       state.previewDeltaSec = null;
@@ -12311,6 +12770,7 @@ HTML = r"""<!doctype html>
         el('importAnnotationStart').value = '40';
         el('importSeedWindow').value = '2.5';
         el('importPostQcMode').value = 'disabled';
+        el('importLifPeakDetectorVersion').value = '2';
         const templateOptions = el('importProjectTemplates');
         if (templateOptions) templateOptions.open = false;
         renderImportLifRows();
@@ -12433,6 +12893,7 @@ HTML = r"""<!doctype html>
         el('timeMode').value = 'raw';
       }
       let url = `/api/window?start_min=${encodeURIComponent(state.start)}&window_min=${encodeURIComponent(state.width)}&time_mode=${encodeURIComponent(state.timeMode)}`;
+      url += `&include_weak_lif_peaks=${state.showWeakLifPeaks ? 'true' : 'false'}`;
       if (state.stage === 'local_calibration' && state.previewDeltaSec !== null) {
         url += `&preview_ms_delta_sec=${encodeURIComponent(state.previewDeltaSec)}`;
       }
@@ -12804,6 +13265,19 @@ HTML = r"""<!doctype html>
       el('cfgQcEnd').value = fmt(cfg.qc_calibration_end_min ?? 10.5, 1);
       el('cfgAnnotationStart').value = fmt(cfg.annotation_start_min ?? 40.0, 1);
       el('cfgSeedWindow').value = fmt(cfg.local_delta_seed_window_min ?? 2.5, 1);
+      const detector = cfg.lif_peak_detection || state.meta?.lif_peak_detection || {};
+      const detectorVersion = Number(detector.detector_version || 1);
+      el('cfgLifPeakDetectorVersion').textContent = detectorVersion === 2
+        ? 'v2 · core + weak（weak 仅人工复核）'
+        : 'v1 · 旧 V3 固定阈值兼容模式';
+      const core = detector.core || {};
+      const weak = detector.weak || {};
+      el('cfgLifPeakDetectorDetails').textContent = detectorVersion === 2
+        ? `${detector.profile || 'core_weak'}；core prominence ≥ ${fmt(core.prominence_snr_min, 2)}σ；weak prominence ≥ ${fmt(weak.prominence_snr_min, 2)}σ；峰形相似度 ≥ ${fmt(weak.template_similarity_min, 2)}；局部噪声窗 ${fmt(weak.local_noise_block_sec, 1)} s；至少 ${weak.min_core_template_peaks ?? '-'} 个 core 且 ${fmt(weak.min_core_rate_per_min, 2)} core/min`
+        : `${detector.profile || 'legacy_v3_fixed'}；core prominence ≥ ${fmt(core.prominence_snr_min, 2)}σ；不生成 weak`;
+      el('cfgLifPeakDetectorHash').textContent = String(
+        cfg.lif_peak_detection_hash || '-'
+      );
       const protocol = cfg.calibration_protocol || null;
       const legacy = Boolean(protocol?.compatibility_mode);
       el('cfgQcEnd').disabled = true;
@@ -13616,6 +14090,30 @@ HTML = r"""<!doctype html>
           annotation_start_min: annotationStart,
           local_delta_seed_window_min: seedWindow,
           post_qc_strategy: postQcStrategy,
+          lif_peak_detection: el('importLifPeakDetectorVersion').value === '1'
+            ? {
+                detector_version: 1,
+                profile: 'legacy_v3_fixed',
+                core: { prominence_snr_min: 10.0 },
+                weak: { enabled: false, prominence_snr_min: null },
+                geometry: { min_distance_sec: 0.02, merge_gap_sec: 0.12, min_width_sec: 0.02, max_width_sec: 1.0 },
+                weak_usage: 'disabled'
+              }
+            : {
+                detector_version: 2,
+                profile: 'core_weak',
+                core: { prominence_snr_min: 10.0 },
+                weak: {
+                  enabled: true,
+                  prominence_snr_min: 3.5,
+                  template_similarity_min: 0.75,
+                  local_noise_block_sec: 10.0,
+                  min_core_template_peaks: 3,
+                  min_core_rate_per_min: 0.50,
+                },
+                geometry: { min_distance_sec: 0.02, merge_gap_sec: 0.12, min_width_sec: 0.02, max_width_sec: 1.0 },
+                weak_usage: 'manual_review_only'
+              },
           cell_event_map_path: el('importCellEventMap').value,
         });
         applyLoadedProjectMeta(result.meta);
@@ -13814,6 +14312,9 @@ HTML = r"""<!doctype html>
     function selectManualPeak(kind, row) {
       if (!state.manualMode) return;
       const cellMode = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
+      const weakPeak = kind !== 'MS760'
+        && String(row.peak_tier || 'core').trim().toLowerCase() === 'weak';
+      if (weakPeak && !cellMode) return;
       if (cellMode && kind !== 'MS760') {
         const allowed = new Set(
           (state.meta?.acquisition_layout?.lif_channels || [])
@@ -14087,8 +14588,16 @@ HTML = r"""<!doctype html>
           });
           const trackPeaks = state.current.lif_peaks
             .filter(p => track.channels.includes(p.channel));
-          const peakIsInteractive = p => !restrictThirdStageHits
-            || thirdStagePeakIds.has(String(p.peak_id));
+          const peakIsInteractive = p => {
+            const weakPeak = String(p.peak_tier || 'core').trim().toLowerCase() === 'weak';
+            if (weakPeak) {
+              return state.showWeakLifPeaks
+                && state.stage === 'event_annotation'
+                && state.manualAnnotationKind === 'cell';
+            }
+            return !restrictThirdStageHits
+              || thirdStagePeakIds.has(String(p.peak_id));
+          };
           const labelIds = automaticPeakLabelIds(
             trackPeaks.filter(peakIsInteractive),
             p => p.peak_id,
@@ -14101,13 +14610,15 @@ HTML = r"""<!doctype html>
           trackPeaks.forEach(p => {
               const peakY = lifPeakY(p);
               const interactive = peakIsInteractive(p);
+              const weakPeak = String(p.peak_tier || 'core').trim().toLowerCase() === 'weak';
               const c = svgEl('circle', {
                 cx: xScale(p.plot_time_min),
                 cy: yScale(peakY),
-                r: p.close_peak_risk || p.merge_risk ? 4.5 : 3.4,
-                fill: colorForChannel(p.channel),
-                stroke: p.close_peak_risk || p.merge_risk ? '#b42318' : '#fff',
-                'stroke-width': 1.3,
+                r: p.close_peak_risk || p.merge_risk ? 4.5 : (weakPeak ? 3.8 : 3.4),
+                fill: weakPeak ? '#fff' : colorForChannel(p.channel),
+                stroke: p.close_peak_risk || p.merge_risk ? '#b42318' : (weakPeak ? colorForChannel(p.channel) : '#fff'),
+                'stroke-width': weakPeak ? 1.8 : 1.3,
+                'stroke-dasharray': weakPeak ? '2 1' : '',
                 class: 'peak-marker'
               });
               if (interactive) {
@@ -14695,6 +15206,11 @@ HTML = r"""<!doctype html>
       renderCandidateList();
       draw();
     });
+    el('showWeakLifPeaks').addEventListener('change', async () => {
+      hideLineContextMenu();
+      state.showWeakLifPeaks = el('showWeakLifPeaks').checked;
+      await loadWindow();
+    });
     el('manualMode').addEventListener('click', () => {
       hideLineContextMenu();
       state.manualMode = !state.manualMode;
@@ -15145,6 +15661,9 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     raise BadRequest("start_min, window_min, and preview_ms_delta_sec must be numeric") from exc
                 time_mode = str(query.get("time_mode", ["aligned"])[0])
                 lif_signal_mode = str(query.get("lif_signal_mode", [DEFAULT_LIF_SIGNAL_MODE])[0])
+                include_weak_lif_peaks = str(
+                    query.get("include_weak_lif_peaks", ["false"])[0]
+                ).strip().lower() in {"1", "true", "yes", "on"}
                 self.send_json(
                     self.data.window(
                         start_min=start_min,
@@ -15152,6 +15671,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         time_mode=time_mode,
                         preview_ms_delta_sec=preview_ms_delta_sec,
                         lif_signal_mode=lif_signal_mode,
+                        include_weak_lif_peaks=include_weak_lif_peaks,
                     )
                 )
                 return
@@ -15424,6 +15944,11 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                             if isinstance(payload.get("post_qc_strategy"), dict)
                             else None
                         ),
+                        lif_peak_detection=(
+                            payload.get("lif_peak_detection")
+                            if isinstance(payload.get("lif_peak_detection"), dict)
+                            else None
+                        ),
                         annotation_start_min=(
                             float(payload.get("annotation_start_min"))
                             if payload.get("annotation_start_min") is not None
@@ -15448,6 +15973,11 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         r1_identity=str(payload.get("r1_identity", "Day9")),
                         r2_identity=str(payload.get("r2_identity", "Day3")),
                         raw_input_mode=str(payload.get("raw_input_mode", RAW_INPUT_MODE_EXTERNAL)),
+                        lif_peak_detection=(
+                            payload.get("lif_peak_detection")
+                            if isinstance(payload.get("lif_peak_detection"), dict)
+                            else None
+                        ),
                         cell_event_map_path=Path(str(payload["cell_event_map_path"])),
                     )
                 self.__class__.data = new_data

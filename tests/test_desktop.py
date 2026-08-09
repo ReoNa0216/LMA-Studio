@@ -272,6 +272,7 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
                 "run_v3_02_ms_event_calling.py",
             ],
         )
+        self.assertEqual(result["lif_detector_tiers"], ["core", "weak"])
 
     def test_windows_builder_prioritizes_selected_python_environment_dlls(self):
         script = (
@@ -282,6 +283,24 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
         self.assertIn("Library\\bin", script)
         self.assertRegex(script, r"\$env:PATH\s*=")
         self.assertRegex(script, r"libexpat\.dll")
+        self.assertIn("validate_bundle_runtime.py", script)
+
+    def test_windows_bundle_includes_versioned_lif_detector_module(self):
+        spec = (
+            Path(__file__).resolve().parents[1]
+            / "packaging/windows/lifms_annotation.spec"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("scripts/v3/lif_peak_detection.py", spec.replace("\\", "/"))
+
+        macos_spec = (
+            Path(__file__).resolve().parents[1]
+            / "packaging/macos/lifms_annotation_macos.spec"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "scripts/v3/lif_peak_detection.py",
+            macos_spec.replace("\\", "/"),
+        )
 
 
 if __name__ == "__main__":

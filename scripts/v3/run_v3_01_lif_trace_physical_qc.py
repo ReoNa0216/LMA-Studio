@@ -15,6 +15,19 @@ import pandas as pd
 from scipy.signal import find_peaks, peak_widths
 
 try:
+    from scripts.v3.lif_peak_detection import (
+        legacy_lif_peak_detection,
+        lif_peak_detection_hash,
+        normalize_lif_peak_detection,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from lif_peak_detection import (  # type: ignore[no-redef]
+        legacy_lif_peak_detection,
+        lif_peak_detection_hash,
+        normalize_lif_peak_detection,
+    )
+
+try:
     from scripts.v3.project_protocol import (
         classify_project_phase,
         load_project_protocol,
@@ -249,7 +262,49 @@ def read_lif_csv(spec: ChannelSpec) -> pd.DataFrame:
     return df[["channel", "label", "detector", "phase", "time_min", "time_sec", "raw"]]
 
 
-def add_baseline_and_noise(trace: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def _blockwise_local_baseline_noise(
+    time_sec: np.ndarray,
+    raw: np.ndarray,
+    *,
+    block_sec: float,
+    fallback_noise: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate a slowly varying center/scale without learning event counts."""
+
+    block_ids = np.floor((time_sec - float(time_sec[0])) / float(block_sec)).astype(int)
+    boundaries = np.r_[0, np.flatnonzero(np.diff(block_ids)) + 1, len(raw)]
+    centers: list[float] = []
+    medians: list[float] = []
+    scales: list[float] = []
+    for left, right in zip(boundaries[:-1], boundaries[1:]):
+        values = raw[int(left) : int(right)]
+        median = float(np.median(values))
+        mad = float(1.4826 * np.median(np.abs(values - median)))
+        if not np.isfinite(mad) or mad <= 0:
+            q25, q75 = np.quantile(values, [0.25, 0.75])
+            mad = float((q75 - q25) / 1.3489795)
+        if not np.isfinite(mad) or mad <= 0:
+            mad = float(fallback_noise)
+        centers.append(float((time_sec[int(left)] + time_sec[int(right) - 1]) / 2.0))
+        medians.append(median)
+        scales.append(max(mad, 1e-12))
+    baseline = np.interp(
+        time_sec,
+        np.asarray(centers, dtype=float),
+        np.asarray(medians, dtype=float),
+    )
+    noise = np.interp(
+        time_sec,
+        np.asarray(centers, dtype=float),
+        np.asarray(scales, dtype=float),
+    )
+    return baseline, np.maximum(noise, 1e-12)
+
+
+def add_baseline_and_noise(
+    trace: pd.DataFrame,
+    detection_config: dict | None = None,
+) -> tuple[pd.DataFrame, dict]:
     out = trace.copy()
     time_sec = out["time_sec"].to_numpy(float)
     raw = out["raw"].to_numpy(float)
@@ -274,10 +329,31 @@ def add_baseline_and_noise(trace: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     if not np.isfinite(noise) or noise <= 0:
         noise = 1e-12
 
+    config = normalize_lif_peak_detection(
+        detection_config if detection_config is not None else legacy_lif_peak_detection()
+    )
+    config_hash = lif_peak_detection_hash(config)
     out["baseline"] = baseline
     out["signal"] = signal
     out["signal_pos"] = np.maximum(signal, 0.0)
     out["snr_trace"] = out["signal_pos"] / noise
+    if int(config["detector_version"]) == 2 and bool(config["weak"]["enabled"]):
+        adaptive_baseline, adaptive_noise = _blockwise_local_baseline_noise(
+            time_sec,
+            raw,
+            block_sec=float(config["weak"]["local_noise_block_sec"]),
+            fallback_noise=noise,
+        )
+        adaptive_signal = raw - adaptive_baseline
+        out["adaptive_baseline"] = adaptive_baseline
+        out["adaptive_signal"] = adaptive_signal
+        out["adaptive_local_noise"] = adaptive_noise
+        out["adaptive_snr_trace"] = np.maximum(adaptive_signal, 0.0) / adaptive_noise
+    else:
+        out["adaptive_baseline"] = baseline
+        out["adaptive_signal"] = signal
+        out["adaptive_local_noise"] = noise
+        out["adaptive_snr_trace"] = np.maximum(signal, 0.0) / noise
     meta = {
         "channel": out["channel"].iloc[0],
         "label": out["label"].iloc[0],
@@ -291,12 +367,16 @@ def add_baseline_and_noise(trace: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "base_quantile": BASE_Q,
         "noise_pool_quantile": NOISE_POOL_Q,
         "noise": noise,
-        "prom_snr_min": PROM_SNR_MIN,
-        "prom_threshold": PROM_SNR_MIN * noise,
-        "raw_min_distance_sec": RAW_MIN_DISTANCE_SEC,
-        "merge_gap_sec": MERGE_GAP_SEC,
-        "min_width_sec": MIN_WIDTH_SEC,
-        "max_width_sec": MAX_WIDTH_SEC,
+        "prom_snr_min": float(config["core"]["prominence_snr_min"]),
+        "prom_threshold": float(config["core"]["prominence_snr_min"]) * noise,
+        "raw_min_distance_sec": float(config["geometry"]["min_distance_sec"]),
+        "merge_gap_sec": float(config["geometry"]["merge_gap_sec"]),
+        "min_width_sec": float(config["geometry"]["min_width_sec"]),
+        "max_width_sec": float(config["geometry"]["max_width_sec"]),
+        "detector_version": int(config["detector_version"]),
+        "detector_profile": str(config["profile"]),
+        "detector_config_hash": config_hash,
+        "weak_usage": str(config["weak_usage"]),
         "phase_boundaries_min": phase_boundaries_min(PROJECT_PHASE_POLICY),
         "red_pair_max_abs_offset_sec": RED_PAIR_MAX_ABS_OFFSET_SEC,
         "red_pair_bin_sec": RED_PAIR_BIN_SEC,
@@ -305,64 +385,273 @@ def add_baseline_and_noise(trace: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return out, meta
 
 
-def call_raw_peaks(trace: pd.DataFrame, meta: dict) -> pd.DataFrame:
+def _normalized_peak_shape(
+    standardized_signal: np.ndarray,
+    peak_index: int,
+    width_samples: float,
+    *,
+    points: int = 61,
+) -> np.ndarray:
+    grid = np.linspace(-3.0, 3.0, points)
+    positions = float(peak_index) + grid * max(float(width_samples), 1.0)
+    values = np.interp(
+        positions,
+        np.arange(len(standardized_signal), dtype=float),
+        standardized_signal,
+    )
+    edge_count = max(3, points // 8)
+    values = values - float(np.median(np.r_[values[:edge_count], values[-edge_count:]]))
+    apex = float(values[points // 2])
+    if not np.isfinite(apex) or apex <= 0:
+        return np.zeros(points, dtype=float)
+    return values / apex
+
+
+def call_raw_peaks(
+    trace: pd.DataFrame,
+    meta: dict,
+    detection_config: dict | None = None,
+) -> pd.DataFrame:
+    config = normalize_lif_peak_detection(
+        detection_config
+        if detection_config is not None
+        else {
+            "detector_version": int(meta.get("detector_version", 1)),
+            "profile": meta.get("detector_profile", "legacy_v3_fixed"),
+            "core": {
+                "prominence_snr_min": float(
+                    meta.get("prom_snr_min", PROM_SNR_MIN)
+                )
+            },
+            "weak": {
+                "enabled": False,
+                "prominence_snr_min": None,
+            },
+            "geometry": {
+                "min_distance_sec": float(
+                    meta.get("raw_min_distance_sec", RAW_MIN_DISTANCE_SEC)
+                ),
+                "merge_gap_sec": float(meta.get("merge_gap_sec", MERGE_GAP_SEC)),
+                "min_width_sec": float(meta.get("min_width_sec", MIN_WIDTH_SEC)),
+                "max_width_sec": float(meta.get("max_width_sec", MAX_WIDTH_SEC)),
+            },
+            "weak_usage": "disabled",
+        }
+    )
+    config_hash = lif_peak_detection_hash(config)
     signal = trace["signal"].to_numpy(float)
     time_sec = trace["time_sec"].to_numpy(float)
     raw = trace["raw"].to_numpy(float)
     dt_sec = float(meta["dt_sec"])
-    distance_points = max(1, int(round(RAW_MIN_DISTANCE_SEC / dt_sec)))
-    width_points = (MIN_WIDTH_SEC / dt_sec, MAX_WIDTH_SEC / dt_sec)
-    peaks, props = find_peaks(
+    geometry = config["geometry"]
+    distance_points = max(
+        1, int(round(float(geometry["min_distance_sec"]) / dt_sec))
+    )
+    width_points = (
+        float(geometry["min_width_sec"]) / dt_sec,
+        float(geometry["max_width_sec"]) / dt_sec,
+    )
+    core_threshold = float(config["core"]["prominence_snr_min"]) * float(
+        meta["noise"]
+    )
+    core_peaks, core_props = find_peaks(
         signal,
-        prominence=float(meta["prom_threshold"]),
+        prominence=core_threshold,
         distance=distance_points,
         width=width_points,
     )
-    if len(peaks) == 0:
+
+    calls: list[dict] = []
+    if len(core_peaks):
+        core_widths = peak_widths(signal, core_peaks, rel_height=0.5)
+        for order, peak_index in enumerate(core_peaks):
+            calls.append(
+                {
+                    "peak_index": int(peak_index),
+                    "peak_tier": "core",
+                    "width_samples": float(core_widths[0][order]),
+                    "left_ip": float(core_widths[2][order]),
+                    "right_ip": float(core_widths[3][order]),
+                    "prominence": float(core_props["prominences"][order]),
+                    "left_base": int(core_props["left_bases"][order]),
+                    "right_base": int(core_props["right_bases"][order]),
+                    "snr": float(
+                        core_props["prominences"][order] / float(meta["noise"])
+                    ),
+                    "local_snr": float(
+                        core_props["prominences"][order] / float(meta["noise"])
+                    ),
+                    "template_similarity": 1.0,
+                    "detection_signal": signal,
+                    "detection_noise": float(meta["noise"]),
+                }
+            )
+
+    trace_duration_min = max(
+        dt_sec / 60.0,
+        float(time_sec[-1] - time_sec[0]) / 60.0,
+    )
+    weak_model_ready = (
+        int(config["detector_version"]) == 2
+        and bool(config["weak"]["enabled"])
+        and len(core_peaks) >= int(config["weak"]["min_core_template_peaks"])
+        and len(core_peaks) / trace_duration_min
+        >= float(config["weak"]["min_core_rate_per_min"])
+    )
+    if weak_model_ready:
+        adaptive_signal = (
+            trace["adaptive_signal"].to_numpy(float)
+            if "adaptive_signal" in trace
+            else signal
+        )
+        adaptive_noise = (
+            trace["adaptive_local_noise"].to_numpy(float)
+            if "adaptive_local_noise" in trace
+            else np.full(len(trace), float(meta["noise"]), dtype=float)
+        )
+        standardized = adaptive_signal / np.maximum(adaptive_noise, 1e-12)
+        weak_floor = float(config["weak"]["prominence_snr_min"])
+        weak_peaks, weak_props = find_peaks(
+            standardized,
+            height=weak_floor,
+            prominence=weak_floor,
+            distance=distance_points,
+            width=width_points,
+        )
+        if len(weak_peaks):
+            weak_widths = peak_widths(standardized, weak_peaks, rel_height=0.5)
+            core_shape_rows: list[np.ndarray] = []
+            for peak_index, width_samples in zip(
+                core_peaks, core_widths[0]
+            ):
+                shape = _normalized_peak_shape(
+                    standardized, int(peak_index), float(width_samples)
+                )
+                if np.linalg.norm(shape) > 0:
+                    core_shape_rows.append(shape)
+            if core_shape_rows:
+                template = np.median(np.asarray(core_shape_rows), axis=0)
+            else:
+                template = np.exp(-4.0 * np.log(2.0) * np.linspace(-3, 3, 61) ** 2)
+            template_norm = float(np.linalg.norm(template))
+            core_times = time_sec[core_peaks] if len(core_peaks) else np.asarray([])
+            core_width_sec = np.asarray(core_widths[0], dtype=float) * dt_sec
+            learned_min_width_sec = max(
+                float(geometry["min_width_sec"]),
+                float(np.quantile(core_width_sec, 0.10)) * 0.50,
+            )
+            learned_max_width_sec = min(
+                float(geometry["max_width_sec"]),
+                float(np.quantile(core_width_sec, 0.90)) * 2.00,
+            )
+            similarity_floor = float(config["weak"]["template_similarity_min"])
+            for order, peak_index in enumerate(weak_peaks):
+                peak_time = float(time_sec[int(peak_index)])
+                if len(core_times) and np.min(np.abs(core_times - peak_time)) <= float(
+                    geometry["merge_gap_sec"]
+                ):
+                    continue
+                candidate_width_sec = float(weak_widths[0][order] * dt_sec)
+                if not (
+                    learned_min_width_sec
+                    <= candidate_width_sec
+                    <= learned_max_width_sec
+                ):
+                    continue
+                shape = _normalized_peak_shape(
+                    standardized,
+                    int(peak_index),
+                    float(weak_widths[0][order]),
+                )
+                shape_norm = float(np.linalg.norm(shape))
+                similarity = (
+                    float(np.dot(shape, template) / (shape_norm * template_norm))
+                    if shape_norm > 0 and template_norm > 0
+                    else -1.0
+                )
+                if similarity < similarity_floor:
+                    continue
+                local_noise = float(adaptive_noise[int(peak_index)])
+                standardized_prominence = float(weak_props["prominences"][order])
+                calls.append(
+                    {
+                        "peak_index": int(peak_index),
+                        "peak_tier": "weak",
+                        "width_samples": float(weak_widths[0][order]),
+                        "left_ip": float(weak_widths[2][order]),
+                        "right_ip": float(weak_widths[3][order]),
+                        "prominence": standardized_prominence * local_noise,
+                        "left_base": int(weak_props["left_bases"][order]),
+                        "right_base": int(weak_props["right_bases"][order]),
+                        "snr": standardized_prominence,
+                        "local_snr": standardized_prominence,
+                        "template_similarity": similarity,
+                        "detection_signal": adaptive_signal,
+                        "detection_noise": local_noise,
+                    }
+                )
+
+    if not calls:
         return pd.DataFrame()
-
-    width_result = peak_widths(signal, peaks, rel_height=0.5)
-    width_samples = width_result[0]
-    left_ips = width_result[2]
-    right_ips = width_result[3]
-    prominences = props["prominences"]
-    left_bases = props["left_bases"]
-    right_bases = props["right_bases"]
-
+    calls.sort(key=lambda row: (int(row["peak_index"]), row["peak_tier"] != "core"))
     rows = []
-    channel = trace["channel"].iloc[0]
-    for i, peak_idx in enumerate(peaks, start=1):
-        left_i = max(0, int(np.floor(left_ips[i - 1])))
-        right_i = min(len(trace) - 1, int(np.ceil(right_ips[i - 1])))
+    channel = str(trace["channel"].iloc[0])
+    sample_positions = np.arange(len(time_sec), dtype=float)
+    for order, call in enumerate(calls, start=1):
+        peak_index = int(call["peak_index"])
+        left_ip = float(call["left_ip"])
+        right_ip = float(call["right_ip"])
+        left_i = max(0, int(np.floor(left_ip)))
+        right_i = min(len(trace) - 1, int(np.ceil(right_ip)))
         local_time = time_sec[left_i : right_i + 1]
-        local_signal = np.maximum(signal[left_i : right_i + 1], 0.0)
-        area = float(np.trapezoid(local_signal, local_time)) if len(local_time) >= 2 else 0.0
+        detection_signal = np.asarray(call["detection_signal"], dtype=float)
+        local_signal = np.maximum(detection_signal[left_i : right_i + 1], 0.0)
+        area = (
+            float(np.trapezoid(local_signal, local_time))
+            if len(local_time) >= 2
+            else 0.0
+        )
+        peak_id = f"{channel}_raw_{order:06d}"
         rows.append(
             {
-                "peak_id": f"{channel}_raw_{i:06d}",
+                "peak_id": peak_id,
                 "peak_stage": "raw",
-                "parent_raw_peak_ids": f"{channel}_raw_{i:06d}",
+                "peak_tier": str(call["peak_tier"]),
+                "detector_version": int(config["detector_version"]),
+                "detector_profile": str(config["profile"]),
+                "detector_config_hash": config_hash,
+                "weak_usage": str(config["weak_usage"]),
+                "parent_raw_peak_ids": peak_id,
                 "raw_peak_count_merged": 1,
                 "channel": channel,
                 "label": trace["label"].iloc[0],
                 "detector": trace["detector"].iloc[0],
-                "phase": trace["phase"].iloc[peak_idx],
-                "peak_index": int(peak_idx),
-                "time_min": float(trace["time_min"].iloc[peak_idx]),
-                "time_sec": float(time_sec[peak_idx]),
-                "raw": float(raw[peak_idx]),
-                "baseline": float(trace["baseline"].iloc[peak_idx]),
-                "height": float(signal[peak_idx]),
-                "prominence": float(prominences[i - 1]),
-                "snr": float(prominences[i - 1] / meta["noise"]),
-                "width_sec": float(width_samples[i - 1] * dt_sec),
+                "phase": trace["phase"].iloc[peak_index],
+                "peak_index": peak_index,
+                "time_min": float(trace["time_min"].iloc[peak_index]),
+                "time_sec": float(time_sec[peak_index]),
+                "raw": float(raw[peak_index]),
+                "baseline": float(trace["baseline"].iloc[peak_index]),
+                # Keep the marker on the plotted legacy baseline-corrected trace.
+                "height": float(signal[peak_index]),
+                "prominence": float(call["prominence"]),
+                "snr": float(call["snr"]),
+                "local_snr": float(call["local_snr"]),
+                "template_similarity": float(call["template_similarity"]),
+                "width_sec": float(call["width_samples"] * dt_sec),
                 "area": area,
-                "left_sec": float(np.interp(left_ips[i - 1], np.arange(len(time_sec)), time_sec)),
-                "right_sec": float(np.interp(right_ips[i - 1], np.arange(len(time_sec)), time_sec)),
-                "left_base_sec": float(time_sec[left_bases[i - 1]]),
-                "right_base_sec": float(time_sec[right_bases[i - 1]]),
-                "noise": float(meta["noise"]),
-                "prom_threshold": float(meta["prom_threshold"]),
+                "left_sec": float(np.interp(left_ip, sample_positions, time_sec)),
+                "right_sec": float(np.interp(right_ip, sample_positions, time_sec)),
+                "left_base_sec": float(time_sec[int(call["left_base"])]),
+                "right_base_sec": float(time_sec[int(call["right_base"])]),
+                "noise": float(call["detection_noise"]),
+                "prom_threshold": float(
+                    config["core"]["prominence_snr_min"] * meta["noise"]
+                    if call["peak_tier"] == "core"
+                    else config["weak"]["prominence_snr_min"]
+                    * float(call["detection_noise"])
+                ),
+                "merge_gap_sec": float(geometry["merge_gap_sec"]),
             }
         )
     peaks_df = pd.DataFrame(rows)
@@ -378,8 +667,11 @@ def merge_close_raw_peaks(raw_peaks: pd.DataFrame) -> pd.DataFrame:
     rows = []
     ordered = raw_peaks.sort_values("time_sec").reset_index(drop=True)
     groups: list[list[int]] = [[0]]
+    merge_gap_sec = float(
+        ordered.get("merge_gap_sec", pd.Series([MERGE_GAP_SEC])).iloc[0]
+    )
     for idx in range(1, len(ordered)):
-        if float(ordered.loc[idx, "time_sec"] - ordered.loc[idx - 1, "time_sec"]) <= MERGE_GAP_SEC:
+        if float(ordered.loc[idx, "time_sec"] - ordered.loc[idx - 1, "time_sec"]) <= merge_gap_sec:
             groups[-1].append(idx)
         else:
             groups.append([idx])
@@ -409,6 +701,17 @@ def merge_close_raw_peaks(raw_peaks: pd.DataFrame) -> pd.DataFrame:
                 "right_sec": right_sec,
                 "left_base_sec": float(sub["left_base_sec"].min()),
                 "right_base_sec": float(sub["right_base_sec"].max()),
+                "peak_tier": (
+                    "core"
+                    if "core" in set(sub.get("peak_tier", pd.Series(["core"])).astype(str))
+                    else "weak"
+                ),
+                "local_snr": float(sub.get("local_snr", sub["snr"]).max()),
+                "template_similarity": float(
+                    sub.get(
+                        "template_similarity", pd.Series([1.0] * len(sub), index=sub.index)
+                    ).max()
+                ),
             }
         )
         rows.append(row)
@@ -822,13 +1125,21 @@ def run(project_dir: str | Path | None = None) -> None:
     OUT_FIG.mkdir(parents=True, exist_ok=True)
     OUT_QC.mkdir(parents=True, exist_ok=True)
 
+    detection_config = normalize_lif_peak_detection(
+        PROJECT_PHASE_POLICY.get("lif_peak_detection")
+        or legacy_lif_peak_detection(compatibility_mode=True)
+    )
     traces = []
     peak_tables = []
     meta_rows = []
     for spec in load_channel_specs():
         trace = read_lif_csv(spec)
-        trace, meta = add_baseline_and_noise(trace)
-        raw_peaks = call_raw_peaks(trace, meta)
+        trace, meta = add_baseline_and_noise(
+            trace, detection_config=detection_config
+        )
+        raw_peaks = call_raw_peaks(
+            trace, meta, detection_config=detection_config
+        )
         merged_peaks = merge_close_raw_peaks(raw_peaks)
         peaks = pd.concat([raw_peaks, merged_peaks], ignore_index=True, sort=False)
         traces.append(trace)

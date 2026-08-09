@@ -328,18 +328,70 @@ def check_scientific_runtime() -> dict[str, Any]:
         "run_v3_01_lif_trace_physical_qc.py",
         "run_v3_02_ms_event_calling.py",
     ]
+    loaded_scripts: dict[str, Any] = {}
     for script_name in script_names:
         module = load_preprocessing_module(script_name)
         if not callable(getattr(module, "run", None)):
             raise RuntimeError(
                 f"Bundled preprocessing script has no run(project_dir=...) entry: {script_name}"
             )
+        loaded_scripts[script_name] = module
+
+    # Import success alone does not exercise scipy.signal or the detector-v2
+    # dependency chain. Run one tiny, deterministic core+weak call without
+    # touching a project or the filesystem.
+    import numpy as np
+    import pandas as pd
+
+    lif_module = loaded_scripts["run_v3_01_lif_trace_physical_qc.py"]
+    time_sec = np.linspace(0.0, 1.0, 1001)
+    signal = sum(
+        15.0 * np.exp(-0.5 * ((time_sec - center) / 0.015) ** 2)
+        for center in (0.15, 0.30, 0.45)
+    ) + 6.0 * np.exp(-0.5 * ((time_sec - 0.72) / 0.015) ** 2)
+    detector_config = {
+        "detector_version": 2,
+        "profile": "core_weak",
+        "core": {"prominence_snr_min": 10.0},
+        "weak": {"enabled": True, "prominence_snr_min": 3.5},
+        "geometry": {
+            "min_distance_sec": 0.02,
+            "merge_gap_sec": 0.12,
+            "min_width_sec": 0.02,
+            "max_width_sec": 1.0,
+        },
+        "weak_usage": "manual_review_only",
+    }
+    trace = pd.DataFrame(
+        {
+            "channel": "G1",
+            "label": "runtime_probe",
+            "detector": "green",
+            "phase": "runtime_probe",
+            "time_min": time_sec / 60.0,
+            "time_sec": time_sec,
+            "raw": signal,
+            "baseline": np.zeros_like(signal),
+            "signal": signal,
+        }
+    )
+    raw_peaks = lif_module.call_raw_peaks(
+        trace,
+        {"dt_sec": float(time_sec[1] - time_sec[0]), "noise": 1.0},
+        detection_config=detector_config,
+    )
+    detector_tiers = sorted(set(raw_peaks.get("peak_tier", pd.Series(dtype=str))))
+    if detector_tiers != ["core", "weak"]:
+        raise RuntimeError(
+            "Bundled detector-v2 scientific probe did not emit core and weak tiers"
+        )
 
     return {
         "expat_version": str(expat.EXPAT_VERSION),
         "openssl_version": str(ssl.OPENSSL_VERSION),
         "sqlite_version": str(sqlite3.sqlite_version),
         "preprocessing_scripts": script_names,
+        "lif_detector_tiers": detector_tiers,
     }
 
 

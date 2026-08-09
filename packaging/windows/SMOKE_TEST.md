@@ -23,7 +23,7 @@ Expected:
 - The full automated suite passes.
 - PyInstaller creates `dist/LMAStudio/LMAStudio.exe`.
 - The normal packaged-runtime probe and simulated Internet-zone/MOTW probe both pass.
-- `dist/LMAStudio/_internal/scripts/v3` contains `project_protocol.py`, `run_v3_01_lif_trace_physical_qc.py`, and `run_v3_02_ms_event_calling.py`.
+- `dist/LMAStudio/_internal/scripts/v3` contains `lif_peak_detection.py`, `project_protocol.py`, `run_v3_01_lif_trace_physical_qc.py`, and `run_v3_02_ms_event_calling.py`.
 
 ## 2. First startup
 
@@ -44,6 +44,7 @@ Expected:
 Create only in a new empty project directory. Configure:
 
 - Two to four distinct LIF raw files and one MS raw file.
+- A project-bound LIF detector: adaptive v2 `core + weak` for new work, or legacy v1 only for a deliberate compatibility run.
 - One event-coordinate CSV in which `scan_start_time`, `UMAP1`, and `UMAP2` can be found; unrelated columns are allowed.
 - For every LIF channel: channel name, detector, scientific identity/sample label, and cell-annotation role. The shared physical time axis is assigned automatically from the detector.
 - One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
@@ -63,7 +64,7 @@ Click `分析已选 LIF 并建议窗口`. Expected:
 After creation, verify:
 
 - `lifms_project.json` records project schema 3 and acquisition layout 4.
-- The manifest contains `calibration_protocol`, `post_qc_strategy`, channel detector/time-axis roles, and project-specific annotation settings.
+- The manifest contains `lif_peak_detection` plus its scientific hash, `calibration_protocol`, `post_qc_strategy`, channel detector/time-axis roles, and project-specific annotation settings.
 - `results/tables/v3/00_project_protocol.json` records draft windows explicitly as `calibration_draft:*`; after every segment is confirmed it records the confirmed boundaries used by both preprocessing stages.
 - `data/interim/lma/cell_event_umap.csv` contains exactly `ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`.
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
@@ -93,6 +94,7 @@ Open `前段参考校准`.
 Expected:
 
 - Candidates are grouped by configured calibration segment, not one global `qc_anchor_channels` interval.
+- Dense candidates preserve chronological order; nearby peaks may remain ambiguous, but accepted proposals must never cross in time.
 - Green-only and Red-only segments do not require the absent detector.
 - Red+Green segments display the configured cross-detector evidence.
 - Sequential G1/G2 segments sharing `green_axis` contribute to one Green-axis translation without requiring simultaneous peaks.
@@ -101,6 +103,16 @@ Expected:
 - `应用 QC 对齐（按物理轴）` applies at most one translation per physical time axis and invalidates the dependent delta/time model.
 
 Wrong-order, overlapping, missing, or unconfirmed segments must block saving or preprocessing with a readable error.
+
+## 5a. LIF detector-v2 evidence boundary
+
+On a newly built adaptive-v2 project:
+
+- The legacy high-specificity calls are tagged `core`; automatic alignment, delta, and cell candidates use only core peaks.
+- `显示 weak 弱峰` is off by default. Enabling it adds hollow/dashed weak markers without changing automatic candidates or the time model.
+- Weak evidence is learned only on a channel with enough core pulse evidence. Pure/no-signal channels must not be expanded into dense weak calls.
+- A user-confirmed weak peak/MS event cell pair remains exportable, while any attempt to use weak evidence as a QC or delta training anchor is rejected clearly.
+- An existing v1 project exposes its detector as read-only. Switching v1/v2 requires a new project/project copy and regenerated intermediate tables; opening or saving unrelated settings does not rewrite legacy manifests or parquet inputs.
 
 ## 6. Unlabeled later delta and freeze gate
 

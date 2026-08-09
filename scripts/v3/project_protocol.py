@@ -14,6 +14,17 @@ from typing import Any
 
 import numpy as np
 
+try:
+    from scripts.v3.lif_peak_detection import (
+        legacy_lif_peak_detection,
+        normalize_lif_peak_detection,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from lif_peak_detection import (  # type: ignore[no-redef]
+        legacy_lif_peak_detection,
+        normalize_lif_peak_detection,
+    )
+
 
 PROTOCOL_RELATIVE_PATH = Path("results/tables/v3/00_project_protocol.json")
 
@@ -80,6 +91,9 @@ def _legacy_policy() -> dict[str, Any]:
             "reference_channels": ["G2", "R1"],
             "compatibility_mode": "v0.3_qc_anchor_channels",
         },
+        "lif_peak_detection": legacy_lif_peak_detection(
+            compatibility_mode=True
+        ),
     }
 
 
@@ -150,6 +164,11 @@ def load_project_protocol(project_root: str | Path) -> dict[str, Any]:
     post_qc = raw.get("post_qc_strategy")
     if not isinstance(post_qc, dict):
         raise ValueError("00_project_protocol.json is missing post_qc_strategy")
+    peak_detection_raw = raw.get("lif_peak_detection")
+    if peak_detection_raw is None:
+        peak_detection = legacy_lif_peak_detection(compatibility_mode=True)
+    else:
+        peak_detection = normalize_lif_peak_detection(peak_detection_raw)
     policy = {
         "schema_version": int(raw.get("schema_version") or 0),
         "source": str(path),
@@ -160,6 +179,7 @@ def load_project_protocol(project_root: str | Path) -> dict[str, Any]:
         ),
         "annotation_start_min": annotation_start,
         "post_qc_strategy": post_qc,
+        "lif_peak_detection": peak_detection,
     }
     return _with_derived_fields(policy)
 

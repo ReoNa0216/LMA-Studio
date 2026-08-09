@@ -126,6 +126,11 @@ foreach ($DllName in $CoreRuntimeDlls) {
     }
 }
 
+& $Python (Join-Path $RepoRoot "packaging\windows\validate_bundle_runtime.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "The packaged Windows binary provenance/ABI audit failed (exit code $LASTEXITCODE)."
+}
+
 function Invoke-PackagedRuntimeProbe {
     $Probe = Start-Process -FilePath $BuiltExe -ArgumentList "--check-runtime" -WindowStyle Hidden -Wait -PassThru
     if ($Probe.ExitCode -ne 0) {

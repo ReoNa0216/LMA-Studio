@@ -9,9 +9,11 @@ It opens its own native desktop window, lets users create or open project direct
 - Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a single-cell event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`; unrelated source columns are allowed and ignored.
 - Open an existing project containing preprocessing parquet tables and `annotation_app/annotations/annotation.sqlite`.
 - Configure channel detector, scientific identity, and cell-annotation role. The new-project UI automatically groups Green and Red inputs onto their shared physical time axes instead of asking users to type internal axis names.
+- Select a project-bound LIF detector: adaptive v2 preserves the legacy high-specificity `core` calls and adds locally normalized, morphology-filtered `weak` evidence for manual review only. Existing projects remain bound to their original detector and peak tables.
 - Configure ordered project-level `calibration_protocol` reference segments. Each segment may be Green-only, Red-only, or Red+Green; a read-only raw-peak scan can suggest boundaries, but never confirms them. Unconfirmed numeric windows can be opened as a raw-track draft, while calibration and all downstream stages remain locked.
 - Configure post-run QC independently as `signature`, `scheduled_windows`, or `disabled`.
 - Estimate one calibration shift per physical axis, so same-axis channels such as G1/G2 pool evidence into one `green_axis` shift without requiring simultaneous peaks.
+- Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
 - Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; clicking a point focuses the same event in the main track window.
