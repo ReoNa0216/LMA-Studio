@@ -22,4 +22,15 @@ Existing current-standard HSC1 projects do not require rebuilding. For UAT, firs
 - macOS ARM64 is an Actions candidate artifact only.
 - Do not create a version tag or formal GitHub Release before Windows user acceptance.
 
-Use `docs/HSC1_v0.4.0-rc3_UAT.md` for the current walkthrough. Exact Windows EXE size/SHA and final test count are recorded after rebuilding `dist\LMAStudio`.
+Use `docs/HSC1_v0.4.0-rc3_UAT.md` for the current walkthrough. The exact Windows build evidence is recorded below.
+
+## Windows build evidence (2026-08-10)
+
+- Source commit used for the build: `c441508aa02fbf733688653fb2f071e9873c20d9`.
+- Automated suite: 235 tests passed; 1 POSIX-only test skipped on Windows.
+- EXE: `dist\LMAStudio\LMAStudio.exe`, 19,171,279 bytes.
+- EXE SHA256: `C5B7FCBB7C218F4AFB1EC991291DAAE4414CC09BF7496F3D2D7E23E8B45A3D47`.
+- Bundle audit: 120 scientific binaries checked; no foreign source, missing row, or hash mismatch. The packaged `pyexpat`/`libexpat` ABI and all seven guarded runtime DLL hashes matched the selected build environment.
+- Normal and simulated downloaded-file runtime probes passed.
+- Packaged HSC1 regression used a temporary complete project copy and reported `ProjectStable=True`, `OriginalProjectStable=True`, `HscSourceStable=True`, `SmokeProcessExited=True`, plus the exact 16-column CSV header.
+- Retired-project rejection regression used temporary copies of Batch03Test, CART_Exp1-3, CART_Exp2-1, and Young_HSC3; every copy was rejected before writes and all originals remained unchanged.
