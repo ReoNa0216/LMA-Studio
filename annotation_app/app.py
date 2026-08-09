@@ -11287,8 +11287,8 @@ HTML = r"""<!doctype html>
           <input id="start" type="number" step="0.1" value="0" />
         </label>
         <label>
-          <span class="policy">窗口宽度</span>
-          <input id="widthDisplay" type="text" value="2.5 min" readonly />
+          <span class="policy">窗口宽度 (min)</span>
+          <input id="widthDisplay" type="number" min="0.25" max="15" step="0.05" value="2.5" title="可输入 0.25–15 min" />
         </label>
         <label>
           <span class="policy">时间轴</span>
@@ -11552,6 +11552,8 @@ HTML = r"""<!doctype html>
     const stateChannel = ('BroadcastChannel' in window)
       ? new BroadcastChannel('lma-studio-state-v1')
       : null;
+    const MIN_WINDOW_MIN = 0.25;
+    const MAX_WINDOW_MIN = 15.0;
     const colors = { G1: '#2f6fed', G2: '#176b45', R2: '#b95d18', R1: '#6f4bb8', ms760: '#1f5f99', ms782: '#2a7d67' };
     const fallbackLifTracks = [
       { key: 'lif_g2', label: 'LIF G2 / Day0', kind: 'lif', channels: ['G2'] },
@@ -11728,18 +11730,36 @@ HTML = r"""<!doctype html>
     }
 
     function applyStageWindowWidth() {
-      state.width = stageWindowWidth();
-      el('widthDisplay').value = `${fmt(state.width, 1)} min`;
+      const current = Number(state.width);
+      state.width = Number.isFinite(current) && current >= MIN_WINDOW_MIN && current <= MAX_WINDOW_MIN
+        ? current
+        : stageWindowWidth();
+      el('widthDisplay').value = fmt(state.width, 2);
+      const cfg = state.current?.project_config || state.meta?.project_config || {};
+      const seedWidth = Number(cfg.local_delta_seed_window_min || 2.5);
       el('windowPolicy').textContent = state.stage === 'local_calibration'
-        ? '当前图窗与后段预校准取证范围一致，边界额外载入 ±0.08 min；各轨道刻度和峰旁数字仍为原始时间(min)'
-        : '主窗口使用默认浏览宽度，边界额外载入 ±0.08 min；各轨道刻度和峰旁数字仍为原始时间(min)';
+        ? `浏览宽度可在 0.25–15 min 内调整；无标签 delta 取证范围仍由项目配置决定（当前 ${fmt(seedWidth, 2)} min）。边界额外载入 ±0.08 min。`
+        : '浏览宽度可在 0.25–15 min 内调整；边界额外载入 ±0.08 min，各轨道刻度和峰旁数字仍为原始时间(min)。';
+    }
+
+    function syncWindowWidthFromControl() {
+      const input = el('widthDisplay');
+      const requested = Number(input.value);
+      if (!Number.isFinite(requested) || requested < MIN_WINDOW_MIN || requested > MAX_WINDOW_MIN) {
+        alert(`窗口宽度必须在 ${MIN_WINDOW_MIN}–${MAX_WINDOW_MIN} min 之间。`);
+        input.focus();
+        return false;
+      }
+      state.width = requested;
+      input.value = fmt(state.width, 2);
+      return true;
     }
 
     function eventGridWindowStart(eventTime) {
       const projectMin = Number(state.meta?.time_min_min || 0);
       const projectMax = Number(state.meta?.time_min_max || eventTime);
       const width = Number(state.width || state.meta?.default_window_min || 2.5);
-      const grid = Number(state.meta?.default_window_min || 2.5);
+      const grid = width;
       if (
         !Number.isFinite(eventTime)
         || !Number.isFinite(projectMin)
@@ -12421,7 +12441,7 @@ HTML = r"""<!doctype html>
       state.current = payload;
       state.start = state.current.start_min;
       state.width = state.current.window_min;
-      el('widthDisplay').value = `${fmt(state.width, 1)} min`;
+      el('widthDisplay').value = fmt(state.width, 2);
       state.meta.project_config = payload.project_config || state.meta.project_config;
       state.meta.time_model = payload.time_model || state.meta.time_model;
       el('start').value = state.start.toFixed(2);
@@ -14612,12 +14632,21 @@ HTML = r"""<!doctype html>
       await loadWindow();
     });
     el('go').addEventListener('click', async () => {
+      if (!syncWindowWidthFromControl()) return;
       state.start = Number(el('start').value || 0);
       await loadWindow();
     });
     el('start').addEventListener('keydown', async (ev) => {
       if (ev.key === 'Enter') {
+        if (!syncWindowWidthFromControl()) return;
         state.start = Number(el('start').value || 0);
+        await loadWindow();
+      }
+    });
+    el('widthDisplay').addEventListener('keydown', async (ev) => {
+      if (ev.key === 'Enter') {
+        if (!syncWindowWidthFromControl()) return;
+        state.start = Number(el('start').value || state.start || 0);
         await loadWindow();
       }
     });

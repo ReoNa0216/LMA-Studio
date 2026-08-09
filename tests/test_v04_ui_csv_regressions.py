@@ -168,6 +168,25 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(draw, r"labelIds\.has\(")
         self.assertRegex(HTML, r"悬停.*精确.*时间|精确.*时间.*悬停")
 
+    def test_main_plot_window_width_is_user_editable_and_not_reset_by_stage(self):
+        control = re.search(r'<input id="widthDisplay"[^>]*>', HTML)
+        self.assertIsNotNone(control)
+        self.assertIn('type="number"', control.group(0))
+        self.assertIn('min="0.25"', control.group(0))
+        self.assertIn('max="15"', control.group(0))
+        self.assertNotIn("readonly", control.group(0))
+        self.assertIn("function syncWindowWidthFromControl", HTML)
+        self.assertRegex(
+            HTML,
+            r"(?s)el\('go'\).*?syncWindowWidthFromControl\(\)",
+        )
+
+        stage_listener_start = HTML.index("document.querySelectorAll('.stage-tab')")
+        stage_listener_end = HTML.index("el('manualAnnotationKind')", stage_listener_start)
+        stage_listener = HTML[stage_listener_start:stage_listener_end]
+        self.assertNotIn("state.width = stageWindowWidth()", stage_listener)
+        self.assertRegex(HTML, r"0\.25.*15.*min|0\.25–15 min")
+
     def test_post_qc_policy_change_explains_historical_staleness(self):
         body = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")
 
