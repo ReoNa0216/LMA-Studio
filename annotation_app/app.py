@@ -10533,6 +10533,19 @@ HTML = r"""<!doctype html>
     .lif-field {
       min-width: 0;
     }
+    .lif-axis-auto {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      padding: 5px 8px;
+      border: 1px solid #d7dce3;
+      border-radius: 6px;
+      background: #f2f4f7;
+      color: #344054;
+      font-size: 11px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
     .lif-mobile-label {
       display: none;
     }
@@ -10660,6 +10673,15 @@ HTML = r"""<!doctype html>
       height: 14px;
       margin: 0;
     }
+    .protocol-segment-status {
+      grid-column: 1 / -1;
+      margin: 0;
+      color: #667085;
+      font-size: 11px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
     .import-section {
       margin-top: 14px;
       padding-top: 12px;
@@ -10691,19 +10713,34 @@ HTML = r"""<!doctype html>
     .policy-fields select {
       width: 100%;
     }
-    .preset-box {
-      display: flex;
-      align-items: center;
-      gap: 10px;
+    .project-template-options {
       margin-bottom: 10px;
-      padding: 9px 10px;
       border: 1px solid #b7c2d4;
       border-radius: 7px;
       background: #f8fafc;
     }
-    .preset-box span {
+    .project-template-options summary {
+      padding: 9px 10px;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .project-template-body {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px 10px;
+    }
+    .project-template-body span {
       color: #667085;
       font-size: 11px;
+    }
+    .coordinate-source-help {
+      margin-top: 4px;
+      color: #667085;
+      font-size: 11px;
+      line-height: 1.35;
     }
     .mode-options {
       display: grid;
@@ -11034,14 +11071,17 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="importTitle" class="modal-title">新建标注项目</p>
-          <div class="empty">配置 2–4 个 LIF 通道的科学角色与共享物理时间轴，再逐段确认前段校准参考窗口；后段 QC 独立配置。</div>
+          <div class="empty">配置 2–4 个 LIF 通道的科学角色；共享时间轴由检测器自动设置。再逐段确认前段参考窗口，并独立配置后段 QC。</div>
         </div>
         <button id="closeImportProject" class="small-button secondary">关闭</button>
       </div>
-      <div class="preset-box">
-        <button id="applyHsc1Preset" type="button" class="small-button secondary">套用 HSC1 配置预设</button>
-        <span>HSC1：G1/LSK → G2/Lin−，共享 green_axis；标注起点 24 min；后段 QC disabled。窗口边界仍须由你确认。</span>
-      </div>
+      <details id="importProjectTemplates" class="project-template-options">
+        <summary>可选：实验配置模板</summary>
+        <div class="project-template-body">
+          <button id="applyHsc1Preset" type="button" class="small-button secondary">应用 HSC1 模板</button>
+          <span>HSC1：G1/LSK → G2/Lin−，自动共享 Green 时间轴；事件起点 24 min；不进行后段 QC 巡检。参考窗口仍须由你确认。</span>
+        </div>
+      </details>
       <div class="import-grid">
         <label>Raw 数据管理</label>
         <div class="mode-options">
@@ -11059,7 +11099,7 @@ HTML = r"""<!doctype html>
             <span>输入</span>
             <span>通道<small>G1–R2</small></span>
             <span>检测器<small>Green / Red</small></span>
-            <span>物理时间轴<small>同轴填同名</small></span>
+            <span>采集时间基准<small>由检测器自动设置</small></span>
             <span>样本标签<small>细胞用途必填</small></span>
             <span>科学角色<small>细胞标注</small></span>
             <span>LIF 原始文件</span>
@@ -11077,9 +11117,12 @@ HTML = r"""<!doctype html>
           <button class="small-button secondary path-picker-button" aria-label="选择 MS 原始文件" data-picker-target="importMs" data-picker-kind="file" data-picker-role="ms" data-picker-title="选择 MS 原始文件">选择</button>
         </div>
         <label for="importCellEventMap">事件坐标 CSV</label>
-        <div class="path-picker-row">
-          <input id="importCellEventMap" type="text" placeholder="scan_start_time / UMAP1 / UMAP2" />
-          <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
+        <div>
+          <div class="path-picker-row">
+            <input id="importCellEventMap" type="text" placeholder="选择包含三列必需坐标的 CSV" />
+            <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
+          </div>
+          <div class="coordinate-source-help">必须包含 scan_start_time、UMAP1、UMAP2；CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
         </div>
       </div>
       <section class="import-section" aria-labelledby="calibrationProtocolTitle">
@@ -11580,29 +11623,47 @@ HTML = r"""<!doctype html>
       URL.revokeObjectURL(url);
     }
 
+    function automaticTimeAxisForDetector(detector) {
+      const normalized = String(detector || '').trim().toLowerCase();
+      if (normalized === 'green') return 'green_axis';
+      if (normalized === 'red') return 'red_axis';
+      return '';
+    }
+
+    function physicalTimeAxisLabel(detector) {
+      const normalized = String(detector || '').trim().toLowerCase();
+      if (normalized === 'green') return 'Green 共享时间轴（自动）';
+      if (normalized === 'red') return 'Red 共享时间轴（自动）';
+      return '选择检测器后自动设置';
+    }
+
     function newImportLifRow(initial = {}) {
+      const detector = String(initial.detector || '').trim().toLowerCase();
       const row = {
         id: state.nextImportRowId++,
         path: String(initial.path || ''),
         channel: String(initial.channel || ''),
         identity_prior: String(initial.identity_prior || ''),
-        detector: String(initial.detector || ''),
-        time_axis: String(initial.time_axis || ''),
+        detector,
+        time_axis: automaticTimeAxisForDetector(detector),
         use_for_cell_annotation: Boolean(initial.use_for_cell_annotation),
       };
       return row;
     }
 
     function importLifRows() {
-      return state.importRows.map((row, index) => ({
-        key: `lif_${index + 1}`,
-        path: String(row.path || '').trim(),
-        channel: String(row.channel || '').trim().toUpperCase(),
-        identity_prior: String(row.identity_prior || '').trim(),
-        detector: String(row.detector || '').trim().toLowerCase(),
-        time_axis: String(row.time_axis || '').trim(),
-        use_for_cell_annotation: Boolean(row.use_for_cell_annotation),
-      }));
+      return state.importRows.map((row, index) => {
+        const detector = String(row.detector || '').trim().toLowerCase();
+        return {
+          key: `lif_${index + 1}`,
+          path: String(row.path || '').trim(),
+          channel: String(row.channel || '').trim().toUpperCase(),
+          identity_prior: String(row.identity_prior || '').trim(),
+          detector,
+          time_axis: automaticTimeAxisForDetector(detector),
+          use_for_cell_annotation: Boolean(row.use_for_cell_annotation),
+        };
+      });
     }
 
     function renderImportLifRows() {
@@ -11627,8 +11688,8 @@ HTML = r"""<!doctype html>
             </select>
           </div>
           <div class="lif-field lif-axis">
-            <span class="lif-mobile-label">物理时间轴</span>
-            <input data-import-field="time_axis" type="text" value="${escapeText(row.time_axis)}" placeholder="green_axis" aria-label="LIF ${index + 1} 物理时间轴" />
+            <span class="lif-mobile-label">采集时间基准</span>
+            <div class="lif-axis-auto" aria-label="LIF ${index + 1} 自动采集时间基准">${escapeText(physicalTimeAxisLabel(row.detector))}</div>
           </div>
           <div class="lif-field lif-identity">
             <span class="lif-mobile-label">样本标签</span>
@@ -11738,13 +11799,14 @@ HTML = r"""<!doctype html>
       if (!box) return;
       box.innerHTML = state.importSegments.map((segment, index) => `
         <div class="protocol-row" data-import-segment-id="${segment.id}">
-          <span><strong>#${index + 1}</strong>${segment.suggestion_status ? `<br><small>${escapeText(calibrationSuggestionStatusLabel(segment.suggestion_status))}</small>` : ''}</span>
+          <strong>#${index + 1}</strong>
           <input data-segment-field="population_label" type="text" value="${escapeText(segment.population_label)}" placeholder="群体/参考段名称" aria-label="参考段 ${index + 1} 群体名称" />
           <input data-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" placeholder="开始 min" aria-label="参考段 ${index + 1} 开始时间" />
           <input data-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" placeholder="结束 min" aria-label="参考段 ${index + 1} 结束时间" />
           <div class="protocol-channel-options">${importChannelOptions(segment.reference_channels)}</div>
           <label class="protocol-confirm"><input data-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''} /> 边界已确认</label>
           <button type="button" class="small-button secondary lif-remove" data-remove-import-segment="${segment.id}" aria-label="删除参考段 ${index + 1}"${state.importSegments.length <= 1 ? ' disabled' : ''}>×</button>
+          ${segment.suggestion_status ? `<small class="protocol-segment-status" role="status">${escapeText(calibrationSuggestionStatusLabel(segment.suggestion_status))}</small>` : ''}
         </div>
       `).join('');
     }
@@ -11944,6 +12006,8 @@ HTML = r"""<!doctype html>
         el('importAnnotationStart').value = '40';
         el('importSeedWindow').value = '2.5';
         el('importPostQcMode').value = 'disabled';
+        const templateOptions = el('importProjectTemplates');
+        if (templateOptions) templateOptions.open = false;
         renderImportLifRows();
         renderImportSegments();
         renderImportPostQcControls();
@@ -14236,23 +14300,20 @@ HTML = r"""<!doctype html>
       if (!row) return;
       const previousValue = row[field];
       row[field] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
-      if (['path', 'channel', 'detector', 'time_axis'].includes(field) && row[field] !== previousValue) {
+      if (['path', 'channel', 'detector'].includes(field) && row[field] !== previousValue) {
         state.importSuggestionRevision += 1;
         invalidateImportCalibrationConfirmations(
-          'LIF 文件、检测器或物理时间轴已变化，旧窗口建议已失效，请重新分析并确认。',
+          'LIF 文件、通道或检测器已变化，旧窗口建议已失效，请重新分析并确认。',
           false
         );
       }
       if (field === 'channel') {
         const channel = String(row.channel || '').toUpperCase();
         row.detector = channel.startsWith('G') ? 'green' : channel.startsWith('R') ? 'red' : row.detector;
-        row.time_axis = row.detector ? `${row.detector}_axis` : row.time_axis;
+        row.time_axis = automaticTimeAxisForDetector(row.detector);
         renderImportLifRows();
-      } else if (
-        field === 'detector'
-        && (!row.time_axis || row.time_axis === `${String(previousValue || '')}_axis`)
-      ) {
-        row.time_axis = row.detector ? `${row.detector}_axis` : '';
+      } else if (field === 'detector') {
+        row.time_axis = automaticTimeAxisForDetector(row.detector);
         renderImportLifRows();
       } else if (field === 'use_for_cell_annotation') renderImportLifRows();
       else refreshImportProtocolOptions();
@@ -14389,8 +14450,8 @@ HTML = r"""<!doctype html>
     el('applyHsc1Preset').addEventListener('click', () => {
       state.importSuggestionRevision += 1;
       state.importRows = [
-        newImportLifRow({ channel: 'G1', identity_prior: 'LSK', detector: 'green', time_axis: 'green_axis', use_for_cell_annotation: true }),
-        newImportLifRow({ channel: 'G2', identity_prior: 'Lin−', detector: 'green', time_axis: 'green_axis', use_for_cell_annotation: true }),
+        newImportLifRow({ channel: 'G1', identity_prior: 'LSK', detector: 'green', use_for_cell_annotation: true }),
+        newImportLifRow({ channel: 'G2', identity_prior: 'Lin−', detector: 'green', use_for_cell_annotation: true }),
       ];
       state.importSegments = [
         newImportSegment({ segment_id: 'lsk_reference', population_label: 'LSK', reference_channels: ['G1'] }),
@@ -14405,7 +14466,7 @@ HTML = r"""<!doctype html>
       renderImportSegments();
       renderImportPostQcControls();
       el('importSuggestionStatus').textContent = '选择 G1/G2 原始文件后，可点击“分析已选 LIF 并建议窗口”；建议不会自动确认。';
-      el('importHint').textContent = '已套用 HSC1 科学角色和共享 green_axis。请为 G1/G2 选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
+      el('importHint').textContent = '已应用 HSC1 科学角色；G1/G2 将自动共享 Green 时间轴。请选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
     });
     document.querySelectorAll('[data-event-filter]').forEach(button => {
       button.addEventListener('click', () => {

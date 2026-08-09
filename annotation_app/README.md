@@ -55,7 +55,7 @@ The frozen time model is bound to the acquisition-layout hash, calibration-proto
 
 ## UMAP and Track synchronization
 
-The UMAP window displays only canonical event-map points. Colors are projected from current accepted SQLite semantics. Track-to-UMAP and UMAP-to-Track messages are bound to both project ID and map SHA, and navigation uses canonical `ms_event_id`.
+The coordinate source CSV must contain `scan_start_time`, `UMAP1`, and `UMAP2`, but it may contain any number of unrelated columns. The importer locates and loads only those three required columns; source `CellNumber`, `batch`, `Type`, `leiden`, and other fields are ignored. The UMAP window displays only canonical event-map points. Colors are projected from current accepted SQLite semantics. Track-to-UMAP and UMAP-to-Track messages are bound to both project ID and map SHA, and navigation uses canonical `ms_event_id`.
 
 ## Compact CSV contract
 

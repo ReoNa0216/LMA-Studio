@@ -1018,7 +1018,8 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
     def test_new_project_ui_exposes_physics_protocol_start_and_post_qc_policy(self):
         required_tokens = [
             "data-import-field=\"detector\"",
-            "data-import-field=\"time_axis\"",
+            "automaticTimeAxisForDetector",
+            "physicalTimeAxisLabel",
             "importCalibrationSegments",
             "addImportSegment",
             "boundaries_confirmed",
@@ -1028,6 +1029,7 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
             "suggestImportWindows",
             "/api/suggest-calibration-windows",
             "segment.boundaries_confirmed = false",
+            "可选：实验配置模板",
             "HSC1：G1/LSK → G2/Lin−",
             "后段 QC 策略",
         ]
@@ -1039,6 +1041,11 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
             'data-import-field="use_for_qc"',
             HTML,
             "前段校准参考通道必须只在分段协议中配置",
+        )
+        self.assertNotIn(
+            'data-import-field="time_axis"',
+            HTML,
+            "物理时间轴应由检测器自动设置，而不是让用户填写内部名称",
         )
 
     def test_manual_front_anchor_uses_the_selected_calibration_segment(self):

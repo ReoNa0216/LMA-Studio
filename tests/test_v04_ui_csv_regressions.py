@@ -51,10 +51,11 @@ class V04UiRegressionTest(unittest.TestCase):
         listener_start = HTML.index("el('importLifRows').addEventListener('input'")
         listener_end = HTML.index("el('importCalibrationSegments').addEventListener", listener_start)
         listener = HTML[listener_start:listener_end]
-        for field in ("path", "detector", "time_axis"):
+        for field in ("path", "channel", "detector"):
             self.assertIn(f"'{field}'", listener)
         self.assertIn("invalidateImportCalibrationConfirmations", listener)
         self.assertRegex(listener, r"importSuggestionRevision\s*\+=\s*1")
+        self.assertIn("automaticTimeAxisForDetector", listener)
 
         suggestion = javascript_function_body(
             "suggestImportCalibrationWindows",
@@ -69,6 +70,40 @@ class V04UiRegressionTest(unittest.TestCase):
             r"\w*[Rr]evision\s*!==\s*state\.importSuggestionRevision",
         )
         self.assertIn("segment.boundaries_confirmed = false", suggestion)
+
+    def test_new_project_uses_automatic_plain_language_physical_axes(self):
+        self.assertIn("function automaticTimeAxisForDetector", HTML)
+        self.assertIn("function physicalTimeAxisLabel", HTML)
+        self.assertIn("Green 共享时间轴", HTML)
+        self.assertIn("Red 共享时间轴", HTML)
+        self.assertIn("由检测器自动设置", HTML)
+        self.assertNotIn('data-import-field="time_axis"', HTML)
+
+    def test_hsc1_is_an_optional_collapsed_template_not_the_default_action(self):
+        self.assertIn('<details id="importProjectTemplates"', HTML)
+        self.assertRegex(HTML, r"<summary>[^<]*可选[^<]*实验[^<]*模板[^<]*</summary>")
+        self.assertIn('id="applyHsc1Preset"', HTML)
+        self.assertNotIn('<div class="preset-box">', HTML)
+
+    def test_event_coordinate_picker_explains_required_columns_and_ignored_extras(self):
+        self.assertIn("必须包含 scan_start_time、UMAP1、UMAP2", HTML)
+        self.assertRegex(HTML, r"CellNumber.*batch.*其他列.*保留.*忽略")
+
+    def test_import_segment_status_uses_a_full_width_grid_row(self):
+        body = javascript_function_body(
+            "renderImportSegments",
+            "renderImportScheduledQcWindows",
+        )
+        self.assertIn('class="protocol-segment-status"', body)
+        self.assertNotRegex(
+            body,
+            r"<span>.*suggestion_status.*</span>",
+            "长失效提示不能放进 34px 的参考段序号列",
+        )
+        rule = re.search(r"\.protocol-segment-status\s*\{(?P<body>[^}]*)\}", HTML)
+        self.assertIsNotNone(rule)
+        self.assertRegex(rule.group("body"), r"grid-column\s*:\s*1\s*/\s*-1")
+        self.assertRegex(rule.group("body"), r"overflow-wrap\s*:\s*(?:anywhere|break-word)")
 
     def test_post_qc_policy_change_explains_historical_staleness(self):
         body = javascript_function_body("saveProjectConfig", "previewQcAlignmentRefit")

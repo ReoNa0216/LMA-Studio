@@ -1,121 +1,121 @@
-# HSC1 — LMA Studio v0.4.0-rc1 验收指南
+# HSC1 新版本测试：简明操作指南
 
-本指南只使用 `HSC1_data` 中的原始文件作为只读输入。请把新项目保存到另一个新目录，例如：
+这份指南用于用真实 HSC1 数据测试候选版。软件只读取 `HSC1_data` 中的原始文件；新项目必须保存到别的目录。
 
-```text
-E:\path\to\scMetab\HSC1_LMA_UAT_v040rc1
-```
-
-不要把项目保存到 `HSC1_data` 内，也不要覆盖任何已有项目。
-
-## 0. 先准备 Lin-LSK 专用事件坐标
-
-`HSC-Lin-LSK-MPP-CLP-LK-20260809-After-Batch-Correction.csv` 是多个批次的合并表，**不能直接作为 HSC1/Lin-LSK 项目的事件坐标输入**。请先在 `HSC1_data` 之外新建一个 UAT 输入目录，从合并表中筛选 `batch == Lin-LSK`，并且只保存以下三列：
+建议的新项目位置：
 
 ```text
-scan_start_time,UMAP1,UMAP2
+LMAStudio_UAT_Copies\HSC1_manual_UAT_v0.4.0-rc1
 ```
 
-例如把结果另存为：
+不要选择 `LMAStudio_UAT_Copies` 父目录本身，也不要覆盖已有项目。最好让最后一级项目目录尚不存在，由 LMA Studio 创建。
+
+## 一、先准备事件坐标 CSV
+
+原始文件 `HSC-Lin-LSK-MPP-CLP-LK-20260809-After-Batch-Correction.csv` 混合了多个批次，因此先筛选：
 
 ```text
-E:\path\to\scMetab\LMAStudio_UAT_Copies\HSC1_Lin-LSK_coordinates-only.csv
+batch == Lin-LSK
 ```
 
-可以用 Excel 筛选后另存，也可以在源码目录运行以下只读源文件的 Python 片段；它只会在 UAT 目录创建新文件：
+筛选后的 CSV 必须能找到以下三个表头，而且每个表头只能出现一次：
 
-```powershell
-@'
-from pathlib import Path
-import pandas as pd
-
-source = Path(r"E:\path\to\scMetab\HSC1_data\HSC-Lin-LSK-MPP-CLP-LK-20260809-After-Batch-Correction.csv")
-target = Path(r"E:\path\to\scMetab\LMAStudio_UAT_Copies\HSC1_Lin-LSK_coordinates-only.csv")
-target.parent.mkdir(parents=True, exist_ok=True)
-if target.exists():
-    raise FileExistsError(f"拒绝覆盖已有文件: {target}")
-frame = pd.read_csv(source, usecols=["scan_start_time", "UMAP1", "UMAP2", "batch"])
-selected = frame.loc[frame["batch"].astype(str).eq("Lin-LSK"), ["scan_start_time", "UMAP1", "UMAP2"]]
-if selected.empty:
-    raise RuntimeError("未找到 batch == Lin-LSK 的坐标")
-selected.to_csv(target, index=False)
-print(f"已生成 {len(selected)} 行: {target}")
-'@ | python -
+```text
+scan_start_time
+UMAP1
+UMAP2
 ```
 
-不要把 `batch`、作者标签、细胞类型或其他源列带进项目。当前实测应得到 971 行；如果行数不同，先确认源文件版本和筛选值，再继续。
+其他列可以保留。例如 `CellNumber`、`batch`、`Type` 或 Excel 中的第一列 Cell 编号都不会妨碍导入；LMA Studio 会忽略它们，不会把这些列当作细胞标签。
 
-## 1. 新建项目
+你刚才截图中的格式可以使用。建议给第一列写上 `CellNumber` 表头，但即使保留为空表头，它也只是被忽略的额外列。
 
-1. 启动 `LMAStudio.exe`，点击“新建项目”。
-2. 点击“套用 HSC1 配置预设”。预设应显示：
-   - G1，样本标签 `LSK`，Green，`green_axis`，用于细胞标注；
-   - G2，样本标签 `Lin−`，Green，`green_axis`，用于细胞标注；
-   - 事件标注起点 `24 min`；
-   - 后段 QC `disabled`。
-3. 推荐选择“外部引用”，避免复制 8 GB 以上的 MS 文件。
-4. 选择只读输入：
+保存前检查：
+
+- 筛选后应有 971 行数据，不含表头行；
+- `scan_start_time / UMAP1 / UMAP2` 都是数值；
+- `scan_start_time` 没有重复；
+- 保存为 CSV，建议 UTF-8；
+- CSV 放在 `HSC1_data` 和待创建项目目录之外，例如 `LMAStudio_UAT_Copies\HSC1_UAT_inputs`。
+
+## 二、新建 HSC1 项目
+
+1. 打开 LMA Studio，点击“新建项目”。
+2. 保持“外部引用”，这样不会复制 8 GB 的 MS 原始文件。
+3. 如果想减少手工配置，展开“可选：实验配置模板”，点击“应用 HSC1 模板”。这只是可选模板，不是默认流程。
+4. 项目保存路径选择一个全新的子目录，例如：
+
+   ```text
+   LMAStudio_UAT_Copies\HSC1_manual_UAT_v0.4.0-rc1
+   ```
+
+5. 检查两个 LIF 通道：
+
+   | 通道 | 检测器 | 样本标签 | 用于细胞标注 |
+   |---|---|---|---|
+   | G1 | Green | LSK | 是 |
+   | G2 | Green | Lin− | 是 |
+
+   物理时间轴不需要填写。选择 Green 后，软件会自动显示“Green 共享时间轴（自动）”，G1/G2 因此共用同一个时间平移。
+
+6. 选择输入文件：
+
    - G1：`HSC1_data\Lin-_LSK\G1.CSV`
    - G2：`HSC1_data\Lin-_LSK\G2.CSV`
    - MS：`HSC1_data\Lin-_LSK.txt`
-   - 事件坐标：第 0 节生成的 `HSC1_Lin-LSK_coordinates-only.csv`，不要直接选多批次合并表
-5. 项目保存路径填写上面的全新 UAT 目录。
+   - 事件坐标 CSV：第一步筛选后保存的文件
 
-软件只从专用坐标文件读取白名单坐标，并在项目内建立 canonical 的 `ms_event_id / scan_id / scan_start_time / UMAP1 / UMAP2`；源表中的作者标签不会成为候选或导出标签。
+7. 检查“事件标注起点”为 `24 min`。
+8. 检查“后段 QC 策略”为“不巡检”。HSC1 没有实际使用 R1/R2，因此不要为它增加 Red 通道或后段 QC。
 
-## 2. 建议并确认前段参考窗口
+## 三、确认前段参考窗口
 
-1. 点击“分析已选 LIF 并建议窗口”。该操作只读扫描 G1/G2 峰形，不创建项目，也不改原始文件。
-2. 当前 HSC1 文件的实测建议大约为：
-   - G1/LSK：`1.9–8.3 min`
-   - G2/Lin−：`13.1–20.0 min`
-3. 这些数值不是软件全局常量。请结合轨迹和实验记录核对；如需调整，直接编辑边界。
-4. 建议回填或手工修改后，“边界已确认”必须保持未勾选。逐段核对完毕后，再由你亲自勾选两个确认框。
-5. 确认 G1 在前、G2 在后，窗口不重叠，最后一段结束时间不晚于 `24 min`。
+1. 点击“分析已选 LIF 并建议窗口”。
+2. 等待建议完成，然后查看 G1、G2 的原始峰形范围。
+3. 当前 HSC1 数据的实测建议大约是：
 
-## 3. 生成项目与时间模型
+   - G1/LSK：`1.913–8.288 min`
+   - G2/Lin−：`13.089–19.954 min`
 
-1. 点击“生成并进入项目”。首次解析 `Lin-_LSK.txt` 会耗时；不要在处理中关闭软件或移动原始文件。
-2. 在“前段参考校准”逐段审核 anchor。G1/G2 共享一个 `green_axis` 平移；两通道不需要在同一个时刻同时出现峰。
-3. 点击“用已接受参考 anchors 预览重算”，检查内点、冲突和残差。
-4. 预览合理后点击“应用 QC 对齐（按物理轴）”。HSC1 应只应用一个 Green 轴平移。
-5. 进入“无标签后段 delta”，从 24 min 起检查无标签峰拓扑。若默认 2.5 min 种子窗显示“证据不足”，应扩大观察/种子窗口或调整容差后重新预览；不要为了继续流程而盲目填入 delta 或冻结。真实副本测试中，24–26.5 min 的严格匹配证据不足，而 50–55 min 可产生高置信细胞候选，这属于数据证据分布而不是按钮故障。
-6. HSC1 后段 QC 为 `disabled`，事件阶段默认只做细胞候选/人工细胞二元组，不应生成后段 QC 巡检候选。
+4. 这些只是本次原始数据给出的建议，不是软件固定常量。确认 G1 在前、G2 在后，两个窗口不重叠，并且都早于 24 min。
+5. 由你核对边界后，再分别勾选“边界已确认”。
 
-## 4. 必测行为
+如果选择了新的 LIF 文件、修改了通道或检测器，软件会显示“旧窗口建议已失效”。这是保护机制：需要重新点击“分析已选 LIF 并建议窗口”，不能沿用旧确认。
 
-- G1 和 G2 匹配同一个 MS event 时，两条候选必须显示为跨通道歧义，并要求逐条选择通道；不能批量或静默接受。
-- 未冻结 time model 时，第三阶段接受按钮和后端写入必须被阻止。
-- UMAP 点击事件后，Track 应定位到同一 `ms_event_id`；Track 写入后 UMAP 颜色应同步。
-- 修改已确认的参考边界、24 min 起点或 delta 依赖参数时，应出现明确失效提示。
-- 确认修改后，旧 frozen model、后段 delta 和第三阶段候选必须失效并重算；已有人工标注记录必须保留，不能静默删除。
-- 重新打开项目后，上述配置、冻结状态和人工审核应恢复。
+## 四、生成项目并做前段校准
 
-## 5. 精简 CSV 验收
+1. 点击“生成并进入项目”。首次解析 8 GB MS 文件需要等待，不要关闭软件或移动原始文件。
+2. 进入“前段参考校准”，逐段检查并接受可信的 LIF–MS anchor。
+3. 点击“用已接受参考 anchors 预览重算”。
+4. 检查内点数和残差；合理后点击“应用 QC 对齐（按物理轴）”。
 
-点击“导出 Cell/QC 主 CSV”。主 CSV 只含当前有效的第三阶段 Cell/后段 QC；前段参考 anchor 完整保留在 SQLite 审计中，不混入 CSV。固定为以下 16 列：
+HSC1 应只显示一个 Green 时间轴平移。测试副本得到过约 `−18 sec`，这个值只能作为大致检查，不能手工写成固定答案，应以你当前接受的 anchor 重算结果为准。
 
-```text
-CellNumber,scan_Id,scan_start_time,TIC,PC(34:1)_mz,PC(34:1)_intensity,
-UMAP1,UMAP2,Type,annotation_kind,review_stage,LIF_channel,LIF_peak_id,
-MS_event_id,residual_sec,annotation_id
-```
+## 五、估计后段 delta 并冻结
 
-重点检查：
+1. 进入“无标签后段 delta”。
+2. 从 24 min 起预览无标签峰匹配。
+3. 如果默认 2.5 min 范围显示“证据不足”，不要直接填 0 或立即冻结。可在项目配置中扩大“无标签 delta 取证范围”，再重新估计；也可以结合轨迹使用滑块人工核对。
+4. 只有确认预览合理后，才点击“确认并冻结无标签 delta”。
 
-- `CellNumber` 是按 canonical event-map 顺序生成的稳定编号，方便后续按 cell 读取。
-- `Type` 对细胞行来自当前项目中已接受的 LIF 通道科学身份（本项目为 `LSK` 或 `Lin−`），QC 行为 `QC`；它不读取 source CSV 的作者 `Type`。
-- `scan_Id / scan_start_time / TIC / PC(34:1)` 便于和后续代谢矩阵连接。
-- `UMAP1 / UMAP2` 只来自白名单坐标 map。
-- 模型 hash、协议 payload、候选冲突详情和审计元数据不进入主 CSV；它们仍保存在项目 SQLite 中。
-- 同一 `MS_event_id` 在当前模型下不应同时出现 active accepted QC 和 cell 语义。
+真实副本中 24–26.5 min 的严格匹配证据不足，而较后面的窗口能够出现高置信候选。这表示证据分布在更后面，不是按钮损坏。
 
-验收时请保留项目副本、导出的 CSV、截图和软件版本号；不要移动或修改 `HSC1_data` 原件。
+## 六、检查事件标注、UMAP 和 CSV
 
-开发者也可用下面的回归脚本一次性建立全新的隔离项目副本。脚本拒绝覆盖现有目录、临时筛选坐标，并在结束时复核 `HSC1_data` 文件树和输入指纹未改变：
+冻结时间模型后：
 
-```powershell
-python scripts/regression_hsc1_project_copy.py `
-  --hsc-data-dir "E:\path\to\scMetab\HSC1_data" `
-  --project-dir "E:\path\to\scMetab\LMAStudio_UAT_Copies\HSC1_v0.4.0_rc1_new_copy"
-```
+1. 进入“事件标注 / QC 巡检”。HSC1 的后段 QC 已禁用，因此这里不应生成后段 QC 候选。
+2. 如果 G1 和 G2 同时匹配同一个 MS event，软件应显示跨通道歧义，必须由你选择 LSK 或 Lin−，不能批量接受。
+3. 点击 UMAP 点时，Track 应定位到同一个事件；在 Track 接受或撤销后，UMAP 颜色应同步。
+4. 点击“导出 Cell/QC 主 CSV”。
+
+导出表中的 `CellNumber` 由 LMA Studio 按项目 event-map 顺序重新生成；它不会复制事件坐标源文件中已有的 Cell 编号。`Type` 来自你接受的通道科学身份，本项目应是 `LSK` 或 `Lin−`。
+
+## 常见提示是什么意思
+
+- “旧窗口建议已失效”：输入文件、通道或检测器变了，需要重新分析和确认参考窗口。
+- “自动建议证据不足”：当前 delta 取证范围内没有足够的唯一匹配，应扩大范围或人工核对。
+- “请先冻结 time model”：第三阶段标注受保护，完成并冻结 delta 后才能接受。
+- “跨通道歧义”：G1/G2 都可能对应同一 MS event，需要人工选择一个通道。
+
+自动生成的 `HSC1_v0.4.0_rc1_candidate` 和 `HSC1_v0.4.0_rc1_alignment_test` 只用于程序回归。特别是 `alignment_test` 含测试性冻结值，不应作为正式科学标注项目。

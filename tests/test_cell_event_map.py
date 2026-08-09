@@ -56,6 +56,25 @@ class CellEventMapImportTest(unittest.TestCase):
         self.assertEqual(frame.columns.tolist(), ["scan_start_time", "UMAP1", "UMAP2"])
         self.assertNotIn("AUTHOR_LABEL", frame.to_csv(index=False))
 
+    def test_source_loader_accepts_excel_style_cell_id_column_before_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_source(
+                Path(tmp),
+                [["Cell00001", 24.074766666667, 6.312042, -5.778983]],
+                ["", "scan_start_time", "UMAP1", "UMAP2"],
+            )
+
+            frame = read_source_coordinates(path)
+
+        self.assertEqual(frame.columns.tolist(), ["scan_start_time", "UMAP1", "UMAP2"])
+        self.assertEqual(frame.to_dict("records"), [
+            {
+                "scan_start_time": 24.074766666667,
+                "UMAP1": 6.312042,
+                "UMAP2": -5.778983,
+            }
+        ])
+
     def test_header_requires_each_allowed_column_exactly_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

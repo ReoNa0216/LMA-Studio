@@ -6,9 +6,9 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Current Scope
 
-- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a required single-cell event-coordinate CSV.
+- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a single-cell event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`; unrelated source columns are allowed and ignored.
 - Open an existing project containing preprocessing parquet tables and `annotation_app/annotations/annotation.sqlite`.
-- Configure channel detector, shared physical `time_axis`, scientific identity, and cell-annotation role independently.
+- Configure channel detector, scientific identity, and cell-annotation role. The new-project UI automatically groups Green and Red inputs onto their shared physical time axes instead of asking users to type internal axis names.
 - Configure ordered project-level `calibration_protocol` reference segments. Each segment may be Green-only, Red-only, or Red+Green; a read-only raw-peak scan can suggest boundaries, but never confirms them.
 - Configure post-run QC independently as `signature`, `scheduled_windows`, or `disabled`.
 - Estimate one calibration shift per physical axis, so same-axis channels such as G1/G2 pool evidence into one `green_axis` shift without requiring simultaneous peaks.
