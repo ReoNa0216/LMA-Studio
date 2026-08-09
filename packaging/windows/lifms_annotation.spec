@@ -18,6 +18,7 @@ def production_submodule(name):
         for part in parts
     )
 datas = [
+    (str(repo_root / "scripts/v3/project_protocol.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_01_lif_trace_physical_qc.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_02_ms_event_calling.py"), "scripts/v3"),
 ]

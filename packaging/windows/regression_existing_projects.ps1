@@ -67,6 +67,9 @@ try {
     foreach ($Name in @("Batch03Test", "CART_Exp1-3", "CART_Exp2-1", "Young_HSC3")) {
         $Source = (Resolve-Path (Join-Path $ProjectsRoot $Name)).Path
         $Copy = Join-Path $CopyRoot $Name
+        # Snapshot the original before copying so the regression proves that the
+        # packaged application never writes through to an existing user project.
+        $SourceBefore = Get-ProjectSnapshot $Source
         Copy-Item -LiteralPath $Source -Destination $Copy -Recurse
         $Before = Get-ProjectSnapshot $Copy
 
@@ -127,7 +130,29 @@ try {
             if ($Response.StatusCode -ne 200 -or $Response.Content.Length -lt 10) {
                 throw "Packaged CSV export failed."
             }
-            $ExportRows = ($Response.Content -split "`n").Count - 1
+            $ExpectedExportHeader = @(
+                "CellNumber",
+                "scan_Id",
+                "scan_start_time",
+                "TIC",
+                "PC(34:1)_mz",
+                "PC(34:1)_intensity",
+                "UMAP1",
+                "UMAP2",
+                "Type",
+                "annotation_kind",
+                "review_stage",
+                "LIF_channel",
+                "LIF_peak_id",
+                "MS_event_id",
+                "residual_sec",
+                "annotation_id"
+            ) -join ","
+            $HeaderLine = (($Response.Content -split "`r?`n", 2)[0]).TrimStart([char]0xFEFF)
+            if ($HeaderLine -cne $ExpectedExportHeader) {
+                throw "Packaged CSV header mismatch.`nExpected: $ExpectedExportHeader`nActual:   $HeaderLine"
+            }
+            $ExportRows = @($Response.Content | ConvertFrom-Csv).Count
         }
 
         $Process.Refresh()
@@ -203,6 +228,26 @@ try {
             throw "$Name regression changed: $($ChangedFields -join ', ')."
         }
 
+        $SourceAfter = Get-ProjectSnapshot $Source
+        $SourceChecks = [ordered]@{
+            annotations_sha256 = $SourceBefore.annotations_sha256 -eq $SourceAfter.annotations_sha256
+            annotation_count = $SourceBefore.annotation_count -eq $SourceAfter.annotation_count
+            audit_count = $SourceBefore.audit_count -eq $SourceAfter.audit_count
+            audit_sha256 = $SourceBefore.audit_sha256 -eq $SourceAfter.audit_sha256
+            counts = Test-SameJson $SourceBefore.counts $SourceAfter.counts
+            project_config_sha256 = $SourceBefore.project_config_sha256 -eq $SourceAfter.project_config_sha256
+            time_models_sha256 = $SourceBefore.time_models_sha256 -eq $SourceAfter.time_models_sha256
+            time_model_audit_sha256 = $SourceBefore.time_model_audit_sha256 -eq $SourceAfter.time_model_audit_sha256
+            input_manifest_sha256 = $SourceBefore.input_manifest_sha256 -eq $SourceAfter.input_manifest_sha256
+            manifest_sha256 = $SourceBefore.manifest_sha256 -eq $SourceAfter.manifest_sha256
+            parquets = Test-SameJson $SourceBefore.parquets $SourceAfter.parquets
+        }
+        $ChangedSourceFields = @($SourceChecks.Keys | Where-Object { !$SourceChecks[$_] })
+        $SourceStable = $ChangedSourceFields.Count -eq 0
+        if (!$SourceStable) {
+            throw "$Name original project changed during copy regression: $($ChangedSourceFields -join ', ')."
+        }
+
         $Results += [pscustomobject]@{
             Project = $Name
             Channels = $Meta.lif_channels.channel -join "/"
@@ -215,6 +260,7 @@ try {
             QcPending = $QcPending
             QcManualDuplicates = $QcManualDuplicates
             DataStable = $Stable
+            OriginalStable = $SourceStable
             ClosedCleanly = $true
         }
     }

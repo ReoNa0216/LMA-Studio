@@ -102,6 +102,30 @@ class CellEventMapImportTest(unittest.TestCase):
         self.assertEqual(canonical["ms_event_id"].tolist(), ["ms_1", "ms_2"])
         self.assertEqual(canonical["scan_id"].tolist(), ["scan-1", "scan-2"])
 
+    def test_default_tolerance_accepts_one_scan_apex_offset_without_ambiguity(self):
+        source = pd.DataFrame(
+            {
+                "scan_start_time": [1.0],
+                "UMAP1": [4.0],
+                "UMAP2": [6.0],
+            }
+        )
+        events = ms_events(
+            [
+                (
+                    "ms_shifted_apex",
+                    "scan-apex",
+                    1.0 + 0.103 / 60.0,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                )
+            ]
+        )
+
+        canonical = match_source_to_events(source, events)
+
+        self.assertEqual(canonical["ms_event_id"].tolist(), ["ms_shifted_apex"])
+
     def test_unmatched_ambiguous_and_reused_events_fail_the_whole_import(self):
         base = ms_events(
             [

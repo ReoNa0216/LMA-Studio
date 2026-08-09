@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 python_bin="${PYTHON_BIN:-python3}"
-version="${LMA_STUDIO_VERSION:-v0.3.0}"
+version="${LMA_STUDIO_VERSION:-v0.4.0-rc1}"
 
 cd "$repo_root"
 

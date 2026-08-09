@@ -8,18 +8,21 @@ It opens its own native desktop window, lets users create or open project direct
 
 - Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a required single-cell event-coordinate CSV.
 - Open an existing project containing preprocessing parquet tables and `annotation_app/annotations/annotation.sqlite`.
-- Assign each LIF channel independently to QC calibration, cell annotation, both roles, or neither role. QC anchors must cover every physical time axis and include at least one green and one red detector.
-- Estimate one calibration shift per physical axis, so same-axis channels such as G1/G2 reinforce one green-axis estimate instead of creating extra shift parameters.
-- Review three UI stages: QC calibration, local post-QC MS shift calibration, and a merged event-annotation stage containing explicit QC/cell filters.
+- Configure channel detector, shared physical `time_axis`, scientific identity, and cell-annotation role independently.
+- Configure ordered project-level `calibration_protocol` reference segments. Each segment may be Green-only, Red-only, or Red+Green; a read-only raw-peak scan can suggest boundaries, but never confirms them.
+- Configure post-run QC independently as `signature`, `scheduled_windows`, or `disabled`.
+- Estimate one calibration shift per physical axis, so same-axis channels such as G1/G2 pool evidence into one `green_axis` shift without requiring simultaneous peaks.
+- Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
 - Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; clicking a point focuses the same event in the main track window.
-- Export accepted annotations with project-name timestamped CSV filenames. Third-stage rows include UMAP coordinates and the canonical map SHA; early QC rows leave those fields blank.
+- Export a compact 16-column CSV intended for downstream cell labeling. Internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
 - Use external raw input references to avoid copying large MS files into every project.
-- Open schema-v1 projects without rewriting them. Projects without a map keep the legacy unfiltered workflow and can attach one map exactly once after compatibility checks.
+- Open v0.3 G2+R1 projects through a read-only compatibility adapter without rewriting their manifest or changing existing annotation semantics.
+- Invalidate dependent time models and third-stage results explicitly when a frozen-model input changes, while preserving manual annotation history.
 
 ## Desktop Releases
 
-The latest formal GitHub Release is v0.3.0.
+The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc1 and must not be published as a formal Release before Windows user acceptance.
 
 Windows x64:
 
@@ -68,5 +71,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.3.0 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.0-rc1 bash packaging/macos/build_macos.sh
 ```
+
+Manual `workflow_dispatch` builds upload candidate artifacts only. Formal GitHub Release publication is tag-triggered and is intentionally deferred until user acceptance.

@@ -14,6 +14,21 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks, peak_widths
 
+try:
+    from scripts.v3.project_protocol import (
+        classify_project_phase,
+        load_project_protocol,
+        phase_boundaries_min,
+        phase_role_from_labels,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from project_protocol import (  # type: ignore[no-redef]
+        classify_project_phase,
+        load_project_protocol,
+        phase_boundaries_min,
+        phase_role_from_labels,
+    )
+
 
 ROOT = Path.cwd()
 STEP = "01_lif_trace_physical_qc"
@@ -36,11 +51,9 @@ MAX_WIDTH_SEC = 1.00
 RED_PAIR_MAX_ABS_OFFSET_SEC = 30.0
 RED_PAIR_BIN_SEC = 0.25
 RED_NEAR_ZERO_HALF_WIDTH_SEC = 0.75
-QC_START_MAX_MIN = 10.5
-PRE_RUN_MAX_MIN = 40.0
 MIN_LIF_INPUTS = 2
 MAX_LIF_INPUTS = 4
-PHASE_BOUNDARIES_MIN = "qc_start:0-10.5 all-QC calibration; pre_run:10.5-40 transition/quiet; cell_run:>=40 acquisition"
+PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
 
 FORBIDDEN_PATH_PARTS = [
     "hrgc-obs-check.csv",
@@ -57,7 +70,7 @@ FORBIDDEN_PATH_PARTS = [
 
 
 def configure_project_root(project_dir: str | Path) -> Path:
-    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT
+    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT, PROJECT_PHASE_POLICY
     ROOT = Path(project_dir).expanduser().resolve()
     INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
     OUT_DATA = ROOT / "data/interim/v3" / STEP
@@ -65,6 +78,7 @@ def configure_project_root(project_dir: str | Path) -> Path:
     OUT_FIG = ROOT / "results/figures/v3" / STEP
     OUT_QC = ROOT / "results/qc/v3" / STEP
     OUT_REPORT = ROOT / "reports/v3/01_lif_trace_physical_qc.md"
+    PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
     return ROOT
 
 
@@ -170,25 +184,11 @@ def load_channel_specs() -> list[ChannelSpec]:
 
 
 def phase_from_time_min(time_min: pd.Series | np.ndarray) -> np.ndarray:
-    t = np.asarray(time_min, dtype=float)
-    return np.select(
-        [t < QC_START_MAX_MIN, (t >= QC_START_MAX_MIN) & (t < PRE_RUN_MAX_MIN), t >= PRE_RUN_MAX_MIN],
-        ["qc_start", "pre_run", "cell_run"],
-        default="unknown",
-    )
+    return classify_project_phase(time_min, PROJECT_PHASE_POLICY)
 
 
 def phase_role_from_phase(phase: pd.Series | np.ndarray) -> np.ndarray:
-    p = np.asarray(phase, dtype=object)
-    return np.select(
-        [p == "qc_start", p == "pre_run", p == "cell_run"],
-        [
-            "all_qc_calibration_only",
-            "transition_quiet_not_main_cell_run",
-            "main_acquisition_possible_qc_like_events",
-        ],
-        default="unknown",
-    )
+    return phase_role_from_labels(phase)
 
 
 def apply_plot_style() -> None:
@@ -297,7 +297,7 @@ def add_baseline_and_noise(trace: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "merge_gap_sec": MERGE_GAP_SEC,
         "min_width_sec": MIN_WIDTH_SEC,
         "max_width_sec": MAX_WIDTH_SEC,
-        "phase_boundaries_min": PHASE_BOUNDARIES_MIN,
+        "phase_boundaries_min": phase_boundaries_min(PROJECT_PHASE_POLICY),
         "red_pair_max_abs_offset_sec": RED_PAIR_MAX_ABS_OFFSET_SEC,
         "red_pair_bin_sec": RED_PAIR_BIN_SEC,
         "red_near_zero_half_width_sec": RED_NEAR_ZERO_HALF_WIDTH_SEC,
@@ -548,6 +548,13 @@ def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     else:
         red = merged_peaks[merged_peaks["channel"].astype(str).str.upper().str.startswith("R")]
     red_channels = list(dict.fromkeys(red["channel"].astype(str).tolist()))
+    audit_phases = list(dict.fromkeys(merged_peaks.get("phase", pd.Series(dtype=str)).astype(str).tolist()))
+    if not audit_phases:
+        audit_phases = [
+            *(f"calibration:{row['segment_id']}" for row in PROJECT_PHASE_POLICY["segments"]),
+            "pre_annotation_unassigned",
+            "annotation_region",
+        ]
     channel_pairs = [
         (red_channels[left_index], red_channels[right_index])
         for left_index in range(len(red_channels))
@@ -555,7 +562,7 @@ def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     ]
     if not channel_pairs:
         only_channel = red_channels[0] if red_channels else ""
-        for phase in ["qc_start", "pre_run", "cell_run"]:
+        for phase in audit_phases:
             left = red[red["phase"].eq(phase)] if only_channel else red.iloc[0:0]
             rows.append(
                 {
@@ -586,7 +593,7 @@ def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     for left_channel, right_channel in channel_pairs:
         left_all = red[red["channel"].eq(left_channel)].sort_values("time_sec")
         right_all = red[red["channel"].eq(right_channel)].sort_values("time_sec")
-        for phase in ["qc_start", "pre_run", "cell_run"]:
+        for phase in audit_phases:
             left = left_all[left_all["phase"].eq(phase)].reset_index(drop=True)
             right = right_all[right_all["phase"].eq(phase)].reset_index(drop=True)
             offsets = all_pair_offsets(left, right, RED_PAIR_MAX_ABS_OFFSET_SEC)
@@ -661,6 +668,17 @@ def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     return pd.DataFrame(rows), pd.DataFrame(offset_rows)
 
 
+def draw_project_phase_boundaries(ax: mpl.axes.Axes) -> None:
+    for boundary in PROJECT_PHASE_POLICY["plot_boundaries"]:
+        is_annotation = boundary["kind"] == "annotation_start"
+        ax.axvline(
+            float(boundary["time_min"]),
+            color="#374151" if is_annotation else "0.72",
+            lw=0.9 if is_annotation else 0.6,
+            ls="--" if is_annotation else ":",
+        )
+
+
 def plot_trace_overview(traces: pd.DataFrame, peaks: pd.DataFrame) -> None:
     merged = peaks[peaks["peak_stage"].eq("merged")]
     channels = list(dict.fromkeys(traces["channel"].astype(str).tolist()))
@@ -678,8 +696,7 @@ def plot_trace_overview(traces: pd.DataFrame, peaks: pd.DataFrame) -> None:
         ax.plot(plot_sub["time_min"], plot_sub["signal"], lw=0.55, color=colors.get(channel, "0.25"), label=channel)
         pk = merged[merged["channel"].eq(channel)]
         ax.scatter(pk["time_min"], pk["height"], s=5, color="black", alpha=0.45, linewidths=0)
-        ax.axvline(10, color="0.7", lw=0.7, ls="--")
-        ax.axvline(40, color="0.7", lw=0.7, ls="--")
+        draw_project_phase_boundaries(ax)
         ax.set_ylabel(f"{channel}\nsignal")
     axes[-1].set_xlabel("time (min)")
     fig.suptitle("V3-01 LIF baseline-corrected traces and merged peaks", y=0.995)
@@ -721,7 +738,7 @@ def write_report(
         "",
         f"- 本步骤只读取输入锁和其中允许的 {len(trace_meta)} 个 raw LIF CSV；没有读取作者 CSV、h5ad、人工补峰或任何 V2 输出。",
         "- 读取 raw LIF 前会校验 V3-00 记录的大小、首尾 1MB SHA256 和 full SHA256，避免锁定后文件变化或路径替换。",
-        "- `qc_start` 明确定义为 0-10.5 min 全 QC 校准段，只能用于 QC/time-calibration 审计；不作为普通 CAR-T 细胞段解释。",
+        f"- 阶段语义来自项目协议：`{phase_boundaries_min(PROJECT_PHASE_POLICY)}`；参考段只用于 calibration 审计，未配置时段不会被猜成细胞或 QC。",
         "- 每个 channel 独立估计 baseline 和 noise，再用物理峰宽、prominence/SNR 和近邻风险生成 raw peak 与 merged peak。",
         "- R1/R2 共用 red detector 的问题在本步骤只做时间轴/串扰候选审计，不把它转成标签判断。",
         "- QC 图只保留两张：全程信号+峰概览、峰宽/SNR/红通道 offset 分布，便于人工快速审查。",
@@ -762,7 +779,7 @@ def write_report(
         "",
         "## merged peak 按 phase 汇总",
         "",
-        "说明：`phase_role=all_qc_calibration_only` 的 0-10.5 min 峰全部按 QC 校准证据处理；`cell_run` 中若出现 QC-like pattern，也只能作为后续 QC anchor 候选，不能反推标签。",
+        "说明：`calibration:*` 仅表示项目配置的前段参考窗口；`annotation_region` 从项目的事件标注起点开始。后段 QC 是否存在及如何巡检由独立 post_qc_strategy 决定，不能从峰形反推身份标签。",
         "",
         md_table(peak_phase_summary),
         "",
@@ -770,9 +787,9 @@ def write_report(
         "",
         md_table(trace_phase_summary),
         "",
-        "## R1/R2 red detector 审计",
+        "## red detector 通道对审计",
         "",
-        "说明：R1/R2 使用同一个 red detector，但代表不同样本通道。这里统计 ±30 sec 内所有 R2-R1 pair offset 的模式、近 0 sec 计数和 sideband 背景；all-pair offset 会受峰密度影响，因此这里只作为串扰或同步结构风险提示，不作为标签证据。",
+        "说明：若项目含两个或更多 red detector 通道，这里逐对统计 ±30 sec 内 offset 模式、近 0 sec 计数和 sideband 背景；all-pair offset 会受峰密度影响，因此只作为串扰或同步结构风险提示，不作为标签证据。",
         "",
         md_table(red_audit),
         "",
@@ -790,7 +807,7 @@ def write_report(
         "## 下一步 gate",
         "",
         "- 如果峰数、峰宽、SNR 和 close/merge risk 可解释，则进入 V3-02 MS event calling。",
-        "- 如果 V3-03 发现 QC composite anchor 不足，应回到本步骤检查 G2/R1 peak calling，但仍不能用作者 CSV 或 h5ad 调参。",
+        "- 如果后续发现 calibration reference evidence 不足，应回到本步骤检查项目协议指定通道的 peak calling，但仍不能用作者 CSV 或 h5ad 调参。",
     ]
     OUT_REPORT.parent.mkdir(parents=True, exist_ok=True)
     OUT_REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")

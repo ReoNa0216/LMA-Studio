@@ -11,6 +11,7 @@ generation or export.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import copy
 import contextlib
 import csv
@@ -80,7 +81,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.3.0"
+APP_VERSION = "lma_studio_v0.4.0-rc1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 DEFAULT_WINDOW_MIN = 2.5
@@ -146,8 +147,13 @@ ANNOTATION_SOURCES = {"auto_candidate", "manual_created"}
 MISSING_PEAK_SYMBOL = "NA"
 NATIVE_DIALOG_KINDS = {"directory", "file"}
 PROJECT_MANIFEST_FILENAME = "lifms_project.json"
-PROJECT_SCHEMA_VERSION = 2
-ACQUISITION_LAYOUT_VERSION = 3
+PROJECT_SCHEMA_VERSION = 3
+ACQUISITION_LAYOUT_VERSION = 4
+CALIBRATION_PROTOCOL_VERSION = 1
+POST_QC_STRATEGY_VERSION = 1
+CALIBRATION_REFERENCE_MODES = {"green_only", "red_only", "red_green"}
+POST_QC_STRATEGY_MODES = {"signature", "scheduled_windows", "disabled"}
+SEGMENTED_CALIBRATION_MATCHER_VERSION = "segmented_axis_reference_v1"
 PROJECT_TABLE_BINDING_SCHEMA_VERSION = 1
 MIN_LIF_INPUTS = 2
 MAX_LIF_INPUTS = 4
@@ -328,6 +334,11 @@ def normalize_acquisition_layout(
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     identities = identities or {}
+    try:
+        source_layout_version = int((layout or {}).get("layout_version", 0)) if isinstance(layout, dict) else 0
+    except (TypeError, ValueError):
+        source_layout_version = 0
+    protocol_layout = source_layout_version >= ACQUISITION_LAYOUT_VERSION
     raw_channels = (layout or {}).get("lif_channels") if isinstance(layout, dict) else None
     lif_channels: list[dict[str, Any]] = []
     if isinstance(raw_channels, list) and raw_channels:
@@ -346,7 +357,7 @@ def normalize_acquisition_layout(
                     "channel": channel,
                     "identity_prior": identity,
                     "time_axis": time_axis,
-                    "detector": str(item.get("detector") or detector_from_time_axis(time_axis)),
+                    "detector": str(item.get("detector") or detector_from_time_axis(time_axis)).strip().lower(),
                     "use_for_cell_annotation": bool(item.get("use_for_cell_annotation", True)),
                 }
             )
@@ -376,6 +387,8 @@ def normalize_acquisition_layout(
         raw_anchors = qc_anchor_channels
     elif isinstance(layout, dict) and "qc_anchor_channels" in layout:
         raw_anchors = layout.get("qc_anchor_channels")
+    elif protocol_layout:
+        raw_anchors = []
     else:
         raw_anchors = ["G2", "R1"]
     if not isinstance(raw_anchors, (list, tuple)):
@@ -385,7 +398,9 @@ def normalize_acquisition_layout(
     if len(anchors) != len(set(anchors)):
         raise BadRequest("QC anchor 通道不能重复")
     max_anchor_count = min(MAX_QC_ANCHOR_CHANNELS, len(channels))
-    if not MIN_QC_ANCHOR_CHANNELS <= len(anchors) <= max_anchor_count:
+    if anchors and not MIN_QC_ANCHOR_CHANNELS <= len(anchors) <= max_anchor_count:
+        raise BadRequest(f"QC anchor 必须选择 {MIN_QC_ANCHOR_CHANNELS}-{max_anchor_count} 个 LIF 通道")
+    if not anchors and not protocol_layout:
         raise BadRequest(f"QC anchor 必须选择 {MIN_QC_ANCHOR_CHANNELS}-{max_anchor_count} 个 LIF 通道")
     missing = [ch for ch in anchors if ch not in channels]
     if missing:
@@ -395,29 +410,670 @@ def normalize_acquisition_layout(
         anchors = ["G2", "R1"]
     else:
         anchors = [channel for channel in channels if channel in set(anchors)]
-    required_axes = {
-        str(row["time_axis"])
-        for row in lif_channels
-        if bool(row.get("use_for_cell_annotation", True))
-    }
     covered_axes = {str(axis_by_channel[channel]) for channel in anchors}
-    missing_axes = sorted(required_axes - covered_axes)
-    if missing_axes:
-        raise BadRequest(f"QC anchor 必须至少覆盖每条标注时间轴，当前缺少: {', '.join(missing_axes)}")
-    detector_by_channel = {
-        row["channel"]: str(row.get("detector") or detector_from_time_axis(row["time_axis"])).strip().lower()
-        for row in lif_channels
-    }
-    covered_detectors = {detector_by_channel[channel] for channel in anchors}
-    missing_detectors = sorted({"green", "red"} - covered_detectors)
-    if missing_detectors:
-        raise BadRequest("QC anchor 必须至少包含一个绿色通道和一个红色通道")
+    if anchors:
+        required_axes = {
+            str(row["time_axis"])
+            for row in lif_channels
+            if bool(row.get("use_for_cell_annotation", True))
+        }
+        missing_axes = sorted(required_axes - covered_axes)
+        if missing_axes:
+            raise BadRequest(f"QC anchor 必须至少覆盖每条标注时间轴，当前缺少: {', '.join(missing_axes)}")
+        detector_by_channel = {
+            row["channel"]: str(row.get("detector") or detector_from_time_axis(row["time_axis"])).strip().lower()
+            for row in lif_channels
+        }
+        covered_detectors = {detector_by_channel[channel] for channel in anchors}
+        missing_detectors = sorted({"green", "red"} - covered_detectors)
+        if missing_detectors:
+            raise BadRequest("QC anchor 必须至少包含一个绿色通道和一个红色通道")
     return {
         "layout_version": ACQUISITION_LAYOUT_VERSION,
+        "source_layout_version": source_layout_version or ACQUISITION_LAYOUT_VERSION,
         "lif_channels": lif_channels,
         "qc_anchor_channels": anchors,
         "channel_time_axes": axis_by_channel,
         "qc_anchor_time_axes": sorted(covered_axes),
+    }
+
+
+def _reference_mode_for_channels(
+    channels: list[str],
+    detector_by_channel: dict[str, str],
+) -> str:
+    detectors = {str(detector_by_channel[channel]).strip().lower() for channel in channels}
+    if detectors == {"green"}:
+        return "green_only"
+    if detectors == {"red"}:
+        return "red_only"
+    if detectors == {"green", "red"}:
+        return "red_green"
+    raise BadRequest(
+        "校准参考段只支持 Green-only、Red-only 或 Red+Green 检测器组合"
+    )
+
+
+def normalize_calibration_protocol(
+    protocol: dict[str, Any] | None,
+    acquisition_layout: dict[str, Any] | None,
+    *,
+    require_confirmed: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(protocol, dict):
+        raise BadRequest("calibration_protocol 必须是对象")
+    layout = normalize_acquisition_layout(acquisition_layout)
+    channel_order = [str(row["channel"]) for row in layout["lif_channels"]]
+    channel_set = set(channel_order)
+    axis_by_channel = {
+        str(channel): str(axis) for channel, axis in layout["channel_time_axes"].items()
+    }
+    detector_by_channel = {
+        str(row["channel"]): str(row.get("detector") or detector_from_time_axis(row["time_axis"])).lower()
+        for row in layout["lif_channels"]
+    }
+    raw_segments = protocol.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise BadRequest("calibration_protocol 至少需要一个分段参考窗口")
+
+    segments: list[dict[str, Any]] = []
+    segment_ids: set[str] = set()
+    previous_order: int | None = None
+    previous_end: float | None = None
+    for index, raw in enumerate(raw_segments, start=1):
+        if not isinstance(raw, dict):
+            raise BadRequest("calibration_protocol.segments entries must be objects")
+        segment_id = str(raw.get("segment_id") or f"reference_{index}").strip()
+        if not segment_id:
+            raise BadRequest("每个校准参考段必须有 segment_id")
+        if segment_id in segment_ids:
+            raise BadRequest(f"校准参考段 segment_id 不能重复: {segment_id}")
+        segment_ids.add(segment_id)
+        try:
+            order = int(raw.get("order", index))
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"校准参考段 {segment_id} 的顺序必须是整数") from exc
+        if order != index or (previous_order is not None and order <= previous_order):
+            raise BadRequest("校准参考段顺序必须与列表及时间先后严格一致")
+        previous_order = order
+        try:
+            start_min = float(raw.get("start_min"))
+            end_min = float(raw.get("end_min"))
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"校准参考段 {segment_id} 缺失有效起止边界") from exc
+        if not math.isfinite(start_min) or not math.isfinite(end_min) or start_min < 0 or end_min <= start_min:
+            raise BadRequest(f"校准参考段 {segment_id} 的边界必须有限且 end_min > start_min >= 0")
+        if previous_end is not None and start_min < previous_end - 1e-9:
+            raise BadRequest(f"校准参考段不能重叠: {segment_id}")
+        previous_end = end_min
+        confirmed = bool(raw.get("boundaries_confirmed", False))
+        if require_confirmed and not confirmed:
+            raise BadRequest(f"校准参考段 {segment_id} 的边界必须由用户确认")
+        raw_channels = raw.get("reference_channels")
+        if not isinstance(raw_channels, (list, tuple)) or not raw_channels:
+            raise BadRequest(f"校准参考段 {segment_id} 缺失 reference_channels")
+        requested = [str(channel).strip().upper() for channel in raw_channels if str(channel).strip()]
+        if not requested or len(requested) != len(set(requested)):
+            raise BadRequest(f"校准参考段 {segment_id} 的参考通道不能为空或重复")
+        missing = sorted(set(requested) - channel_set)
+        if missing:
+            raise BadRequest(f"校准参考段 {segment_id} 包含未知通道: {', '.join(missing)}")
+        requested_set = set(requested)
+        channels = [channel for channel in channel_order if channel in requested_set]
+        derived_mode = _reference_mode_for_channels(channels, detector_by_channel)
+        declared_mode = str(raw.get("reference_mode") or derived_mode).strip().lower()
+        if declared_mode not in CALIBRATION_REFERENCE_MODES:
+            raise BadRequest(f"校准参考段 {segment_id} 的 reference_mode 不受支持")
+        if declared_mode != derived_mode:
+            raise BadRequest(
+                f"校准参考段 {segment_id} 的 reference_mode={declared_mode} 与通道检测器组合 {derived_mode} 不一致"
+            )
+        axes = sorted({axis_by_channel[channel] for channel in channels})
+        segments.append(
+            {
+                "segment_id": segment_id,
+                "order": order,
+                "start_min": start_min,
+                "end_min": end_min,
+                "reference_channels": channels,
+                "reference_mode": derived_mode,
+                "population_label": str(raw.get("population_label") or "").strip(),
+                "boundaries_confirmed": confirmed,
+                "time_axes": axes,
+            }
+        )
+
+    reference_set = {
+        channel for segment in segments for channel in segment["reference_channels"]
+    }
+    reference_channels = [channel for channel in channel_order if channel in reference_set]
+    calibration_axes = sorted(
+        {axis_by_channel[channel] for channel in reference_channels}
+    )
+    required_cell_axes = {
+        str(row["time_axis"])
+        for row in layout["lif_channels"]
+        if bool(row.get("use_for_cell_annotation", True))
+    }
+    missing_axes = sorted(required_cell_axes - set(calibration_axes))
+    if missing_axes:
+        raise BadRequest(
+            "calibration_protocol 未覆盖启用细胞标注的物理轴: " + ", ".join(missing_axes)
+        )
+    normalized = {
+        "protocol_version": CALIBRATION_PROTOCOL_VERSION,
+        "segments": segments,
+        "reference_channels": reference_channels,
+        "calibration_time_axes": calibration_axes,
+        "boundaries_confirmed": all(bool(row["boundaries_confirmed"]) for row in segments),
+    }
+    compatibility_mode = str(protocol.get("compatibility_mode") or "").strip()
+    if compatibility_mode:
+        normalized["compatibility_mode"] = compatibility_mode
+    return normalized
+
+
+def suggest_calibration_segment_windows(
+    lif_peaks: pd.DataFrame,
+    segments: list[dict[str, Any]],
+    *,
+    annotation_start_min: float,
+    cluster_gap_min: float = 1.50,
+    edge_margin_min: float = 0.25,
+) -> dict[str, Any]:
+    """Suggest ordered project-local reference windows without confirming them.
+
+    The result is deliberately advisory: every returned segment has
+    ``boundaries_confirmed=False``.  Evidence is clustered independently for
+    each declared segment and then jointly arbitrated so sequential segments
+    cannot overlap or appear out of order.
+    """
+
+    try:
+        annotation_start = float(annotation_start_min)
+        gap_limit = float(cluster_gap_min)
+        edge_margin = float(edge_margin_min)
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("参考窗口建议参数必须是有效数值") from exc
+    if not math.isfinite(annotation_start) or annotation_start <= 0:
+        raise BadRequest("事件标注起点必须大于 0 min 才能建议前段参考窗口")
+    if not math.isfinite(gap_limit) or gap_limit <= 0:
+        raise BadRequest("参考峰簇间隔阈值必须大于 0 min")
+    if not math.isfinite(edge_margin) or edge_margin <= 0:
+        raise BadRequest("参考窗口边缘留白必须大于 0 min")
+    if not isinstance(segments, list) or not segments:
+        raise BadRequest("至少需要一个校准参考段才能建议窗口")
+
+    declared: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(segments, start=1):
+        if not isinstance(raw, dict):
+            raise BadRequest("校准参考段必须是对象")
+        segment_id = str(raw.get("segment_id") or f"reference_{index}").strip()
+        if not segment_id or segment_id in seen_ids:
+            raise BadRequest("校准参考段 segment_id 不能为空或重复")
+        seen_ids.add(segment_id)
+        try:
+            order = int(raw.get("order", index))
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"校准参考段 {segment_id} 的顺序必须是整数") from exc
+        if order != index:
+            raise BadRequest("窗口建议前，参考段列表必须按 order 连续排列")
+        raw_channels = raw.get("reference_channels")
+        if not isinstance(raw_channels, (list, tuple)):
+            raise BadRequest(f"校准参考段 {segment_id} 缺失 reference_channels")
+        channels = [str(value).strip().upper() for value in raw_channels if str(value).strip()]
+        if not channels or len(channels) != len(set(channels)):
+            raise BadRequest(f"校准参考段 {segment_id} 的参考通道不能为空或重复")
+        declared.append(
+            {
+                "segment_id": segment_id,
+                "order": order,
+                "reference_channels": channels,
+                "population_label": str(raw.get("population_label") or "").strip(),
+            }
+        )
+
+    peaks = lif_peaks.copy() if isinstance(lif_peaks, pd.DataFrame) else pd.DataFrame()
+    if not peaks.empty and "peak_stage" in peaks.columns and peaks["peak_stage"].eq("merged").any():
+        peaks = peaks[peaks["peak_stage"].eq("merged")].copy()
+    if "channel" not in peaks.columns or "time_min" not in peaks.columns:
+        peaks = pd.DataFrame(columns=["channel", "time_min", "snr"])
+    else:
+        peaks["channel"] = peaks["channel"].astype(str).str.strip().str.upper()
+        peaks["time_min"] = pd.to_numeric(peaks["time_min"], errors="coerce")
+        if "snr" not in peaks.columns:
+            peaks["snr"] = 1.0
+        peaks["snr"] = pd.to_numeric(peaks["snr"], errors="coerce").fillna(1.0).clip(lower=0.0)
+        peaks = peaks[
+            peaks["time_min"].notna()
+            & peaks["time_min"].ge(0.0)
+            & peaks["time_min"].lt(annotation_start)
+        ].copy()
+
+    candidates_by_segment: list[list[dict[str, Any]]] = []
+    for segment in declared:
+        channels = segment["reference_channels"]
+        selected = peaks[peaks["channel"].isin(channels)].sort_values(
+            ["time_min", "channel"], kind="mergesort"
+        )
+        groups: list[pd.DataFrame] = []
+        if not selected.empty:
+            group_key = selected["time_min"].diff().fillna(0.0).gt(gap_limit).cumsum()
+            groups = [group.copy() for _, group in selected.groupby(group_key, sort=False)]
+        segment_candidates: list[dict[str, Any]] = []
+        for group in groups:
+            observed_channels = sorted(set(group["channel"].astype(str)))
+            if not set(channels).issubset(observed_channels):
+                continue
+            first_peak = float(group["time_min"].min())
+            last_peak = float(group["time_min"].max())
+            span = max(0.0, last_peak - first_peak)
+            margin = min(0.75, max(edge_margin, span * 0.08))
+            start_min = max(0.0, first_peak - margin)
+            end_min = min(annotation_start, last_peak + margin)
+            if end_min <= start_min:
+                continue
+            score = float(np.log1p(group["snr"].to_numpy(float)).sum())
+            score += 0.25 * float(len(group))
+            segment_candidates.append(
+                {
+                    "suggested_start_min": round(start_min, 3),
+                    "suggested_end_min": round(end_min, 3),
+                    "first_peak_min": round(first_peak, 6),
+                    "last_peak_min": round(last_peak, 6),
+                    "peak_count": int(len(group)),
+                    "observed_channels": observed_channels,
+                    "score": score,
+                }
+            )
+        segment_candidates.sort(
+            key=lambda row: (-float(row["score"]), float(row["suggested_start_min"]), float(row["suggested_end_min"]))
+        )
+        candidates_by_segment.append(segment_candidates[:12])
+
+    base_rows = [
+        {
+            **segment,
+            "status": "missing_evidence" if not candidates else "evidence_available",
+            "suggested_start_min": None,
+            "suggested_end_min": None,
+            "peak_count": 0,
+            "score": None,
+            "alternative_count": len(candidates),
+            "boundaries_confirmed": False,
+        }
+        for segment, candidates in zip(declared, candidates_by_segment)
+    ]
+    missing_ids = [
+        declared[index]["segment_id"]
+        for index, candidates in enumerate(candidates_by_segment)
+        if not candidates
+    ]
+    if missing_ids:
+        warnings = ["以下参考段缺少完整通道峰形证据: " + ", ".join(missing_ids)]
+        return {
+            "segments": base_rows,
+            "can_apply_suggestions": False,
+            "requires_user_confirmation": True,
+            "warnings": warnings,
+        }
+
+    valid_sequences: list[tuple[float, tuple[dict[str, Any], ...]]] = []
+
+    def collect_sequences(
+        segment_index: int,
+        chosen: tuple[dict[str, Any], ...],
+        score: float,
+    ) -> None:
+        if len(valid_sequences) >= 4096:
+            return
+        if segment_index >= len(candidates_by_segment):
+            valid_sequences.append((score, chosen))
+            return
+        previous_end = float(chosen[-1]["suggested_end_min"]) if chosen else None
+        for candidate in candidates_by_segment[segment_index]:
+            if previous_end is not None and float(candidate["suggested_start_min"]) <= previous_end + 1e-9:
+                continue
+            collect_sequences(
+                segment_index + 1,
+                chosen + (candidate,),
+                score + float(candidate["score"]),
+            )
+
+    collect_sequences(0, (), 0.0)
+    if not valid_sequences:
+        for row in base_rows:
+            row["status"] = "order_conflict"
+        return {
+            "segments": base_rows,
+            "can_apply_suggestions": False,
+            "requires_user_confirmation": True,
+            "warnings": ["峰形证据无法组成严格按序且不重叠的参考窗口，请人工检查错序或重叠。"],
+        }
+
+    valid_sequences.sort(
+        key=lambda item: (
+            -float(item[0]),
+            tuple(float(row["suggested_start_min"]) for row in item[1]),
+        )
+    )
+    best_score, best_sequence = valid_sequences[0]
+    ambiguity_tolerance = max(1e-9, abs(float(best_score)) * 0.05)
+    near_best = [
+        sequence
+        for score, sequence in valid_sequences
+        if float(best_score) - float(score) <= ambiguity_tolerance
+    ]
+    result_rows: list[dict[str, Any]] = []
+    for index, (segment, chosen) in enumerate(zip(declared, best_sequence)):
+        alternative_windows = {
+            (float(sequence[index]["suggested_start_min"]), float(sequence[index]["suggested_end_min"]))
+            for sequence in near_best
+        }
+        ambiguous = len(alternative_windows) > 1
+        result_rows.append(
+            {
+                **segment,
+                **chosen,
+                "status": "ambiguous" if ambiguous else "suggested",
+                "alternative_count": len(alternative_windows),
+                "boundaries_confirmed": False,
+            }
+        )
+    warnings = []
+    if any(row["status"] == "ambiguous" for row in result_rows):
+        warnings.append("存在分数接近的多个峰簇窗口；已回填最高分方案，必须人工核对后确认。")
+    return {
+        "segments": result_rows,
+        "can_apply_suggestions": True,
+        "requires_user_confirmation": True,
+        "warnings": warnings,
+    }
+
+
+def calibration_protocol_hash(
+    protocol: dict[str, Any],
+    acquisition_layout: dict[str, Any] | None,
+) -> str:
+    layout = normalize_acquisition_layout(acquisition_layout)
+    normalized = normalize_calibration_protocol(protocol, layout)
+    channel_physics = {
+        str(row["channel"]): {
+            "detector": str(row["detector"]),
+            "time_axis": str(row["time_axis"]),
+        }
+        for row in layout["lif_channels"]
+    }
+    payload = {
+        "protocol_version": normalized["protocol_version"],
+        "matcher_semantics": (
+            "legacy_qc_anchor_channels"
+            if normalized.get("compatibility_mode")
+            else "segmented_calibration_v1"
+        ),
+        "channel_physics": channel_physics,
+        "segments": [
+            {
+                "segment_id": row["segment_id"],
+                "order": row["order"],
+                "start_min": row["start_min"],
+                "end_min": row["end_min"],
+                "reference_channels": row["reference_channels"],
+                "reference_mode": row["reference_mode"],
+            }
+            for row in normalized["segments"]
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def calibration_protocol_from_manifest(
+    manifest: dict[str, Any] | None,
+    project_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = project_config or {}
+    layout = acquisition_layout_from_manifest(manifest)
+    configured = config.get("calibration_protocol")
+    if not isinstance(configured, dict) and manifest:
+        configured = manifest.get("calibration_protocol")
+    if isinstance(configured, dict):
+        return normalize_calibration_protocol(copy.deepcopy(configured), layout)
+    legacy_channels = list(layout.get("qc_anchor_channels") or [])
+    if not legacy_channels:
+        raise BadRequest("项目缺少 calibration_protocol，且没有可只读适配的旧 qc_anchor_channels")
+    try:
+        qc_end = float(config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN))
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("旧项目 qc_calibration_end_min 无效") from exc
+    detector_by_channel = {
+        str(row["channel"]): str(row["detector"]) for row in layout["lif_channels"]
+    }
+    legacy = {
+        "protocol_version": CALIBRATION_PROTOCOL_VERSION,
+        "compatibility_mode": "v0.3_qc_anchor_channels",
+        "segments": [
+            {
+                "segment_id": "legacy_qc_calibration",
+                "order": 1,
+                "start_min": 0.0,
+                "end_min": qc_end,
+                "reference_channels": legacy_channels,
+                "reference_mode": _reference_mode_for_channels(legacy_channels, detector_by_channel),
+                "population_label": "legacy QC reference",
+                "boundaries_confirmed": True,
+            }
+        ],
+    }
+    return normalize_calibration_protocol(legacy, layout)
+
+
+def normalize_post_qc_strategy(
+    strategy: dict[str, Any] | None,
+    acquisition_layout: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(strategy, dict):
+        raise BadRequest("post_qc_strategy 必须是对象")
+    layout = normalize_acquisition_layout(acquisition_layout)
+    channel_order = [str(row["channel"]) for row in layout["lif_channels"]]
+    channel_set = set(channel_order)
+    detector_by_channel = {
+        str(row["channel"]): str(row["detector"]) for row in layout["lif_channels"]
+    }
+    mode = str(strategy.get("mode") or "").strip().lower()
+    if mode not in POST_QC_STRATEGY_MODES:
+        raise BadRequest(
+            "post_qc_strategy.mode 必须是 signature、scheduled_windows 或 disabled"
+        )
+
+    def normalized_channels(raw: Any, label: str) -> list[str]:
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise BadRequest(f"{label} 必须配置至少一个参考通道")
+        values = [str(channel).strip().upper() for channel in raw if str(channel).strip()]
+        if not values or len(values) != len(set(values)):
+            raise BadRequest(f"{label} 的参考通道不能为空或重复")
+        missing = sorted(set(values) - channel_set)
+        if missing:
+            raise BadRequest(f"{label} 包含未知通道: {', '.join(missing)}")
+        selected = set(values)
+        return [channel for channel in channel_order if channel in selected]
+
+    compatibility_mode = str(strategy.get("compatibility_mode") or "").strip()
+    if mode == "disabled":
+        normalized: dict[str, Any] = {
+            "strategy_version": POST_QC_STRATEGY_VERSION,
+            "mode": "disabled",
+            "reference_channels": [],
+            "windows": [],
+        }
+    elif mode == "signature":
+        channels = normalized_channels(strategy.get("reference_channels"), "QC signature")
+        normalized = {
+            "strategy_version": POST_QC_STRATEGY_VERSION,
+            "mode": "signature",
+            "reference_channels": channels,
+            "reference_mode": _reference_mode_for_channels(channels, detector_by_channel),
+            "windows": [],
+        }
+    else:
+        raw_windows = strategy.get("windows")
+        if not isinstance(raw_windows, list) or not raw_windows:
+            raise BadRequest("scheduled_windows 策略至少需要一个窗口")
+        windows: list[dict[str, Any]] = []
+        window_ids: set[str] = set()
+        previous_end: float | None = None
+        for index, raw in enumerate(raw_windows, start=1):
+            if not isinstance(raw, dict):
+                raise BadRequest("scheduled_windows entries must be objects")
+            window_id = str(raw.get("window_id") or f"post_qc_{index}").strip()
+            if window_id in window_ids:
+                raise BadRequest(f"后段 QC window_id 不能重复: {window_id}")
+            window_ids.add(window_id)
+            try:
+                start_min = float(raw.get("start_min"))
+                end_min = float(raw.get("end_min"))
+            except (TypeError, ValueError) as exc:
+                raise BadRequest(f"后段 QC 窗口 {window_id} 缺失有效边界") from exc
+            if not math.isfinite(start_min) or not math.isfinite(end_min) or start_min < 0 or end_min <= start_min:
+                raise BadRequest(f"后段 QC 窗口 {window_id} 边界无效")
+            if previous_end is not None and start_min < previous_end - 1e-9:
+                raise BadRequest(f"后段 QC scheduled windows 不能重叠: {window_id}")
+            previous_end = end_min
+            channels = normalized_channels(
+                raw.get("reference_channels") or strategy.get("reference_channels"),
+                f"后段 QC 窗口 {window_id}",
+            )
+            windows.append(
+                {
+                    "window_id": window_id,
+                    "order": index,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "reference_channels": channels,
+                    "reference_mode": _reference_mode_for_channels(channels, detector_by_channel),
+                }
+            )
+        union = {channel for row in windows for channel in row["reference_channels"]}
+        normalized = {
+            "strategy_version": POST_QC_STRATEGY_VERSION,
+            "mode": "scheduled_windows",
+            "reference_channels": [channel for channel in channel_order if channel in union],
+            "windows": windows,
+        }
+    if compatibility_mode:
+        normalized["compatibility_mode"] = compatibility_mode
+    return normalized
+
+
+def validate_post_qc_strategy_timing(
+    strategy: dict[str, Any],
+    calibration_end_min: float,
+) -> None:
+    """Reject scheduled post-QC windows that overlap front calibration.
+
+    Candidate generation must not silently clip a user-configured window.  The
+    calibration boundary is project-owned, so this validation deliberately
+    lives outside the layout-only strategy normalizer.
+    """
+    try:
+        boundary = float(calibration_end_min)
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("calibration end must be numeric") from exc
+    if not math.isfinite(boundary) or boundary < 0:
+        raise BadRequest("calibration end must be a finite non-negative number")
+    if str(strategy.get("mode") or "") != "scheduled_windows":
+        return
+    for window in strategy.get("windows") or []:
+        start_min = float(window["start_min"])
+        if start_min < boundary - 1e-9:
+            raise BadRequest(
+                f"后段 QC 窗口 {window['window_id']} 从 {start_min:g} min 开始，"
+                f"与前段校准（结束于 {boundary:g} min）重叠；请完整移到前段之后"
+            )
+
+
+def post_qc_strategy_from_manifest(
+    manifest: dict[str, Any] | None,
+    project_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = project_config or {}
+    layout = acquisition_layout_from_manifest(manifest)
+    configured = config.get("post_qc_strategy")
+    if not isinstance(configured, dict) and manifest:
+        configured = manifest.get("post_qc_strategy")
+    if isinstance(configured, dict):
+        return normalize_post_qc_strategy(copy.deepcopy(configured), layout)
+    legacy_channels = list(layout.get("qc_anchor_channels") or [])
+    if not legacy_channels:
+        return normalize_post_qc_strategy({"mode": "disabled"}, layout)
+    return normalize_post_qc_strategy(
+        {
+            "mode": "signature",
+            "reference_channels": legacy_channels,
+            "compatibility_mode": "v0.3_qc_anchor_channels",
+        },
+        layout,
+    )
+
+
+def post_qc_strategy_hash(
+    strategy: dict[str, Any],
+    acquisition_layout: dict[str, Any] | None,
+) -> str:
+    normalized = normalize_post_qc_strategy(strategy, acquisition_layout)
+    payload = {
+        key: value
+        for key, value in normalized.items()
+        if key != "compatibility_mode"
+    }
+    payload["matcher_semantics"] = (
+        "legacy_qc_anchor_channels"
+        if normalized.get("compatibility_mode")
+        else "post_qc_strategy_v1"
+    )
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def project_config_defaults_from_manifest(
+    manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    protocol = calibration_protocol_from_manifest(manifest, {})
+    strategy = post_qc_strategy_from_manifest(manifest, {})
+    annotation_config = (
+        manifest.get("annotation_config", {})
+        if isinstance(manifest, dict) and isinstance(manifest.get("annotation_config"), dict)
+        else {}
+    )
+    protocol_end = max(float(row["end_min"]) for row in protocol["segments"])
+    validate_post_qc_strategy_timing(strategy, protocol_end)
+    try:
+        annotation_start = float(
+            annotation_config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+        )
+        seed_window = float(
+            annotation_config.get(
+                "local_delta_seed_window_min", DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("项目 annotation_config 时间参数无效") from exc
+    if annotation_start < protocol_end:
+        raise BadRequest("项目 annotation_start_min 早于 calibration_protocol 结束时间")
+    if seed_window <= 0:
+        raise BadRequest("项目 local_delta_seed_window_min 必须大于 0")
+    return {
+        "qc_calibration_end_min": protocol_end,
+        "sample_valve_switch_min": float(
+            annotation_config.get("sample_valve_switch_min", DEFAULT_SAMPLE_VALVE_SWITCH_MIN)
+        ),
+        "annotation_start_min": annotation_start,
+        "local_delta_seed_window_min": seed_window,
+        "calibration_protocol": protocol,
+        "post_qc_strategy": strategy,
     }
 
 
@@ -512,10 +1168,69 @@ def write_project_manifest(
     intermediate_tables: dict[str, dict[str, Any]] | None = None,
     acquisition_layout: dict[str, Any] | None = None,
     cell_event_map: dict[str, Any] | None = None,
+    calibration_protocol: dict[str, Any] | None = None,
+    post_qc_strategy: dict[str, Any] | None = None,
+    annotation_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_dir.mkdir(parents=True, exist_ok=True)
     binding = project_table_binding(intermediate_tables) if intermediate_tables else {}
     layout = normalize_acquisition_layout(acquisition_layout, identities=channel_identity_prior)
+    if calibration_protocol is None:
+        legacy_channels = list(layout.get("qc_anchor_channels") or [])
+        if not legacy_channels:
+            raise BadRequest("新项目必须显式提供 calibration_protocol")
+        detector_by_channel = {
+            str(row["channel"]): str(row["detector"]) for row in layout["lif_channels"]
+        }
+        calibration_protocol = {
+            "compatibility_mode": "legacy_creation_api",
+            "segments": [
+                {
+                    "segment_id": "legacy_qc_calibration",
+                    "order": 1,
+                    "start_min": 0.0,
+                    "end_min": QC_SHIFT_WINDOW_MIN,
+                    "reference_channels": legacy_channels,
+                    "reference_mode": _reference_mode_for_channels(legacy_channels, detector_by_channel),
+                    "population_label": "legacy QC reference",
+                    "boundaries_confirmed": True,
+                }
+            ],
+        }
+    normalized_protocol = normalize_calibration_protocol(calibration_protocol, layout)
+    protocol_end_min = max(
+        float(row["end_min"]) for row in normalized_protocol["segments"]
+    )
+    if post_qc_strategy is None:
+        legacy_channels = list(layout.get("qc_anchor_channels") or normalized_protocol["reference_channels"])
+        post_qc_strategy = {
+            "mode": "signature",
+            "reference_channels": legacy_channels,
+            "compatibility_mode": "legacy_creation_api",
+        }
+    normalized_post_qc = normalize_post_qc_strategy(post_qc_strategy, layout)
+    validate_post_qc_strategy_timing(normalized_post_qc, protocol_end_min)
+    raw_annotation_config = annotation_config or {}
+    try:
+        annotation_start_min = float(
+            raw_annotation_config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+        )
+        seed_window_min = float(
+            raw_annotation_config.get(
+                "local_delta_seed_window_min", DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("annotation_config 时间参数必须是数字") from exc
+    if not math.isfinite(annotation_start_min) or annotation_start_min < protocol_end_min:
+        raise BadRequest("annotation_start_min 必须晚于或等于最后一个校准参考段")
+    if not math.isfinite(seed_window_min) or seed_window_min <= 0:
+        raise BadRequest("local_delta_seed_window_min 必须大于 0")
+    normalized_annotation_config = {
+        "annotation_start_min": annotation_start_min,
+        "local_delta_seed_window_min": seed_window_min,
+        "qc_calibration_end_min": protocol_end_min,
+    }
     prior_values = {row["channel"]: row.get("identity_prior", "") for row in layout["lif_channels"]}
     manifest = {
         "project_id": uuid.uuid4().hex,
@@ -527,6 +1242,11 @@ def write_project_manifest(
         "raw_input_mode": normalize_raw_input_mode(raw_input_mode),
         "raw_inputs": raw_inputs,
         "acquisition_layout": layout,
+        "calibration_protocol": normalized_protocol,
+        "calibration_protocol_hash": calibration_protocol_hash(normalized_protocol, layout),
+        "post_qc_strategy": normalized_post_qc,
+        "post_qc_strategy_hash": post_qc_strategy_hash(normalized_post_qc, layout),
+        "annotation_config": normalized_annotation_config,
         "intermediate_tables": intermediate_tables or {},
         "project_table_binding": binding,
         "annotation_db": {
@@ -553,6 +1273,7 @@ def build_raw_input_project_records(
     identities: dict[str, str],
     lif_inputs: list[dict[str, Any]] | None = None,
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
+    calibration_protocol: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
     mode = normalize_raw_input_mode(raw_input_mode)
     if lif_inputs is None:
@@ -562,6 +1283,7 @@ def build_raw_input_project_records(
             {"key": "lif_r2", "path": raw_paths["lif_r2"], "channel": "R2", "identity_prior": identities.get("R2", "Day3")},
         ]
     layout_input = {
+        "layout_version": ACQUISITION_LAYOUT_VERSION if calibration_protocol is not None else 0,
         "lif_channels": [
             {
                 "input_id": f"{str(item.get('key') or f'lif_{idx}').strip()}_raw",
@@ -573,9 +1295,15 @@ def build_raw_input_project_records(
             }
             for idx, item in enumerate(lif_inputs, start=1)
         ],
-        "qc_anchor_channels": list(["G2", "R1"] if qc_anchor_channels is None else qc_anchor_channels),
+        "qc_anchor_channels": (
+            []
+            if calibration_protocol is not None and qc_anchor_channels is None
+            else list(["G2", "R1"] if qc_anchor_channels is None else qc_anchor_channels)
+        ),
     }
     layout = normalize_acquisition_layout(layout_input, identities=identities)
+    if calibration_protocol is not None:
+        normalize_calibration_protocol(calibration_protocol, layout)
     specs = []
     for item, channel_config in zip(lif_inputs, layout["lif_channels"]):
         key = str(item.get("key") or channel_config["input_id"].removesuffix("_raw"))
@@ -768,6 +1496,25 @@ def candidate_id_for_group(group: dict[str, Any]) -> str:
 
 
 def post_qc_candidate_id(group: dict[str, Any]) -> str:
+    strategy_hash = str(group.get("post_qc_strategy_hash") or "")
+    strategy_mode = str(group.get("post_qc_strategy_mode") or "")
+    if strategy_hash and strategy_mode:
+        relation = {
+            "strategy_hash": strategy_hash,
+            "strategy_mode": strategy_mode,
+            "window_id": str(group.get("post_qc_window_id") or ""),
+            "ms_event_id": str(group.get("ms_event_id") or ""),
+            "anchors": qc_anchor_peak_id_map(group),
+        }
+        digest = hashlib.sha1(
+            json.dumps(
+                relation,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        return f"post_qc:v3:{digest}"
     if has_dynamic_qc_anchor_payload(group):
         return f"post_qc:v2:{dynamic_qc_candidate_digest(group)}"
     return f"post_qc:{group['g2_peak_id']}:{group['r1_peak_id']}:{group['ms_event_id']}"
@@ -937,7 +1684,7 @@ def link_or_copy_raw_input(src: Path, dst: Path) -> Path:
     return dst
 
 
-def load_preprocessing_runner(script_name: str):
+def load_preprocessing_module(script_name: str):
     script_path = SCRIPT_ROOT / script_name
     if not script_path.exists():
         raise FileNotFoundError(f"Missing bundled preprocessing script: {script_path}")
@@ -948,6 +1695,12 @@ def load_preprocessing_runner(script_name: str):
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    return module
+
+
+def load_preprocessing_runner(script_name: str):
+    script_path = SCRIPT_ROOT / script_name
+    module = load_preprocessing_module(script_name)
     runner = getattr(module, "run", None)
     if not callable(runner):
         raise RuntimeError(f"Preprocessing script has no run(project_dir=...) entry: {script_path}")
@@ -960,6 +1713,92 @@ def run_preprocessing_script(script_name: str, project_dir: Path) -> str:
         runner = load_preprocessing_runner(script_name)
         runner(project_dir=project_dir)
     return output.getvalue()
+
+
+def suggest_calibration_windows_from_raw_inputs(
+    lif_inputs: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    *,
+    annotation_start_min: float,
+) -> dict[str, Any]:
+    """Read selected LIF files without writing and suggest project windows."""
+
+    if not isinstance(lif_inputs, list) or not 2 <= len(lif_inputs) <= 4:
+        raise BadRequest("窗口建议需要 2–4 个 LIF 输入")
+    prepared: list[dict[str, Any]] = []
+    seen_channels: set[str] = set()
+    for index, raw in enumerate(lif_inputs, start=1):
+        if not isinstance(raw, dict):
+            raise BadRequest("lif_inputs entries must be objects")
+        channel = str(raw.get("channel") or "").strip().upper()
+        path_text = str(raw.get("path") or "").strip()
+        if not channel or not path_text:
+            raise BadRequest(f"LIF {index} 必须选择文件并填写通道")
+        if channel in seen_channels:
+            raise BadRequest(f"LIF 通道不能重复: {channel}")
+        seen_channels.add(channel)
+        path = Path(path_text).expanduser().resolve()
+        require_file(path)
+        prepared.append(
+            {
+                "key": str(raw.get("key") or f"lif_{index}"),
+                "channel": channel,
+                "path": path,
+                "label": str(raw.get("identity_prior") or "").strip(),
+                "detector": str(raw.get("detector") or "").strip().lower(),
+            }
+        )
+    validate_distinct_lif_input_files(prepared)
+
+    module = load_preprocessing_module("run_v3_01_lif_trace_physical_qc.py")
+    merged_tables: list[pd.DataFrame] = []
+    summaries: list[dict[str, Any]] = []
+    for item in prepared:
+        try:
+            trace = pd.read_csv(
+                item["path"],
+                sep="\t",
+                header=None,
+                names=["time_min", "raw"],
+                encoding="utf-16",
+            )
+            trace["time_min"] = pd.to_numeric(trace["time_min"], errors="coerce")
+            trace["raw"] = pd.to_numeric(trace["raw"], errors="coerce")
+            trace = trace.dropna(subset=["time_min", "raw"]).sort_values("time_min").reset_index(drop=True)
+            if len(trace) < 3:
+                raise BadRequest(f"{item['channel']} LIF 文件没有足够的有效时间/强度行")
+            trace["time_sec"] = trace["time_min"] * 60.0
+            trace["channel"] = item["channel"]
+            trace["label"] = item["label"]
+            trace["detector"] = item["detector"]
+            trace["phase"] = "calibration_window_preview"
+            trace, meta = module.add_baseline_and_noise(trace)
+            raw_peaks = module.call_raw_peaks(trace, meta)
+            merged = module.merge_close_raw_peaks(raw_peaks)
+        except BadRequest:
+            raise
+        except Exception as exc:
+            raise BadRequest(f"无法分析 {item['channel']} LIF 峰形: {exc}") from exc
+        if not merged.empty:
+            merged_tables.append(merged)
+        summaries.append(
+            {
+                "channel": item["channel"],
+                "row_count": int(len(trace)),
+                "merged_peak_count": int(len(merged)),
+                "time_min_min": float(trace["time_min"].min()),
+                "time_min_max": float(trace["time_min"].max()),
+            }
+        )
+    all_peaks = pd.concat(merged_tables, ignore_index=True) if merged_tables else pd.DataFrame()
+    result = suggest_calibration_segment_windows(
+        all_peaks,
+        segments,
+        annotation_start_min=annotation_start_min,
+    )
+    result["channel_summaries"] = summaries
+    result["source"] = "selected_raw_lif_peak_shape"
+    return result
 
 
 def assert_first_principles_path(path: Path) -> None:
@@ -1537,9 +2376,15 @@ class AnnotationStore:
     stored separately so they cannot leak back into peak/event extraction.
     """
 
-    def __init__(self, db_path: Path = DEFAULT_ANNOTATION_DB_PATH) -> None:
+    def __init__(
+        self,
+        db_path: Path = DEFAULT_ANNOTATION_DB_PATH,
+        *,
+        default_project_config: dict[str, Any] | None = None,
+    ) -> None:
         self.db_path = db_path
         self.legacy_state_path = self.db_path.parent / "annotation_state.json"
+        self.default_project_config = copy.deepcopy(default_project_config or {})
         self._lock = threading.Lock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -1715,6 +2560,7 @@ class AnnotationStore:
             "sample_valve_switch_min": DEFAULT_SAMPLE_VALVE_SWITCH_MIN,
             "annotation_start_min": DEFAULT_ANNOTATION_START_MIN,
             "local_delta_seed_window_min": DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
+            **self.default_project_config,
         }
         for key, value in defaults.items():
             conn.execute(
@@ -2123,11 +2969,18 @@ class AnnotationStore:
             "qc_calibration_end_min",
             "annotation_start_min",
             "local_delta_seed_window_min",
+            "calibration_protocol",
+            "post_qc_strategy",
         }
         current_config = self.project_config()
-        cleaned: dict[str, float] = {}
+        cleaned: dict[str, Any] = {}
         for key, value in updates.items():
             if key not in allowed:
+                continue
+            if key in {"calibration_protocol", "post_qc_strategy"}:
+                if not isinstance(value, dict):
+                    raise BadRequest(f"{key} must be an object")
+                cleaned[key] = copy.deepcopy(value)
                 continue
             try:
                 number = float(value)
@@ -2143,40 +2996,64 @@ class AnnotationStore:
         proposed_config = {**current_config, **cleaned}
         if float(proposed_config["annotation_start_min"]) < float(proposed_config["qc_calibration_end_min"]):
             raise BadRequest("annotation_start_min must be >= qc_calibration_end_min")
-        frozen = self.active_time_model()
+        active_model = self.active_time_model()
         sensitive_changes = {
             key: {"old": float(current_config.get(key, 0.0)), "new": float(proposed_config[key])}
             for key in TIME_MODEL_CONFIG_KEYS
             if key in cleaned and abs(float(current_config.get(key, 0.0)) - float(proposed_config[key])) > 1e-9
         }
-        clear_active_frozen = bool(frozen and frozen.get("status") == "frozen" and sensitive_changes)
+        if "calibration_protocol" in cleaned:
+            old_protocol_json = json.dumps(
+                current_config.get("calibration_protocol"),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            new_protocol_json = json.dumps(
+                proposed_config.get("calibration_protocol"),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if old_protocol_json != new_protocol_json:
+                sensitive_changes["calibration_protocol"] = {
+                    "old_hash": hashlib.sha256(old_protocol_json.encode("utf-8")).hexdigest(),
+                    "new_hash": hashlib.sha256(new_protocol_json.encode("utf-8")).hexdigest(),
+                }
+        clear_active_time_model = bool(active_model and sensitive_changes)
+        clear_active_frozen = bool(
+            active_model and active_model.get("status") == "frozen" and sensitive_changes
+        )
         if clear_active_frozen and not clear_frozen_time_model:
-            raise BadRequest("修改 QC/后段时间节点会清除当前已冻结 time model；请确认后重新进行后段局部校正")
+            raise BadRequest("修改校准协议或后段时间节点会使当前已冻结 time model 失效；请确认后重新进行后段局部校正")
         qc_end_changed = "qc_calibration_end_min" in sensitive_changes
+        calibration_protocol_changed = "calibration_protocol" in sensitive_changes
         existing_qc_alignment_model = current_config.get(QC_ALIGNMENT_MODEL_KEY)
-        clear_active_qc_alignment = bool(qc_end_changed and existing_qc_alignment_model)
+        clear_active_qc_alignment = bool(
+            (qc_end_changed or calibration_protocol_changed) and existing_qc_alignment_model
+        )
         if clear_active_qc_alignment and not clear_qc_alignment_model:
-            raise BadRequest("修改 QC 结束时间会清除已应用的 anchor QC 对齐；请确认后重新审核并重算 QC 对齐")
+            raise BadRequest("修改校准协议会使已应用的 anchor QC 对齐失效；请确认后重新审核并重算 QC 对齐")
         timestamp = now_iso()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if clear_active_frozen:
+            if clear_active_time_model:
                 conn.execute(
-                    "UPDATE time_models SET is_active = 0, updated_at = ? WHERE is_active = 1 AND status = 'frozen'",
+                    "UPDATE time_models SET is_active = 0, updated_at = ? WHERE is_active = 1",
                     (timestamp,),
                 )
                 self._insert_time_model_audit_row(
                     conn,
-                    action="clear_frozen_time_model_for_project_config_update",
-                    time_model_version=str(frozen.get("time_model_version")),
-                    payload={"updates": cleaned, "sensitive_changes": sensitive_changes, "previous_time_model": frozen},
+                    action="invalidate_time_model_for_project_config_update",
+                    time_model_version=str(active_model.get("time_model_version")),
+                    payload={"updates": cleaned, "sensitive_changes": sensitive_changes, "previous_time_model": active_model},
                 )
             if clear_active_qc_alignment:
                 conn.execute("DELETE FROM project_config WHERE key = ?", (QC_ALIGNMENT_MODEL_KEY,))
                 self._insert_time_model_audit_row(
                     conn,
                     action="clear_qc_alignment_model_for_qc_end_update",
-                    time_model_version=str((frozen or {}).get("time_model_version") or "") or None,
+                    time_model_version=str((active_model or {}).get("time_model_version") or "") or None,
                     payload={
                         "updates": cleaned,
                         "sensitive_changes": sensitive_changes,
@@ -2202,6 +3079,7 @@ class AnnotationStore:
                 payload={
                     "updates": cleaned,
                     "project_config": self._project_config_from_conn(conn),
+                    "invalidated_time_model": clear_active_time_model,
                     "cleared_frozen_time_model": clear_active_frozen,
                     "cleared_qc_alignment_model": clear_active_qc_alignment,
                 },
@@ -2248,19 +3126,59 @@ class AnnotationStore:
         base_model_name: str,
         acquisition_layout_hash_value: str | None = None,
         *,
+        calibration_protocol_hash_value: str | None = None,
         allow_unhashed_legacy_binding: bool = True,
     ) -> dict[str, Any]:
         existing = self.active_time_model()
         if existing:
-            if acquisition_layout_hash_value and not existing.get("acquisition_layout_hash"):
+            existing_layout_hash = str(existing.get("acquisition_layout_hash") or "")
+            existing_protocol_hash = str(existing.get("calibration_protocol_hash") or "")
+            if (
+                acquisition_layout_hash_value
+                and existing_layout_hash
+                and existing_layout_hash != str(acquisition_layout_hash_value)
+            ):
+                raise BadRequest(
+                    "现有 time model 的 acquisition layout 绑定与当前项目不一致；"
+                    "请明确失效旧模型后重新校正"
+                )
+            if (
+                calibration_protocol_hash_value
+                and existing_protocol_hash
+                and existing_protocol_hash != str(calibration_protocol_hash_value)
+            ):
+                raise BadRequest(
+                    "现有 time model 的 calibration protocol 绑定与当前项目不一致；"
+                    "请明确失效旧模型后重新校正"
+                )
+            missing_layout_hash = bool(
+                acquisition_layout_hash_value and not existing_layout_hash
+            )
+            missing_protocol_hash = bool(
+                calibration_protocol_hash_value and not existing_protocol_hash
+            )
+            if missing_layout_hash or missing_protocol_hash:
                 if not allow_unhashed_legacy_binding:
                     raise BadRequest(
-                        "现有 time model 没有 acquisition layout 绑定，不能静默迁移到新的 QC anchor 配置；"
+                        "现有 time model 没有 acquisition layout / calibration protocol 绑定，"
+                        "不能静默迁移到新的校准配置；"
                         "请先清除旧 time model，再重新进行 QC 校正和后段局部校正"
                     )
                 existing = self.upsert_time_model(
-                    {**existing, "acquisition_layout_hash": acquisition_layout_hash_value},
-                    action="bind_legacy_time_model_to_acquisition_layout",
+                    {
+                        **existing,
+                        "acquisition_layout_hash": (
+                            acquisition_layout_hash_value
+                            if missing_layout_hash
+                            else existing.get("acquisition_layout_hash")
+                        ),
+                        "calibration_protocol_hash": (
+                            calibration_protocol_hash_value
+                            if missing_protocol_hash
+                            else existing.get("calibration_protocol_hash")
+                        ),
+                    },
+                    action="bind_legacy_time_model_to_project_protocol",
                 )
             return existing
         config = self.project_config()
@@ -2283,6 +3201,7 @@ class AnnotationStore:
             "method": "default_zero_delta_pending_freeze",
             "residual_summary": {},
             "acquisition_layout_hash": acquisition_layout_hash_value,
+            "calibration_protocol_hash": calibration_protocol_hash_value,
         }
         return self.upsert_time_model(payload, action="default_draft_time_model")
 
@@ -2580,8 +3499,33 @@ class BadRequest(ValueError):
     pass
 
 
-def display_phase_from_time_min(time_min: pd.Series | np.ndarray) -> np.ndarray:
+def display_phase_from_time_min(
+    time_min: pd.Series | np.ndarray,
+    calibration_protocol: dict[str, Any] | None = None,
+    annotation_start_min: float | None = None,
+) -> np.ndarray:
     t = np.asarray(time_min, dtype=float)
+    if calibration_protocol and not calibration_protocol.get("compatibility_mode"):
+        conditions: list[np.ndarray] = []
+        choices: list[str] = []
+        for segment in calibration_protocol.get("segments") or []:
+            conditions.append(
+                (t >= float(segment["start_min"]))
+                & (t <= float(segment["end_min"]))
+            )
+            choices.append(f"calibration:{segment['segment_id']}")
+        start_min = float(
+            DEFAULT_ANNOTATION_START_MIN
+            if annotation_start_min is None
+            else annotation_start_min
+        )
+        conditions.append(t >= start_min)
+        choices.append("annotation_region")
+        return np.select(
+            conditions,
+            choices,
+            default="pre_annotation_unassigned",
+        )
     return np.select(
         [t < QC_SHIFT_WINDOW_MIN, (t >= QC_SHIFT_WINDOW_MIN) & (t < PRE_RUN_MAX_MIN), t >= PRE_RUN_MAX_MIN],
         ["qc_start", "pre_run", "cell_run"],
@@ -2886,6 +3830,154 @@ def estimate_axis_shift(
     }
 
 
+def estimate_segmented_axis_shift(
+    lif_peaks: pd.DataFrame,
+    ms_events: pd.DataFrame,
+    *,
+    time_axis: str,
+    calibration_protocol: dict[str, Any],
+    channel_time_axes: dict[str, str],
+) -> dict[str, Any]:
+    segment_inputs: list[tuple[dict[str, Any], list[str], list[dict[str, Any]], pd.DataFrame]] = []
+    for segment in calibration_protocol["segments"]:
+        channels = [
+            str(channel)
+            for channel in segment["reference_channels"]
+            if str(channel_time_axes[channel]) == str(time_axis)
+        ]
+        if not channels:
+            continue
+        clusters = build_axis_peak_clusters(
+            lif_peaks,
+            channels,
+            start_min=float(segment["start_min"]),
+            end_min=float(segment["end_min"]),
+        )
+        ms = primary_pc34_events(ms_events)
+        ms = ms[
+            ms["time_min"].between(
+                float(segment["start_min"]),
+                float(segment["end_min"]),
+                inclusive="both",
+            )
+        ].sort_values("time_sec").reset_index(drop=True)
+        segment_inputs.append((segment, channels, clusters, ms))
+
+    best: tuple[tuple[Any, ...], float, list[dict[str, Any]]] | None = None
+    scored: list[tuple[tuple[Any, ...], float, list[dict[str, Any]]]] = []
+    for shift in np.arange(
+        SHIFT_SEARCH_MIN_SEC,
+        SHIFT_SEARCH_MAX_SEC + SHIFT_SEARCH_STEP_SEC / 2.0,
+        SHIFT_SEARCH_STEP_SEC,
+    ):
+        match_rows: list[dict[str, Any]] = []
+        support_count = 0
+        multi_channel_count = 0
+        for segment, channels, clusters, ms in segment_inputs:
+            if not clusters or ms.empty:
+                continue
+            lif_times = np.asarray([float(cluster["time_sec"]) for cluster in clusters], dtype=float)
+            ms_times = ms["time_sec"].to_numpy(float)
+            matches = greedy_time_matches(lif_times, ms_times, float(shift), SHIFT_MATCH_TOL_SEC)
+            for lif_idx, ms_idx, residual in matches:
+                cluster = clusters[int(lif_idx)]
+                ms_row = ms.iloc[int(ms_idx)]
+                support = int(cluster["support_count"])
+                support_count += support
+                multi_channel_count += int(support >= 2)
+                match_rows.append(
+                    {
+                        "calibration_segment_id": str(segment["segment_id"]),
+                        "calibration_segment_order": int(segment["order"]),
+                        "population_label": str(segment.get("population_label") or ""),
+                        "time_axis": str(time_axis),
+                        "channels": sorted(cluster["members"]),
+                        "lif_peak_ids": {
+                            str(channel): str(row["peak_id"])
+                            for channel, row in sorted(cluster["members"].items())
+                        },
+                        "lif_raw_time_min": float(cluster["time_sec"] / 60.0),
+                        "lif_aligned_time_min": float((cluster["time_sec"] + float(shift)) / 60.0),
+                        "ms_event_id": str(ms_row["event_id"]),
+                        "ms_time_min": float(ms_row["time_min"]),
+                        "shift_sec": float(shift),
+                        "support_count": support,
+                        "residual_sec": float(residual),
+                        "abs_residual_sec": abs(float(residual)),
+                    }
+                )
+        abs_residuals = np.asarray(
+            [float(row["abs_residual_sec"]) for row in match_rows], dtype=float
+        )
+        median_abs = float(np.median(abs_residuals)) if len(abs_residuals) else float("inf")
+        p90_abs = float(np.quantile(abs_residuals, 0.90)) if len(abs_residuals) else float("inf")
+        independent_events = len({str(row["ms_event_id"]) for row in match_rows})
+        score = (
+            independent_events,
+            len(match_rows),
+            support_count,
+            multi_channel_count,
+            -median_abs,
+            -p90_abs,
+            -abs(float(shift)),
+        )
+        scored.append((score, float(shift), match_rows))
+        if best is None or score > best[0]:
+            best = (score, float(shift), match_rows)
+    assert best is not None
+    best_score, shift_sec, rows = best
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            int(row["calibration_segment_order"]),
+            float(row["ms_time_min"]),
+            str(row["ms_event_id"]),
+        ),
+    )
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    separated = sorted(
+        (
+            candidate
+            for candidate in scored
+            if abs(float(candidate[1]) - float(shift_sec)) >= max(1.0, SHIFT_MATCH_TOL_SEC)
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    runner_up = separated[0] if separated else None
+    ambiguous = bool(
+        runner_up
+        and runner_up[0][:4] == best_score[:4]
+        and float(-runner_up[0][4]) <= float(-best_score[4]) + 0.25
+    )
+    abs_values = [float(row["abs_residual_sec"]) for row in rows]
+    channels = sorted(
+        {
+            channel
+            for _segment, segment_channels, _clusters, _ms in segment_inputs
+            for channel in segment_channels
+        }
+    )
+    return {
+        "time_axis": str(time_axis),
+        "channels": channels,
+        "shift_sec": float(shift_sec),
+        "match_count": len(rows),
+        "independent_event_count": len({str(row["ms_event_id"]) for row in rows}),
+        "multi_channel_match_count": sum(int(row["support_count"] >= 2) for row in rows),
+        "median_abs_residual_sec": float(np.median(abs_values)) if abs_values else None,
+        "p90_abs_residual_sec": float(np.quantile(abs_values, 0.90)) if abs_values else None,
+        "status": "insufficient_segmented_reference_evidence" if len(rows) < 2 else "auto_segmented_axis_shift",
+        "recommendation_status": "insufficient_evidence" if len(rows) < 2 else "ambiguous" if ambiguous else "recommended",
+        "search_range_sec": [SHIFT_SEARCH_MIN_SEC, SHIFT_SEARCH_MAX_SEC],
+        "search_step_sec": SHIFT_SEARCH_STEP_SEC,
+        "match_tolerance_sec": SHIFT_MATCH_TOL_SEC,
+        "shift_estimation_matches": rows,
+        "runner_up_shift_sec": float(runner_up[1]) if runner_up else None,
+    }
+
+
 def multi_anchor_groups_for_range(
     lif_peaks: pd.DataFrame,
     ms_events: pd.DataFrame,
@@ -3108,6 +4200,62 @@ def multi_anchor_groups_for_range(
             )
         groups.append(group)
     return groups
+
+
+def build_segmented_calibration_groups(
+    lif_peaks: pd.DataFrame,
+    ms_events: pd.DataFrame,
+    *,
+    calibration_protocol: dict[str, Any],
+    channel_time_axes: dict[str, str],
+    axis_shifts_sec: dict[str, float],
+) -> dict[str, Any]:
+    groups: list[dict[str, Any]] = []
+    for segment in calibration_protocol["segments"]:
+        segment_groups = multi_anchor_groups_for_range(
+            lif_peaks,
+            ms_events,
+            anchor_channels=list(segment["reference_channels"]),
+            channel_time_axes=channel_time_axes,
+            axis_shifts_sec=axis_shifts_sec,
+            context_start_min=float(segment["start_min"]),
+            context_end_min=float(segment["end_min"]),
+            minimum_raw_time_min=float(segment["start_min"]),
+            ms_shift_sec=0.0,
+            tolerance_sec=QC_GROUP_MATCH_TOL_SEC,
+        )
+        for group in segment_groups:
+            group.update(
+                {
+                    "calibration_segment_id": str(segment["segment_id"]),
+                    "calibration_segment_order": int(segment["order"]),
+                    "calibration_segment_start_min": float(segment["start_min"]),
+                    "calibration_segment_end_min": float(segment["end_min"]),
+                    "calibration_reference_mode": str(segment["reference_mode"]),
+                    "calibration_population_label": str(segment.get("population_label") or ""),
+                }
+            )
+            groups.append(group)
+    groups.sort(
+        key=lambda row: (
+            int(row["calibration_segment_order"]),
+            float(row["ms_time_min"]),
+            str(row["ms_event_id"]),
+        )
+    )
+    for rank, group in enumerate(groups, start=1):
+        group["rank"] = rank
+    return {
+        "anchor_channels": list(calibration_protocol["reference_channels"]),
+        "matcher_version": SEGMENTED_CALIBRATION_MATCHER_VERSION,
+        "calibration_protocol_hash": calibration_protocol.get("protocol_hash"),
+        "lif_r1_minus_g2_offset_sec": None,
+        "lif_anchor_b_minus_anchor_a_offset_sec": None,
+        "lif_pair_match_tolerance_sec": LIF_PAIR_MATCH_TOL_SEC,
+        "match_tolerance_sec": QC_GROUP_MATCH_TOL_SEC,
+        "segments": copy.deepcopy(calibration_protocol["segments"]),
+        "groups": groups,
+    }
 
 
 def estimate_lif_pair_offset(g2: pd.DataFrame, r1: pd.DataFrame) -> float:
@@ -4201,12 +5349,110 @@ def estimate_local_delta_shift(
     return best
 
 
+def estimate_segmented_shift_alignment(
+    lif_peaks: pd.DataFrame,
+    ms_events: pd.DataFrame,
+    *,
+    acquisition_layout: dict[str, Any],
+    calibration_protocol: dict[str, Any],
+) -> dict[str, Any]:
+    layout = normalize_acquisition_layout(acquisition_layout)
+    protocol = normalize_calibration_protocol(calibration_protocol, layout)
+    protocol_hash = calibration_protocol_hash(protocol, layout)
+    protocol = {**protocol, "protocol_hash": protocol_hash}
+    channel_time_axes = {
+        str(channel): str(axis) for channel, axis in layout["channel_time_axes"].items()
+    }
+    axis_estimates = {
+        axis: estimate_segmented_axis_shift(
+            lif_peaks,
+            ms_events,
+            time_axis=axis,
+            calibration_protocol=protocol,
+            channel_time_axes=channel_time_axes,
+        )
+        for axis in protocol["calibration_time_axes"]
+    }
+    axis_shifts_sec = {
+        str(axis): float(estimate["shift_sec"])
+        for axis, estimate in axis_estimates.items()
+    }
+    for row in layout["lif_channels"]:
+        axis_shifts_sec.setdefault(str(row["time_axis"]), 0.0)
+    channel_estimates: dict[str, dict[str, Any]] = {}
+    for row in layout["lif_channels"]:
+        channel = str(row["channel"])
+        axis = str(row["time_axis"])
+        estimate = axis_estimates.get(axis)
+        if estimate:
+            channel_estimates[channel] = {
+                **estimate,
+                "channel": channel,
+                "shift_sec": float(axis_shifts_sec[axis]),
+                "shift_source_channels": list(estimate["channels"]),
+                "shift_estimation_matches": [
+                    copy.deepcopy(match)
+                    for match in estimate["shift_estimation_matches"]
+                    if channel in set(match.get("channels") or [])
+                ],
+            }
+        else:
+            channel_estimates[channel] = {
+                "channel": channel,
+                "shift_sec": 0.0,
+                "match_count": 0,
+                "median_abs_residual_sec": None,
+                "p90_abs_residual_sec": None,
+                "status": "axis_not_covered_by_calibration_protocol",
+                "shift_estimation_matches": [],
+            }
+    qc_groups = build_segmented_calibration_groups(
+        lif_peaks,
+        ms_events,
+        calibration_protocol=protocol,
+        channel_time_axes=channel_time_axes,
+        axis_shifts_sec=axis_shifts_sec,
+    )
+    return {
+        "model": f"segmented_calibration_{protocol_hash[:12]}",
+        "status": "suggestion_not_annotation",
+        "description": (
+            f"按 {len(protocol['segments'])} 个用户确认参考段估计物理轴平移；"
+            "同一 time_axis 的通道共享一个平移，不要求同轴通道同时出峰，MS760/MS782 不移动。"
+        ),
+        "green_to_ms_shift_sec": float(axis_shifts_sec.get("green_axis", 0.0)),
+        "red_to_ms_shift_sec": float(axis_shifts_sec.get("red_axis", 0.0)),
+        "axis_shifts_sec": axis_shifts_sec,
+        "channel_time_axes": channel_time_axes,
+        # Deprecated compatibility projection. New code consumes calibration_protocol.
+        "qc_anchor_channels": list(protocol["reference_channels"]),
+        "qc_anchor_time_axes": list(protocol["calibration_time_axes"]),
+        "calibration_protocol": protocol,
+        "calibration_protocol_hash": protocol_hash,
+        "matcher_version": SEGMENTED_CALIBRATION_MATCHER_VERSION,
+        "acquisition_layout_hash": acquisition_layout_hash(layout),
+        "r2_uses": "red_to_ms_shift_sec",
+        "ms_shift_sec": 0.0,
+        "channels": channel_estimates,
+        "axes": axis_estimates,
+        "qc_groups": qc_groups,
+    }
+
+
 def estimate_shift_alignment(
     lif_peaks: pd.DataFrame,
     ms_events: pd.DataFrame,
     qc_calibration_end_min: float = QC_SHIFT_WINDOW_MIN,
     acquisition_layout: dict[str, Any] | None = None,
+    calibration_protocol: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if calibration_protocol is not None:
+        return estimate_segmented_shift_alignment(
+            lif_peaks,
+            ms_events,
+            acquisition_layout=normalize_acquisition_layout(acquisition_layout),
+            calibration_protocol=calibration_protocol,
+        )
     qc_end = float(qc_calibration_end_min)
     layout = normalize_acquisition_layout(acquisition_layout)
     channel_time_axes = layout["channel_time_axes"]
@@ -4326,15 +5572,40 @@ def accepted_qc_alignment_refit(
     annotations: list[dict[str, Any]],
     *,
     acquisition_layout: dict[str, Any] | None,
+    calibration_protocol: dict[str, Any] | None = None,
     qc_calibration_end_min: float,
     current_axis_shifts_sec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     layout = normalize_acquisition_layout(acquisition_layout)
     layout_hash = acquisition_layout_hash(layout)
     qc_end = float(qc_calibration_end_min)
-    anchor_channels = [str(channel) for channel in layout["qc_anchor_channels"]]
+    normalized_protocol = (
+        normalize_calibration_protocol(calibration_protocol, layout)
+        if calibration_protocol is not None
+        else None
+    )
+    protocol_hash = (
+        calibration_protocol_hash(normalized_protocol, layout)
+        if normalized_protocol is not None
+        else ""
+    )
+    anchor_channels = [
+        str(channel)
+        for channel in (
+            normalized_protocol["reference_channels"]
+            if normalized_protocol is not None
+            else layout["qc_anchor_channels"]
+        )
+    ]
     channel_axes = {str(channel): str(axis) for channel, axis in layout["channel_time_axes"].items()}
-    required_axes = sorted({channel_axes[channel] for channel in anchor_channels})
+    required_axes = sorted(
+        normalized_protocol["calibration_time_axes"]
+        if normalized_protocol is not None
+        else {channel_axes[channel] for channel in anchor_channels}
+    )
+    protocol_segments = {
+        str(row["segment_id"]): row for row in (normalized_protocol or {}).get("segments", [])
+    }
     previous_shifts = {
         axis: float((current_axis_shifts_sec or {}).get(axis, 0.0))
         for axis in required_axes
@@ -4361,6 +5632,7 @@ def accepted_qc_alignment_refit(
             continue
         if not review_stage and candidate_type not in {
             "qc_calibration_anchor_0_10p5",
+            "qc_calibration_segment_anchor",
             "manual_qc_triplet",
             "manual_qc_anchor_set",
         } and not annotation_id.startswith("auto_qc:"):
@@ -4386,15 +5658,46 @@ def accepted_qc_alignment_refit(
             )
             continue
         ms_time_sec = float(ms_row["time_sec"])
-        if ms_time_sec < 0.0 or ms_time_sec > qc_end * 60.0 + 1e-9:
+        segment = None
+        record_anchor_channels = anchor_channels
+        record_axes = required_axes
+        min_time_sec = 0.0
+        max_time_sec = qc_end * 60.0
+        if normalized_protocol is not None:
+            segment_id = str(record.get("calibration_segment_id") or "")
+            segment = protocol_segments.get(segment_id)
+            if segment is None:
+                matching_segments = [
+                    row
+                    for row in normalized_protocol["segments"]
+                    if float(row["start_min"]) * 60.0 - 1e-9
+                    <= ms_time_sec
+                    <= float(row["end_min"]) * 60.0 + 1e-9
+                ]
+                if len(matching_segments) == 1:
+                    segment = matching_segments[0]
+                else:
+                    conflicts.append(
+                        {
+                            "annotation_id": annotation_id,
+                            "ms_event_id": ms_event_id,
+                            "reason": "missing_or_ambiguous_calibration_segment_id",
+                        }
+                    )
+                    continue
+            record_anchor_channels = [str(channel) for channel in segment["reference_channels"]]
+            record_axes = [str(axis) for axis in segment["time_axes"]]
+            min_time_sec = float(segment["start_min"]) * 60.0
+            max_time_sec = float(segment["end_min"]) * 60.0
+        if ms_time_sec < min_time_sec - 1e-9 or ms_time_sec > max_time_sec + 1e-9:
             continue
         accepted_qc_records.append(record)
         anchor_ids = qc_anchor_peak_id_map(record)
-        for axis in required_axes:
+        for axis in record_axes:
             selected_rows: list[pd.Series] = []
             selected_ids: dict[str, str] = {}
             invalid_reason = ""
-            for channel in anchor_channels:
+            for channel in record_anchor_channels:
                 if channel_axes[channel] != axis:
                     continue
                 peak_id = optional_peak_id(anchor_ids.get(channel))
@@ -4408,7 +5711,7 @@ def accepted_qc_alignment_refit(
                     invalid_reason = "lif_peak_channel_mismatch"
                     break
                 peak_time_sec = float(peak_row["time_sec"])
-                if peak_time_sec < 0.0 or peak_time_sec > qc_end * 60.0 + 1e-9:
+                if peak_time_sec < min_time_sec - 1e-9 or peak_time_sec > max_time_sec + 1e-9:
                     invalid_reason = "lif_peak_outside_qc_range"
                     break
                 selected_rows.append(peak_row)
@@ -4461,6 +5764,7 @@ def accepted_qc_alignment_refit(
                     "ms_time_sec": ms_time_sec,
                     "axis_span_sec": span_sec,
                     "observed_shift_sec": observed_shift_sec,
+                    "calibration_segment_id": str((segment or {}).get("segment_id") or "legacy_qc_calibration"),
                 }
             )
 
@@ -4560,6 +5864,7 @@ def accepted_qc_alignment_refit(
         "method": "accepted_qc_anchor_axis_median_mad",
         "qc_calibration_end_min": qc_end,
         "acquisition_layout_hash": layout_hash,
+        "calibration_protocol_hash": protocol_hash,
         "axis_shifts_sec": axis_shifts,
         "axis_models": {
             axis: {
@@ -4584,6 +5889,7 @@ def accepted_qc_alignment_refit(
         "method": "accepted_qc_anchor_axis_median_mad",
         "qc_calibration_end_min": qc_end,
         "acquisition_layout_hash": layout_hash,
+        "calibration_protocol_hash": protocol_hash,
         "axis_shifts_sec": axis_shifts,
         "previous_axis_shifts_sec": previous_shifts,
         "axes": axis_models,
@@ -4606,6 +5912,7 @@ def apply_qc_alignment_model(
     qc_calibration_end_min: float,
     acquisition_layout: dict[str, Any] | None,
     model: dict[str, Any],
+    calibration_protocol: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     layout = normalize_acquisition_layout(acquisition_layout)
     layout_hash = acquisition_layout_hash(layout)
@@ -4616,7 +5923,23 @@ def apply_qc_alignment_model(
         raise BadRequest("已保存的 QC alignment model 与当前 acquisition layout 不一致")
     if abs(float(model.get("qc_calibration_end_min", -1.0)) - qc_end) > 1e-9:
         raise BadRequest("已保存的 QC alignment model 与当前 QC 结束时间不一致")
-    required_axes = sorted({str(axis) for axis in layout["qc_anchor_time_axes"]})
+    normalized_protocol = (
+        normalize_calibration_protocol(calibration_protocol, layout)
+        if calibration_protocol is not None
+        else None
+    )
+    protocol_hash = (
+        calibration_protocol_hash(normalized_protocol, layout)
+        if normalized_protocol is not None
+        else ""
+    )
+    if normalized_protocol is not None and str(model.get("calibration_protocol_hash") or "") != protocol_hash:
+        raise BadRequest("已保存的 QC alignment model 与当前 calibration protocol 不一致")
+    required_axes = sorted(
+        normalized_protocol["calibration_time_axes"]
+        if normalized_protocol is not None
+        else {str(axis) for axis in layout["qc_anchor_time_axes"]}
+    )
     raw_shifts = model.get("axis_shifts_sec")
     if not isinstance(raw_shifts, dict) or any(axis not in raw_shifts for axis in required_axes):
         raise BadRequest("QC alignment model 没有覆盖全部物理轴")
@@ -4625,11 +5948,19 @@ def apply_qc_alignment_model(
         raise BadRequest("QC alignment model 包含无效物理轴平移")
 
     alignment = copy.deepcopy(automatic_alignment)
-    alignment["model"] = f"accepted_anchor_refit_0_{qc_end:g}min_qc"
+    alignment["model"] = (
+        f"accepted_anchor_refit_segmented_{protocol_hash[:12]}"
+        if normalized_protocol is not None
+        else f"accepted_anchor_refit_0_{qc_end:g}min_qc"
+    )
     alignment["status"] = "accepted_anchor_refit_active"
     alignment["description"] = (
-        f"0-{qc_end:g} min accepted QC anchors 按物理轴稳健重拟合；"
-        "同一 time_axis 的 LIF 通道共用平移，MS760/MS782 不移动。"
+        (
+            f"{len(normalized_protocol['segments'])} 个项目参考段的 accepted anchors 按物理轴稳健重拟合；"
+            if normalized_protocol is not None
+            else f"0-{qc_end:g} min accepted QC anchors 按物理轴稳健重拟合；"
+        )
+        + "同一 time_axis 的 LIF 通道共用平移，MS760/MS782 不移动。"
     )
     alignment["axis_shifts_sec"] = axis_shifts
     alignment["green_to_ms_shift_sec"] = float(axis_shifts.get("green_axis", 0.0))
@@ -4650,16 +5981,27 @@ def apply_qc_alignment_model(
                 "refit_summary": copy.deepcopy(model.get("axes", {}).get(axis, {})),
             }
         )
-    alignment["qc_groups"] = build_qc_alignment_groups(
-        lif_peaks,
-        ms_events,
-        alignment["green_to_ms_shift_sec"],
-        alignment["red_to_ms_shift_sec"],
-        qc_end,
-        axis_shifts_sec=axis_shifts,
-        channel_time_axes=layout["channel_time_axes"],
-        qc_anchor_channels=layout["qc_anchor_channels"],
-    )
+    if normalized_protocol is not None:
+        alignment["calibration_protocol"] = copy.deepcopy(normalized_protocol)
+        alignment["calibration_protocol_hash"] = protocol_hash
+        alignment["qc_groups"] = build_segmented_calibration_groups(
+            lif_peaks,
+            ms_events,
+            calibration_protocol={**normalized_protocol, "protocol_hash": protocol_hash},
+            channel_time_axes=layout["channel_time_axes"],
+            axis_shifts_sec=axis_shifts,
+        )
+    else:
+        alignment["qc_groups"] = build_qc_alignment_groups(
+            lif_peaks,
+            ms_events,
+            alignment["green_to_ms_shift_sec"],
+            alignment["red_to_ms_shift_sec"],
+            qc_end,
+            axis_shifts_sec=axis_shifts,
+            channel_time_axes=layout["channel_time_axes"],
+            qc_anchor_channels=layout["qc_anchor_channels"],
+        )
     return alignment
 
 
@@ -4674,6 +6016,8 @@ class AppData:
     store: AnnotationStore
     channel_identity_prior: dict[str, dict[str, str]]
     acquisition_layout: dict[str, Any] | None = None
+    calibration_protocol: dict[str, Any] | None = None
+    post_qc_strategy: dict[str, Any] | None = None
     manifest: dict[str, Any] | None = None
     cell_event_map: pd.DataFrame | None = None
     cell_event_map_info: dict[str, Any] | None = None
@@ -4695,7 +6039,6 @@ class AppData:
         lif_traces = pd.read_parquet(project.lif_traces_path).sort_values(["channel", "time_min"]).reset_index(drop=True)
         lif_peaks = pd.read_parquet(project.lif_peaks_path)
         lif_peaks = lif_peaks[lif_peaks["peak_stage"].eq("merged")].sort_values(["time_min", "channel"]).reset_index(drop=True)
-        lif_peaks["phase"] = display_phase_from_time_min(lif_peaks["time_min"])
         ms_events = pd.read_parquet(project.ms_events_path).sort_values("time_min").reset_index(drop=True)
         ms_scan = pd.read_parquet(project.ms_scan_path).sort_values("scan_start_time_min").reset_index(drop=True)
         cell_event_map, cell_event_map_info = load_project_cell_event_map(
@@ -4723,13 +6066,43 @@ class AppData:
             binding,
             allow_adopt=allow_adopt,
         )
-        store = AnnotationStore(project.annotation_db_path)
+        store_defaults = project_config_defaults_from_manifest(manifest)
+        # A v0.3 project has neither of the split semantic objects.  They are
+        # compatibility projections, not migrations: do not persist them on
+        # open.  The in-memory adapter below must first consume the project's
+        # already stored qc_calibration_end_min (which may differ from 10.5).
+        if not isinstance((manifest or {}).get("calibration_protocol"), dict):
+            store_defaults.pop("calibration_protocol", None)
+        if not isinstance((manifest or {}).get("post_qc_strategy"), dict):
+            store_defaults.pop("post_qc_strategy", None)
+        store = AnnotationStore(
+            project.annotation_db_path,
+            default_project_config=store_defaults,
+        )
         project_config = store.project_config()
+        calibration_protocol = calibration_protocol_from_manifest(manifest, project_config)
+        post_qc_strategy = post_qc_strategy_from_manifest(manifest, project_config)
+        legacy_protocol = bool(calibration_protocol.get("compatibility_mode"))
+        lif_peaks["phase"] = display_phase_from_time_min(
+            lif_peaks["time_min"],
+            calibration_protocol,
+            float(project_config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)),
+        )
         alignment = estimate_shift_alignment(
             lif_peaks,
             ms_events,
             float(project_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
             acquisition_layout=acquisition_layout,
+            calibration_protocol=None if legacy_protocol else calibration_protocol,
+        )
+        alignment.setdefault("calibration_protocol", copy.deepcopy(calibration_protocol))
+        alignment.setdefault(
+            "calibration_protocol_hash",
+            calibration_protocol_hash(calibration_protocol, acquisition_layout),
+        )
+        alignment["post_qc_strategy"] = copy.deepcopy(post_qc_strategy)
+        alignment["post_qc_strategy_hash"] = post_qc_strategy_hash(
+            post_qc_strategy, acquisition_layout
         )
         persisted_qc_alignment = store.qc_alignment_model()
         if persisted_qc_alignment:
@@ -4740,12 +6113,29 @@ class AppData:
                 qc_calibration_end_min=float(project_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
                 acquisition_layout=acquisition_layout,
                 model=persisted_qc_alignment,
+                calibration_protocol=None if legacy_protocol else calibration_protocol,
             )
         current_layout_hash = str(alignment.get("acquisition_layout_hash") or "")
+        current_protocol_hash = str(
+            alignment.get("calibration_protocol_hash")
+            or calibration_protocol_hash(calibration_protocol, acquisition_layout)
+        )
         existing_time_model = store.active_time_model()
         existing_layout_hash = str((existing_time_model or {}).get("acquisition_layout_hash") or "")
+        existing_protocol_hash = str(
+            (existing_time_model or {}).get("calibration_protocol_hash") or ""
+        )
         if existing_layout_hash and current_layout_hash and existing_layout_hash != current_layout_hash:
             raise BadRequest("项目 QC anchor/time-axis 配置与当前 frozen/draft time model 不一致；请恢复原配置或清除旧 time model 后重新校正")
+        if (
+            existing_protocol_hash
+            and current_protocol_hash
+            and existing_protocol_hash != current_protocol_hash
+        ):
+            raise BadRequest(
+                "项目 calibration protocol 与当前 frozen/draft time model 不一致；"
+                "请恢复原配置或明确失效旧 time model 后重新校正"
+            )
         if existing_time_model and current_layout_hash and not existing_layout_hash:
             if not is_legacy_acquisition_layout(acquisition_layout):
                 raise BadRequest(
@@ -4756,10 +6146,17 @@ class AppData:
             # persist this hash.  Loading them must remain side-effect free:
             # the legacy interpretation is applied in memory until the user
             # performs an explicit mutating operation.
+        if existing_time_model and current_protocol_hash and not existing_protocol_hash:
+            if not legacy_protocol:
+                raise BadRequest(
+                    "现有 time model 没有 calibration protocol 绑定，不能静默迁移到新协议；"
+                    "请明确失效旧 time model 后重新校正"
+                )
         elif existing_time_model is None:
             store.ensure_draft_time_model(
                 str(alignment["model"]),
                 current_layout_hash,
+                calibration_protocol_hash_value=current_protocol_hash,
                 allow_unhashed_legacy_binding=False,
             )
 
@@ -4789,6 +6186,8 @@ class AppData:
             store=store,
             channel_identity_prior=channel_identity_prior,
             acquisition_layout=acquisition_layout,
+            calibration_protocol=calibration_protocol,
+            post_qc_strategy=post_qc_strategy,
             manifest=manifest,
             cell_event_map=cell_event_map,
             cell_event_map_info=cell_event_map_info,
@@ -4832,6 +6231,8 @@ class AppData:
             "ms_scan_rows": int(len(self.ms_scan)),
             "lif_channels": labels,
             "acquisition_layout": normalize_acquisition_layout(self.acquisition_layout),
+            "calibration_protocol": copy.deepcopy(self.calibration_protocol),
+            "post_qc_strategy": copy.deepcopy(self.post_qc_strategy),
             "cell_event_map": {
                 "available": self.cell_event_map is not None,
                 "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
@@ -4860,7 +6261,7 @@ class AppData:
         candidate_type = self.infer_candidate_type(row)
         if candidate_type.startswith("cell") or candidate_type == "manual_cell_pair":
             return "cell_annotation"
-        if candidate_type == "qc_survey_post_10p5" or candidate_type == "manual_qc_anchor_partial":
+        if candidate_type.startswith("qc_survey_") or candidate_type == "manual_qc_anchor_partial":
             return "qc_survey"
         if candidate_type == "qc_calibration_anchor_0_10p5":
             return "qc_calibration"
@@ -4962,6 +6363,10 @@ class AppData:
         stage = self.annotation_review_stage(payload)
         if stage not in {"qc_survey", "cell_annotation"}:
             return
+        if stage == "qc_survey" and not self.qc_survey_matches_current_strategy(payload):
+            raise BadRequest(
+                "该 QC 巡检候选不属于当前 post_qc_strategy（策略可能已修改或禁用）；请在当前窗口重新生成并审核"
+            )
         frozen = self.frozen_time_model()
         if not frozen:
             raise BadRequest("请先完成后段局部校正并冻结 delta，再接受第三阶段标注")
@@ -4973,6 +6378,21 @@ class AppData:
         if not ms_event_id:
             raise BadRequest("第三阶段 annotation 缺少 ms_event_id")
         self.require_third_stage_event_in_map(ms_event_id)
+        conflicting = [
+            row
+            for row in self.store.records()
+            if str(row.get("annotation_id") or "") != str(annotation_id)
+            and str(row.get("review_status") or "") == "accepted"
+            and str(row.get("ms_event_id") or "") == ms_event_id
+            and str(row.get("time_model_version") or "") == active_version
+            and self.annotation_review_stage(row) in {"qc_survey", "cell_annotation"}
+        ]
+        if conflicting:
+            relation = conflicting[0]
+            raise BadRequest(
+                "同一 MS event 在当前 time model 下只能有一个第三阶段标注，已有冲突："
+                f"{relation.get('annotation_id')}；请先撤销旧关系再仲裁"
+            )
         if self.cell_event_map is None:
             return
         state = self.projected_cell_event_map_state()
@@ -5001,7 +6421,7 @@ class AppData:
 
     def attach_cell_event_map(self, source_path: Path) -> "AppData":
         if self.cell_event_map is not None or (self.manifest or {}).get("cell_event_map"):
-            raise BadRequest("当前项目已绑定 cell event map；v0.3.0 不支持替换")
+            raise BadRequest("当前项目已绑定 cell event map；当前版本不支持替换")
         manifest = copy.deepcopy(self.manifest or read_project_manifest(self.project.project_dir))
         if not manifest:
             raise BadRequest("旧项目必须先建立 lifms_project.json 才能附加 event map")
@@ -5090,7 +6510,8 @@ class AppData:
         filters = {
             "review_status": "accepted",
             "exportable": True,
-            "include_stages": ["qc_calibration", "qc_survey", "cell_annotation"],
+            "include_stages": ["qc_survey", "cell_annotation"],
+            "calibration_evidence_policy": "sqlite_audit_only",
             "current_time_model_only_for_post_qc_and_cell": True,
             "active_time_model_version": active_version,
             "input_policy": "first_principles_preprocessing_tables_plus_human_review",
@@ -5103,6 +6524,22 @@ class AppData:
             if row.get("review_status") != "accepted" or not bool(row.get("exportable")):
                 continue
             stage = self.annotation_review_stage(row)
+            if stage == "qc_calibration":
+                skipped.append(
+                    {
+                        "annotation_id": row.get("annotation_id"),
+                        "reason": "calibration_evidence_audit_only",
+                    }
+                )
+                continue
+            if stage not in {"qc_survey", "cell_annotation"}:
+                skipped.append(
+                    {
+                        "annotation_id": row.get("annotation_id"),
+                        "reason": "not_a_main_cell_export_stage",
+                    }
+                )
+                continue
             if stage in {"qc_survey", "cell_annotation"}:
                 row_version = str(row.get("time_model_version") or "")
                 if not active_version or not row_version or row_version != active_version:
@@ -5115,7 +6552,40 @@ class AppData:
                         }
                     )
                     continue
+            if stage == "qc_survey" and not self.qc_survey_matches_current_strategy(row):
+                skipped.append(
+                    {
+                        "annotation_id": row.get("annotation_id"),
+                        "reason": "stale_post_qc_strategy_hash",
+                        "row_post_qc_strategy_hash": str(
+                            row.get("post_qc_strategy_hash") or ""
+                        ),
+                        "active_post_qc_strategy_hash": str(
+                            self.project_config().get("post_qc_strategy_hash") or ""
+                        ),
+                    }
+                )
+                continue
             rows.append(self.export_row(row, stage=stage, export_id=export_id, exported_at=timestamp))
+        missing_cell_numbers = [
+            str(row.get("annotation_id") or "")
+            for row in rows
+            if not str(row.get("CellNumber") or "").strip()
+        ]
+        if missing_cell_numbers:
+            raise BadRequest(
+                "主 CSV 中每条后段 QC/细胞记录都必须对应一个 MS event 和稳定 CellNumber；"
+                "请检查这些标注: " + ", ".join(missing_cell_numbers[:10])
+            )
+        cell_numbers = [str(row["CellNumber"]) for row in rows]
+        duplicate_cell_numbers = sorted(
+            value for value, count in Counter(cell_numbers).items() if count > 1
+        )
+        if duplicate_cell_numbers:
+            raise BadRequest(
+                "同一 MS event 不能在主 CSV 中重复分类；请先仲裁这些 CellNumber: "
+                + ", ".join(duplicate_cell_numbers[:10])
+            )
         columns = self.export_columns()
         buffer = io.StringIO()
         writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
@@ -5162,6 +6632,14 @@ class AppData:
                 lif_channel = "R2"
         prior = self.channel_identity_prior.get(lif_channel, {}) if lif_channel else {}
         identity_prior = str(prior.get("identity_prior") or "")
+        layout_row = next(
+            (
+                item
+                for item in self.layout_lif_channels()
+                if str(item.get("channel") or "") == lif_channel
+            ),
+            {},
+        )
         if is_cell:
             annotation_kind = "cell_pair"
             evidence_role = "cell_annotation"
@@ -5233,16 +6711,78 @@ class AppData:
 
         umap1 = None
         umap2 = None
+        cell_number = None
+        event_id = str(row.get("ms_event_id") or "")
         if self.cell_event_map is not None and stage in {"qc_survey", "cell_annotation"}:
-            event_id = str(row.get("ms_event_id") or "")
             coordinate_rows = self.cell_event_map[
                 self.cell_event_map["ms_event_id"].astype(str).eq(event_id)
             ]
             if not coordinate_rows.empty:
                 umap1 = float(coordinate_rows.iloc[0]["UMAP1"])
                 umap2 = float(coordinate_rows.iloc[0]["UMAP2"])
+                event_positions = np.flatnonzero(
+                    self.cell_event_map["ms_event_id"].astype(str).eq(event_id).to_numpy()
+                )
+                if len(event_positions):
+                    width = max(5, len(str(len(self.cell_event_map))))
+                    cell_number = f"Cell{int(event_positions[0]) + 1:0{width}d}"
+        if cell_number is None and event_id and "event_id" in self.ms_events.columns:
+            event_positions = np.flatnonzero(
+                self.ms_events["event_id"].astype(str).eq(event_id).to_numpy()
+            )
+            if len(event_positions):
+                width = max(5, len(str(len(self.ms_events))))
+                cell_number = f"Cell{int(event_positions[0]) + 1:0{width}d}"
+
+        event_rows = (
+            self.ms_events[self.ms_events["event_id"].astype(str).eq(event_id)]
+            if event_id and "event_id" in self.ms_events.columns
+            else self.ms_events.iloc[0:0]
+        )
+        event_row = event_rows.iloc[0] if not event_rows.empty else pd.Series(dtype=object)
+        scan_id_value = row.get("scan_id")
+        if scan_id_value is None:
+            scan_id_value = clean_value(event_row.get("scan_id"))
+        scan_rows = self.ms_scan.iloc[0:0]
+        if scan_id_value is not None and "scan_id" in self.ms_scan.columns:
+            scan_rows = self.ms_scan[
+                self.ms_scan["scan_id"].astype(str).eq(str(scan_id_value))
+            ]
+        scan_row = scan_rows.iloc[0] if not scan_rows.empty else pd.Series(dtype=object)
+        output_channels = lif_channel
+        output_peak_ids = lif_peak_id
+        if not is_cell:
+            present_anchor_pairs = [
+                (channel, peak_id)
+                for channel, peak_id in dynamic_peak_ids.items()
+                if peak_id and str(peak_id) != MISSING_PEAK_SYMBOL
+            ]
+            output_channels = ";".join(channel for channel, _ in present_anchor_pairs)
+            output_peak_ids = ";".join(str(peak_id) for _, peak_id in present_anchor_pairs)
+        # Main CSV Type is a project-owned scientific identity, never a
+        # payload/source label.  Historical rows without a configured identity
+        # remain useful as generic cells without leaking author annotations.
+        type_value = (identity_prior or "cell") if is_cell else "QC"
 
         return {
+            "CellNumber": cell_number,
+            "scan_Id": scan_id_value,
+            "scan_start_time": row.get("ms_time_min")
+            if row.get("ms_time_min") is not None
+            else clean_value(event_row.get("time_min")),
+            "TIC": clean_value(
+                event_row.get("tic_apex")
+                if event_row.get("tic_apex") is not None
+                else scan_row.get("tic")
+            ),
+            "PC(34:1)_mz": clean_value(
+                scan_row.get("pc34_760_mz_at_max_intensity")
+            ),
+            "PC(34:1)_intensity": clean_value(event_row.get("pc34_760_apex")),
+            "Type": type_value,
+            "LIF_channel": output_channels,
+            "LIF_peak_id": output_peak_ids,
+            "MS_event_id": row.get("ms_event_id"),
             "export_id": export_id,
             "exported_at": exported_at,
             "annotation_id": row.get("annotation_id"),
@@ -5253,12 +6793,18 @@ class AppData:
             "candidate_type": candidate_type,
             "confidence_mode": row.get("confidence_mode"),
             "annotation_label": annotation_label,
+            "cell_id": row.get("ms_event_id") if is_cell else None,
+            "cell_label": annotation_label if is_cell else None,
+            "cell_source_channel": lif_channel if is_cell else None,
+            "cell_source_peak_id": lif_peak_id if is_cell else None,
             "label_source": label_source,
             "payload_label": row.get("label"),
             "evidence_role": evidence_role,
             "lif_channel": lif_channel,
             "lif_peak_id": lif_peak_id,
             "candidate_channel": lif_channel,
+            "lif_detector": layout_row.get("detector"),
+            "lif_time_axis": layout_row.get("time_axis"),
             "channel_identity_prior": identity_prior,
             "channel_identity_prior_source": prior.get("identity_prior_source"),
             "channel_identity_prior_file": prior.get("identity_prior_file"),
@@ -5302,6 +6848,27 @@ class AppData:
             "candidate_rank": row.get("candidate_rank"),
             "candidate_score": row.get("candidate_score"),
             "selection_reason": row.get("selection_reason"),
+            "cross_channel_candidate_conflict": row.get(
+                "cross_channel_candidate_conflict"
+            ),
+            "arbitration_status": row.get("arbitration_status"),
+            "arbitration_reason": row.get("arbitration_reason"),
+            "cross_channel_alternatives_json": json.dumps(
+                row.get("cross_channel_alternatives") or [],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "calibration_segment_id": row.get("calibration_segment_id"),
+            "calibration_segment_order": row.get("calibration_segment_order"),
+            "calibration_population_label": row.get(
+                "calibration_population_label"
+            ),
+            "calibration_reference_mode": row.get("calibration_reference_mode"),
+            "calibration_protocol_hash": row.get("calibration_protocol_hash"),
+            "post_qc_strategy_mode": row.get("post_qc_strategy_mode"),
+            "post_qc_window_id": row.get("post_qc_window_id"),
+            "post_qc_strategy_hash": row.get("post_qc_strategy_hash"),
             "time_model_name": row.get("time_model_name"),
             "time_model_version": row.get("time_model_version"),
             "time_model_status": row.get("time_model_status"),
@@ -5314,17 +6881,22 @@ class AppData:
 
     def export_columns(self) -> list[str]:
         return [
-            "annotation_id", "annotation_kind", "review_stage",
-            "annotation_label", "label_source", "evidence_role",
-            "source", "review_status",
-            "lif_channel", "channel_identity_prior", "channel_identity_prior_source",
-            "lif_peak_id",
-            "g1_peak_id", "g2_peak_id", "r1_peak_id", "r2_peak_id", "ms_event_id", "scan_id",
-            "UMAP1", "UMAP2", "cell_event_map_sha256",
-            "lif_raw_time_min", "g1_raw_time_min", "g2_raw_time_min", "r1_raw_time_min", "r2_raw_time_min", "ms_time_min",
-            "qc_anchor_channels_json", "qc_anchor_peak_ids_json", "qc_anchor_raw_times_json",
-            "qc_anchor_plot_times_json", "qc_anchor_time_axes_json", "lif_anchor_count",
-            "missing_lif_channels", "complete_anchor_set", "matcher_version", "acquisition_layout_hash",
+            "CellNumber",
+            "scan_Id",
+            "scan_start_time",
+            "TIC",
+            "PC(34:1)_mz",
+            "PC(34:1)_intensity",
+            "UMAP1",
+            "UMAP2",
+            "Type",
+            "annotation_kind",
+            "review_stage",
+            "LIF_channel",
+            "LIF_peak_id",
+            "MS_event_id",
+            "residual_sec",
+            "annotation_id",
         ]
 
     def csv_value(self, value: Any) -> Any:
@@ -5352,6 +6924,10 @@ class AppData:
         raw_input_mode: str = RAW_INPUT_MODE_EXTERNAL,
         lif_inputs: list[dict[str, Any]] | None = None,
         qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
+        calibration_protocol: dict[str, Any] | None = None,
+        post_qc_strategy: dict[str, Any] | None = None,
+        annotation_start_min: float | None = None,
+        local_delta_seed_window_min: float = DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
         cell_event_map_path: Path | None = None,
         _staging_build: bool = False,
     ) -> "AppData | ProjectPaths":
@@ -5404,6 +6980,10 @@ class AppData:
                     raw_input_mode=mode,
                     lif_inputs=lif_inputs,
                     qc_anchor_channels=qc_anchor_channels,
+                    calibration_protocol=calibration_protocol,
+                    post_qc_strategy=post_qc_strategy,
+                    annotation_start_min=annotation_start_min,
+                    local_delta_seed_window_min=local_delta_seed_window_min,
                     cell_event_map_path=cell_event_map_path,
                     _staging_build=True,
                 )
@@ -5447,7 +7027,46 @@ class AppData:
             identities=identities,
             lif_inputs=lif_inputs,
             qc_anchor_channels=qc_anchor_channels,
+            calibration_protocol=calibration_protocol,
         )
+        if calibration_protocol is None:
+            effective_protocol = calibration_protocol_from_manifest(
+                {"project_schema_version": 2, "acquisition_layout": acquisition_layout},
+                {"qc_calibration_end_min": QC_SHIFT_WINDOW_MIN},
+            )
+        else:
+            effective_protocol = normalize_calibration_protocol(
+                calibration_protocol, acquisition_layout
+            )
+        if post_qc_strategy is None:
+            legacy_channels = list(
+                acquisition_layout.get("qc_anchor_channels")
+                or effective_protocol["reference_channels"]
+            )
+            effective_post_qc_strategy = normalize_post_qc_strategy(
+                {"mode": "signature", "reference_channels": legacy_channels},
+                acquisition_layout,
+            )
+        else:
+            effective_post_qc_strategy = normalize_post_qc_strategy(
+                post_qc_strategy, acquisition_layout
+            )
+        effective_annotation_start_min = float(
+            DEFAULT_ANNOTATION_START_MIN
+            if annotation_start_min is None
+            else annotation_start_min
+        )
+        protocol_end_min = max(
+            float(row["end_min"]) for row in effective_protocol["segments"]
+        )
+        validate_post_qc_strategy_timing(
+            effective_post_qc_strategy,
+            protocol_end_min,
+        )
+        if not math.isfinite(effective_annotation_start_min) or effective_annotation_start_min < protocol_end_min:
+            raise BadRequest("事件标注起点必须晚于或等于最后一个校准参考段")
+        if not math.isfinite(float(local_delta_seed_window_min)) or float(local_delta_seed_window_min) <= 0:
+            raise BadRequest("后段预校准取证范围必须大于 0 min")
         missing_cell_labels = [
             row["channel"]
             for row in acquisition_layout["lif_channels"]
@@ -5519,6 +7138,20 @@ class AppData:
         script_allowed["allowed_stage"] = "V3-01~V3-06 main workflow"
         script_allowed.to_csv(lock_dir / "00_allowed_inputs.csv", index=False)
         allowed.to_csv(lock_dir / "00_imported_raw_inputs.csv", index=False)
+        preprocessing_protocol = {
+            "schema_version": PROJECT_SCHEMA_VERSION,
+            "calibration_protocol": effective_protocol,
+            "post_qc_strategy": effective_post_qc_strategy,
+            "annotation_config": {
+                "qc_calibration_end_min": protocol_end_min,
+                "annotation_start_min": effective_annotation_start_min,
+                "local_delta_seed_window_min": float(local_delta_seed_window_min),
+            },
+        }
+        (lock_dir / "00_project_protocol.json").write_text(
+            json.dumps(preprocessing_protocol, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         (project_dir / "reports").mkdir(parents=True, exist_ok=True)
         (project_dir / "reports/import_project.md").write_text(
             "\n".join(
@@ -5530,7 +7163,10 @@ class AppData:
                     f"- 本导入只锁定 {len(lif_inputs)} 个用户配置的 LIF 原始文件和 1 个 MS 原始文件。",
                     "- 不读取作者 CSV、h5ad、manual、V2/archive 输入。",
                     "- 生成的中间表用于浏览器人工标注；后续时间校正和 annotation 由软件内人工审核完成。",
-                    f"- QC anchor LIF 通道：`{' + '.join(acquisition_layout['qc_anchor_channels'])}`。",
+                    f"- 前段校准参考通道：`{' + '.join(effective_protocol['reference_channels'])}`。",
+                    f"- 前段参考段数量：`{len(effective_protocol['segments'])}`；边界均为项目级用户确认参数。",
+                    f"- 后段 QC 策略：`{effective_post_qc_strategy['mode']}`。",
+                    f"- 事件标注起点：`{effective_annotation_start_min:g} min`。",
                     "",
                     "## 原始输入",
                     "",
@@ -5600,6 +7236,12 @@ class AppData:
             intermediate_tables=intermediate_tables,
             acquisition_layout=acquisition_layout,
             cell_event_map=map_manifest_entry,
+            calibration_protocol=effective_protocol,
+            post_qc_strategy=effective_post_qc_strategy,
+            annotation_config={
+                "annotation_start_min": effective_annotation_start_min,
+                "local_delta_seed_window_min": float(local_delta_seed_window_min),
+            },
         )
 
         project = ProjectPaths.from_args(
@@ -5653,6 +7295,32 @@ class AppData:
 
     def project_config(self) -> dict[str, Any]:
         config = self.store.project_config()
+        protocol_manifest = self.manifest or {
+            "project_schema_version": 2,
+            "acquisition_layout": self.acquisition_layout,
+        }
+        protocol = calibration_protocol_from_manifest(
+            protocol_manifest,
+            {
+                **config,
+                **(
+                    {"calibration_protocol": self.calibration_protocol}
+                    if self.calibration_protocol is not None and "calibration_protocol" not in config
+                    else {}
+                ),
+            },
+        )
+        strategy = post_qc_strategy_from_manifest(
+            protocol_manifest,
+            {
+                **config,
+                **(
+                    {"post_qc_strategy": self.post_qc_strategy}
+                    if self.post_qc_strategy is not None and "post_qc_strategy" not in config
+                    else {}
+                ),
+            },
+        )
         return {
             "qc_calibration_end_min": float(config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN)),
             "sample_valve_switch_min": float(config.get("sample_valve_switch_min", DEFAULT_SAMPLE_VALVE_SWITCH_MIN)),
@@ -5661,15 +7329,32 @@ class AppData:
                 config.get("local_delta_seed_window_min", DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN)
             ),
             "qc_alignment_model": config.get(QC_ALIGNMENT_MODEL_KEY),
+            "calibration_protocol": protocol,
+            "calibration_protocol_hash": calibration_protocol_hash(
+                protocol, self.acquisition_layout
+            ),
+            "post_qc_strategy": strategy,
+            "post_qc_strategy_hash": post_qc_strategy_hash(
+                strategy, self.acquisition_layout
+            ),
         }
 
     def active_time_model(self) -> dict[str, Any]:
         model = self.store.active_time_model()
         if model:
             return model
+        config = self.project_config()
         return self.store.ensure_draft_time_model(
             str(self.alignment["model"]),
             str(self.alignment.get("acquisition_layout_hash") or ""),
+            calibration_protocol_hash_value=str(
+                self.alignment.get("calibration_protocol_hash")
+                or config.get("calibration_protocol_hash")
+                or ""
+            ),
+            allow_unhashed_legacy_binding=bool(
+                config.get("calibration_protocol", {}).get("compatibility_mode")
+            ),
         )
 
     def frozen_time_model(self) -> dict[str, Any] | None:
@@ -5716,6 +7401,11 @@ class AppData:
             self.ms_events,
             float(config["qc_calibration_end_min"]),
             acquisition_layout=self.acquisition_layout,
+            calibration_protocol=(
+                None
+                if bool(config.get("calibration_protocol", {}).get("compatibility_mode"))
+                else config.get("calibration_protocol")
+            ),
         )
         object.__setattr__(self, "alignment", alignment)
 
@@ -5726,6 +7416,11 @@ class AppData:
             self.ms_events,
             self.store.records(),
             acquisition_layout=self.acquisition_layout,
+            calibration_protocol=(
+                None
+                if bool((self.calibration_protocol or {}).get("compatibility_mode"))
+                else self.project_config().get("calibration_protocol")
+            ),
             qc_calibration_end_min=float(config["qc_calibration_end_min"]),
             current_axis_shifts_sec=self.alignment.get("axis_shifts_sec"),
         )
@@ -5745,6 +7440,11 @@ class AppData:
             self.ms_events,
             float(config["qc_calibration_end_min"]),
             acquisition_layout=self.acquisition_layout,
+            calibration_protocol=(
+                None
+                if bool(config.get("calibration_protocol", {}).get("compatibility_mode"))
+                else config.get("calibration_protocol")
+            ),
         )
         candidate_alignment = apply_qc_alignment_model(
             automatic_alignment,
@@ -5753,6 +7453,11 @@ class AppData:
             qc_calibration_end_min=float(config["qc_calibration_end_min"]),
             acquisition_layout=self.acquisition_layout,
             model=preview,
+            calibration_protocol=(
+                None
+                if bool((self.calibration_protocol or {}).get("compatibility_mode"))
+                else config.get("calibration_protocol")
+            ),
         )
         draft_time_model = {
             "time_model_version": f"tm_{uuid.uuid4().hex[:12]}",
@@ -5774,6 +7479,7 @@ class AppData:
             "method": "default_zero_delta_after_qc_alignment_refit",
             "residual_summary": {},
             "acquisition_layout_hash": candidate_alignment.get("acquisition_layout_hash"),
+            "calibration_protocol_hash": config.get("calibration_protocol_hash"),
         }
         stored_model = self.store.save_qc_alignment_model(
             preview,
@@ -5812,12 +7518,23 @@ class AppData:
             "contains_cell_labels": bool(model.get("contains_cell_labels", False)),
             "ms_local_delta_sec": float(model.get("ms_local_delta_sec", 0.0) or 0.0),
             "acquisition_layout_hash": model.get("acquisition_layout_hash") or self.alignment.get("acquisition_layout_hash"),
+            "calibration_protocol_hash": model.get("calibration_protocol_hash")
+            or self.alignment.get("calibration_protocol_hash")
+            or self.project_config().get("calibration_protocol_hash"),
         }
         if self.cell_event_map is not None:
             payload["cell_event_map_sha256"] = self.cell_event_map_sha256()
         return payload
 
     def local_delta_anchor_pair_kwargs(self, config: dict[str, Any]) -> dict[str, Any]:
+        protocol = config.get("calibration_protocol") or self.calibration_protocol or {}
+        if not bool(protocol.get("compatibility_mode")):
+            # New projects estimate the downstream MS delta from unlabeled peak
+            # topology across every cell-enabled channel.  Front reference
+            # populations are deliberately not reused as downstream QC identity
+            # labels: sequential G1/G2 segments need not co-occur after the
+            # annotation boundary.
+            return {}
         pair_offset = self.alignment.get("qc_groups", {}).get("lif_anchor_b_minus_anchor_a_offset_sec")
         if pair_offset is None:
             pair_offset = self.alignment.get("qc_groups", {}).get("lif_r1_minus_g2_offset_sec")
@@ -5896,6 +7613,7 @@ class AppData:
             "recommendation_status": recommendation_status,
             "complete_anchor_set_count": int(result.get("complete_anchor_set_count", result["unique_match_count"])),
             "acquisition_layout_hash": self.alignment.get("acquisition_layout_hash"),
+            "calibration_protocol_hash": config.get("calibration_protocol_hash"),
             "residual_summary": {
                 "median_abs_residual_sec": result["median_abs_residual_sec"],
                 "p90_abs_residual_sec": result["p90_abs_residual_sec"],
@@ -5950,6 +7668,9 @@ class AppData:
             "method": "manual_slider_unlabeled_topology_preview",
             "evidence_preview": preview["evidence"][:50],
             "acquisition_layout_hash": self.alignment.get("acquisition_layout_hash"),
+            "calibration_protocol_hash": self.project_config().get(
+                "calibration_protocol_hash"
+            ),
         }
         return self.store.upsert_time_model(payload, action="manual_update_local_delta_draft")
 
@@ -5959,11 +7680,16 @@ class AppData:
             raise BadRequest("Cannot freeze a time model that contains cell labels")
         status = "frozen"
         records = self.store.records()
+        active_version = str(model.get("time_model_version") or "")
         first_cell = [
             row
             for row in records
             if str(row.get("candidate_type", "")).startswith("cell")
             and str(row.get("review_status")) == "accepted"
+            and (
+                not str(row.get("time_model_version") or "")
+                or str(row.get("time_model_version") or "") == active_version
+            )
         ]
         if first_cell:
             status = "exploratory"
@@ -5974,9 +7700,76 @@ class AppData:
         clear_frozen_time_model = bool(updates.get("clear_frozen_time_model"))
         clear_qc_alignment_model = bool(updates.get("clear_qc_alignment_model"))
         current_config = self.project_config()
+        normalized_updates = copy.deepcopy(updates)
+        current_protocol = normalize_calibration_protocol(
+            current_config["calibration_protocol"], self.acquisition_layout
+        )
+        proposed_protocol = current_protocol
+        if "calibration_protocol" in updates:
+            proposed_protocol = normalize_calibration_protocol(
+                updates.get("calibration_protocol"), self.acquisition_layout
+            )
+            persist_protocol = True
+            if (
+                current_protocol.get("compatibility_mode")
+                and proposed_protocol.get("compatibility_mode")
+            ):
+                current_semantics = copy.deepcopy(current_protocol)
+                proposed_semantics = copy.deepcopy(proposed_protocol)
+                current_semantics.pop("compatibility_mode", None)
+                proposed_semantics.pop("compatibility_mode", None)
+                if proposed_semantics == current_semantics:
+                    persist_protocol = False
+                else:
+                    proposed_protocol.pop("compatibility_mode", None)
+                    proposed_protocol = normalize_calibration_protocol(
+                        proposed_protocol,
+                        self.acquisition_layout,
+                    )
+            if persist_protocol:
+                normalized_updates["calibration_protocol"] = proposed_protocol
+            else:
+                normalized_updates.pop("calibration_protocol", None)
+            normalized_updates["qc_calibration_end_min"] = max(
+                float(row["end_min"]) for row in proposed_protocol["segments"]
+            )
+        current_strategy = normalize_post_qc_strategy(
+            current_config["post_qc_strategy"], self.acquisition_layout
+        )
+        proposed_strategy = current_strategy
+        if "post_qc_strategy" in updates:
+            proposed_strategy = normalize_post_qc_strategy(
+                updates.get("post_qc_strategy"), self.acquisition_layout
+            )
+            persist_strategy = True
+            if (
+                current_strategy.get("compatibility_mode")
+                and proposed_strategy.get("compatibility_mode")
+            ):
+                current_semantics = {
+                    key: value
+                    for key, value in current_strategy.items()
+                    if key != "compatibility_mode"
+                }
+                proposed_semantics = {
+                    key: value
+                    for key, value in proposed_strategy.items()
+                    if key != "compatibility_mode"
+                }
+                if proposed_semantics != current_semantics:
+                    # Compatibility is an adapter, not a user-selectable
+                    # matcher.  Editing its scientific fields is an explicit
+                    # switch to the v1 strategy semantics.
+                    proposed_strategy.pop("compatibility_mode", None)
+                else:
+                    persist_strategy = False
+            if persist_strategy:
+                normalized_updates["post_qc_strategy"] = proposed_strategy
+            else:
+                normalized_updates.pop("post_qc_strategy", None)
         try:
             proposed_qc_end = float(
-                updates.get("qc_calibration_end_min", current_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN))
+                normalized_updates.get("qc_calibration_end_min", current_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN))
             )
         except (TypeError, ValueError) as exc:
             raise BadRequest("qc_calibration_end_min must be numeric") from exc
@@ -5985,14 +7778,49 @@ class AppData:
         qc_end_changed = abs(
             proposed_qc_end - float(current_config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN))
         ) > 1e-9
+        if (
+            qc_end_changed
+            and proposed_protocol.get("compatibility_mode")
+            and "calibration_protocol" not in updates
+        ):
+            # v0.3 exposes qc_calibration_end_min as its only persisted front
+            # boundary.  Rebuild the in-memory compatibility projection now,
+            # rather than leaving its hash/segment stale until the next open.
+            compat_protocol = copy.deepcopy(proposed_protocol)
+            compat_protocol["segments"][-1]["end_min"] = proposed_qc_end
+            proposed_protocol = normalize_calibration_protocol(
+                compat_protocol,
+                self.acquisition_layout,
+            )
+            if "calibration_protocol" in self.store.project_config():
+                normalized_updates["calibration_protocol"] = proposed_protocol
+        current_protocol_hash = calibration_protocol_hash(
+            current_protocol, self.acquisition_layout
+        )
+        proposed_protocol_hash = calibration_protocol_hash(
+            proposed_protocol, self.acquisition_layout
+        )
+        protocol_changed = current_protocol_hash != proposed_protocol_hash
+        current_strategy_hash = post_qc_strategy_hash(
+            current_strategy,
+            self.acquisition_layout,
+        )
+        proposed_strategy_hash = post_qc_strategy_hash(
+            proposed_strategy,
+            self.acquisition_layout,
+        )
+        strategy_changed = current_strategy_hash != proposed_strategy_hash
+        validate_post_qc_strategy_timing(proposed_strategy, proposed_qc_end)
+        legacy_protocol = bool(proposed_protocol.get("compatibility_mode"))
         proposed_alignment = estimate_shift_alignment(
             self.lif_peaks,
             self.ms_events,
             proposed_qc_end,
             acquisition_layout=self.acquisition_layout,
+            calibration_protocol=None if legacy_protocol else proposed_protocol,
         )
         persisted_qc_alignment = self.store.qc_alignment_model()
-        if persisted_qc_alignment and not qc_end_changed:
+        if persisted_qc_alignment and not qc_end_changed and not protocol_changed:
             proposed_alignment = apply_qc_alignment_model(
                 proposed_alignment,
                 self.lif_peaks,
@@ -6000,12 +7828,21 @@ class AppData:
                 qc_calibration_end_min=proposed_qc_end,
                 acquisition_layout=self.acquisition_layout,
                 model=persisted_qc_alignment,
+                calibration_protocol=(
+                    None
+                    if legacy_protocol
+                    else proposed_protocol
+                ),
             )
         config = self.store.update_project_config(
-            updates,
+            normalized_updates,
             clear_frozen_time_model=clear_frozen_time_model,
             clear_qc_alignment_model=clear_qc_alignment_model,
         )
+        object.__setattr__(self, "calibration_protocol", proposed_protocol)
+        object.__setattr__(self, "post_qc_strategy", proposed_strategy)
+        proposed_alignment["post_qc_strategy"] = copy.deepcopy(proposed_strategy)
+        proposed_alignment["post_qc_strategy_hash"] = proposed_strategy_hash
         object.__setattr__(self, "alignment", proposed_alignment)
         warning = ""
         response_time_model: dict[str, Any] = {
@@ -6027,9 +7864,10 @@ class AppData:
                     "annotation_start_min": float(config["annotation_start_min"]),
                     "local_delta_seed_window_min": float(config["local_delta_seed_window_min"]),
                     "contains_cell_labels": False,
-                    "ms_local_delta_sec": 0.0 if (clear_frozen_time_model or qc_end_changed) else float(model.get("ms_local_delta_sec", 0.0) or 0.0),
+                    "ms_local_delta_sec": 0.0 if (clear_frozen_time_model or qc_end_changed or protocol_changed) else float(model.get("ms_local_delta_sec", 0.0) or 0.0),
                     "max_training_time_min": float(config["annotation_start_min"]) + float(config["local_delta_seed_window_min"]),
                     "acquisition_layout_hash": self.alignment.get("acquisition_layout_hash"),
+                    "calibration_protocol_hash": proposed_protocol_hash,
                 }
                 response_time_model = self.store.upsert_time_model(
                     payload,
@@ -6037,6 +7875,12 @@ class AppData:
                 )
         except Exception as exc:
             warning = f"项目时间节点已保存，但 draft time model 同步失败: {exc}"
+        if strategy_changed:
+            strategy_warning = (
+                "后段 QC 策略已修改；既有人工 QC 标注完整保留为历史记录，"
+                "但不再作为当前策略结果，后段 QC 候选与导出已按新策略重算。"
+            )
+            warning = f"{warning} {strategy_warning}".strip()
         object.__setattr__(self, "_project_config_update_warning", warning)
         object.__setattr__(self, "_project_config_update_time_model", response_time_model)
         return self.project_config()
@@ -6057,27 +7901,32 @@ class AppData:
     ) -> dict[str, Any]:
         ms = self.ms_events[self.ms_events["event_id"].eq(group["ms_event_id"])]
         scan_id = None if ms.empty else clean_value(ms.iloc[0].get("scan_id"))
+        anchor_map = qc_anchor_peak_id_map(group)
+        present_channels = [channel for channel, peak_id in anchor_map.items() if peak_id]
+        anchor_a_channel = str(group.get("anchor_a_channel") or (present_channels[0] if present_channels else ""))
+        anchor_b_channel = str(group.get("anchor_b_channel") or (present_channels[1] if len(present_channels) > 1 else ""))
         payload = {
             "candidate_id": candidate_id,
             "candidate_type": candidate_type,
+            "review_stage": "qc_calibration" if not candidate_type.startswith("qc_survey") else "qc_survey",
             "label": "QC",
-            "anchor_a_channel": group.get("anchor_a_channel") or self.alignment.get("qc_anchor_channels", ["G2", "R1"])[0],
-            "anchor_b_channel": group.get("anchor_b_channel") or self.alignment.get("qc_anchor_channels", ["G2", "R1"])[1],
-            "anchor_a_peak_id": group.get("anchor_a_peak_id") or group["g2_peak_id"],
-            "anchor_b_peak_id": group.get("anchor_b_peak_id") or group["r1_peak_id"],
-            "g2_peak_id": group["g2_peak_id"],
-            "r1_peak_id": group["r1_peak_id"],
+            "anchor_a_channel": anchor_a_channel or None,
+            "anchor_b_channel": anchor_b_channel or None,
+            "anchor_a_peak_id": group.get("anchor_a_peak_id") or anchor_map.get(anchor_a_channel),
+            "anchor_b_peak_id": group.get("anchor_b_peak_id") or anchor_map.get(anchor_b_channel),
+            "g2_peak_id": group.get("g2_peak_id"),
+            "r1_peak_id": group.get("r1_peak_id"),
             "ms_event_id": group["ms_event_id"],
             "scan_id": scan_id,
-            "g2_raw_time_min": group["g2_raw_time_min"],
-            "r1_raw_time_min": group["r1_raw_time_min"],
-            "anchor_a_raw_time_min": group.get("anchor_a_raw_time_min", group["g2_raw_time_min"]),
-            "anchor_b_raw_time_min": group.get("anchor_b_raw_time_min", group["r1_raw_time_min"]),
+            "g2_raw_time_min": group.get("g2_raw_time_min"),
+            "r1_raw_time_min": group.get("r1_raw_time_min"),
+            "anchor_a_raw_time_min": group.get("anchor_a_raw_time_min") or (group.get("lif_anchor_raw_times_min") or {}).get(anchor_a_channel),
+            "anchor_b_raw_time_min": group.get("anchor_b_raw_time_min") or (group.get("lif_anchor_raw_times_min") or {}).get(anchor_b_channel),
             "ms_time_min": group["ms_time_min"],
-            "g2_plot_time_min": group["g2_plot_time_min"],
-            "r1_plot_time_min": group["r1_plot_time_min"],
-            "anchor_a_plot_time_min": group.get("anchor_a_plot_time_min", group["g2_plot_time_min"]),
-            "anchor_b_plot_time_min": group.get("anchor_b_plot_time_min", group["r1_plot_time_min"]),
+            "g2_plot_time_min": group.get("g2_plot_time_min"),
+            "r1_plot_time_min": group.get("r1_plot_time_min"),
+            "anchor_a_plot_time_min": group.get("anchor_a_plot_time_min") or (group.get("lif_anchor_plot_times_min") or {}).get(anchor_a_channel),
+            "anchor_b_plot_time_min": group.get("anchor_b_plot_time_min") or (group.get("lif_anchor_plot_times_min") or {}).get(anchor_b_channel),
             "ms_plot_time_min": group["ms_plot_time_min"],
             **self.time_model_payload_fields(),
             "expected_lif_time_sec": None,
@@ -6113,6 +7962,12 @@ class AppData:
             "conflict_count",
             "same_axis_conflict_count",
             "same_axis_dropped_channels",
+            "calibration_segment_id",
+            "calibration_segment_order",
+            "calibration_segment_start_min",
+            "calibration_segment_end_min",
+            "calibration_reference_mode",
+            "calibration_population_label",
             "g1_peak_id",
             "g1_raw_time_min",
             "g1_plot_time_min",
@@ -6129,17 +7984,46 @@ class AppData:
         return self.payload_from_qc_group(
             group,
             candidate_id=candidate_id_for_group(group),
-            candidate_type="qc_calibration_anchor_0_10p5",
-            confidence_mode="auto_qc_shift_candidate",
+            candidate_type=(
+                "qc_calibration_segment_anchor"
+                if group.get("calibration_segment_id")
+                else "qc_calibration_anchor_0_10p5"
+            ),
+            confidence_mode=(
+                "auto_segmented_calibration_candidate"
+                if group.get("calibration_segment_id")
+                else "auto_qc_shift_candidate"
+            ),
         )
 
     def payload_from_post_qc_group(self, group: dict[str, Any]) -> dict[str, Any]:
-        return self.payload_from_qc_group(
+        config = self.project_config()
+        strategy = normalize_post_qc_strategy(
+            config.get("post_qc_strategy"), self.acquisition_layout
+        )
+        compatibility = bool(strategy.get("compatibility_mode"))
+        payload = self.payload_from_qc_group(
             group,
             candidate_id=post_qc_candidate_id(group),
-            candidate_type="qc_survey_post_10p5",
-            confidence_mode="post_qc_shift_only_candidate",
+            candidate_type=(
+                "qc_survey_post_10p5"
+                if compatibility
+                else f"qc_survey_{strategy['mode']}"
+            ),
+            confidence_mode=(
+                "post_qc_shift_only_candidate"
+                if compatibility
+                else f"post_qc_{strategy['mode']}_candidate"
+            ),
         )
+        payload.update(
+            {
+                "post_qc_strategy_mode": str(strategy["mode"]),
+                "post_qc_strategy_hash": config.get("post_qc_strategy_hash"),
+                "post_qc_window_id": group.get("post_qc_window_id"),
+            }
+        )
+        return payload
 
     def payload_from_qc_ids(self, g2_peak_id: str, r1_peak_id: str, ms_event_id: str, *, post_qc: bool) -> dict[str, Any]:
         g2 = self.lif_peaks[self.lif_peaks["peak_id"].eq(g2_peak_id)]
@@ -6257,7 +8141,7 @@ class AppData:
         if annotation_id.startswith("post_qc:"):
             if not self.frozen_time_model():
                 raise BadRequest("Freeze local time model before reviewing QC survey candidates")
-            if annotation_id.startswith("post_qc:v2:"):
+            if annotation_id.startswith(("post_qc:v2:", "post_qc:v3:")):
                 if window_start_min is None or window_end_min is None:
                     raise BadRequest("Reviewing a multi-anchor QC candidate requires its active window")
                 for group in self.build_post_qc_candidates(
@@ -6278,7 +8162,27 @@ class AppData:
             parts = annotation_id.split(":", 3)
             if len(parts) != 4:
                 raise BadRequest(f"Malformed cell candidate_id: {annotation_id}")
-            return self.payload_from_cell_ids(parts[1], parts[2], parts[3])
+            payload = self.payload_from_cell_ids(parts[1], parts[2], parts[3])
+            if window_start_min is not None and window_end_min is not None:
+                for candidate in self.build_cell_candidates(
+                    float(window_start_min) - WINDOW_CONTEXT_MARGIN_MIN,
+                    float(window_end_min) + WINDOW_CONTEXT_MARGIN_MIN,
+                    "aligned",
+                ):
+                    if cell_candidate_id(candidate) != annotation_id:
+                        continue
+                    for key in [
+                        "candidate_type",
+                        "cross_channel_candidate_conflict",
+                        "arbitration_status",
+                        "arbitration_reason",
+                        "cross_channel_alternatives",
+                        "selection_reason",
+                    ]:
+                        if key in candidate:
+                            payload[key] = clean_value(candidate.get(key))
+                    break
+            return payload
         raise BadRequest(f"Unknown auto candidate_id: {annotation_id}")
 
     def payload_from_manual_anchor_set(
@@ -6287,11 +8191,19 @@ class AppData:
         ms_event_id: str,
         *,
         allow_lif_missing: bool,
+        anchor_channels: list[str] | tuple[str, ...] | None = None,
+        calibration_segment: dict[str, Any] | None = None,
+        post_qc_window: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not ms_event_id:
             raise BadRequest("Manual QC anchor requires an MS760 event")
         layout = normalize_acquisition_layout(self.acquisition_layout)
-        anchors = [str(channel) for channel in layout["qc_anchor_channels"]]
+        anchors = [
+            str(channel)
+            for channel in (anchor_channels or layout["qc_anchor_channels"])
+        ]
+        if not anchors:
+            raise BadRequest("Manual QC anchor 缺少当前参考段或后段策略通道")
         channel_time_axes = layout["channel_time_axes"]
         unexpected = sorted(set(lif_anchor_peak_ids) - set(anchors))
         if unexpected:
@@ -6396,6 +8308,54 @@ class AppData:
             "acquisition_layout_hash": self.alignment.get("acquisition_layout_hash"),
             "input_policy": "first_principles_preprocessing_tables_only",
         }
+        if calibration_segment is not None:
+            payload.update(
+                {
+                    "candidate_type": "qc_calibration_segment_anchor",
+                    "calibration_segment_id": str(calibration_segment["segment_id"]),
+                    "calibration_segment_order": int(calibration_segment["order"]),
+                    "calibration_segment_start_min": float(calibration_segment["start_min"]),
+                    "calibration_segment_end_min": float(calibration_segment["end_min"]),
+                    "calibration_population_label": str(
+                        calibration_segment.get("population_label") or ""
+                    ),
+                    "calibration_reference_mode": str(
+                        calibration_segment.get("reference_mode") or ""
+                    ),
+                    "calibration_protocol_hash": self.project_config().get(
+                        "calibration_protocol_hash"
+                    ),
+                }
+            )
+        if allow_lif_missing:
+            strategy = self.project_config().get("post_qc_strategy", {})
+            if strategy.get("compatibility_mode"):
+                # Preserve the v0.3 manual post-QC identity even though the
+                # modern UI sends an axis-aware anchor map.  The compatibility
+                # matcher recognizes these historical types and annotations.
+                payload["candidate_type"] = (
+                    "manual_qc_anchor_partial"
+                    if missing_channels
+                    else "manual_qc_triplet"
+                )
+                payload["confidence_mode"] = payload["candidate_type"]
+            else:
+                payload["candidate_type"] = (
+                    f"qc_survey_{strategy.get('mode', 'signature')}"
+                )
+            payload.update(
+                {
+                    "post_qc_strategy_mode": str(strategy.get("mode") or ""),
+                    "post_qc_strategy_hash": self.project_config().get(
+                        "post_qc_strategy_hash"
+                    ),
+                    "post_qc_window_id": (
+                        str(post_qc_window.get("window_id"))
+                        if post_qc_window is not None
+                        else None
+                    ),
+                }
+            )
         for channel in ["G1", "G2", "R1", "R2"]:
             key = channel.lower()
             payload[f"{key}_peak_id"] = normalized_ids.get(channel)
@@ -6432,12 +8392,18 @@ class AppData:
         *,
         allow_lif_missing: bool = False,
         lif_anchor_peak_ids: dict[str, str | None] | None = None,
+        anchor_channels: list[str] | tuple[str, ...] | None = None,
+        calibration_segment: dict[str, Any] | None = None,
+        post_qc_window: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if lif_anchor_peak_ids is not None:
             return self.payload_from_manual_anchor_set(
                 lif_anchor_peak_ids,
                 ms_event_id,
                 allow_lif_missing=allow_lif_missing,
+                anchor_channels=anchor_channels,
+                calibration_segment=calibration_segment,
+                post_qc_window=post_qc_window,
             )
         if not ms_event_id:
             raise BadRequest("Manual QC anchor requires an MS760 event")
@@ -6627,22 +8593,93 @@ class AppData:
         window_end_min: float | None = None,
         time_mode: str | None = None,
         lif_anchor_peak_ids: dict[str, str | None] | None = None,
+        calibration_segment_id: str | None = None,
+        post_qc_window_id: str | None = None,
         clear_qc_alignment_model: bool = False,
     ) -> dict[str, Any]:
         g2_peak_id = optional_peak_id(g2_peak_id)
         r1_peak_id = optional_peak_id(r1_peak_id)
         ms_event_id = optional_peak_id(ms_event_id) or ""
+        if stage not in {"qc_calibration", "qc_survey"}:
+            raise BadRequest("Manual QC anchor can only be created in QC calibration or QC survey")
+        config = self.project_config()
+        protocol = normalize_calibration_protocol(
+            config["calibration_protocol"], self.acquisition_layout
+        )
+        strategy = normalize_post_qc_strategy(
+            config["post_qc_strategy"], self.acquisition_layout
+        )
+        selected_segment: dict[str, Any] | None = None
+        selected_post_window: dict[str, Any] | None = None
+        if stage == "qc_calibration":
+            if bool(protocol.get("compatibility_mode")):
+                configured_anchors = list(
+                    normalize_acquisition_layout(self.acquisition_layout)[
+                        "qc_anchor_channels"
+                    ]
+                )
+            else:
+                segment_key = str(calibration_segment_id or "").strip()
+                selected_segment = next(
+                    (
+                        segment
+                        for segment in protocol["segments"]
+                        if str(segment["segment_id"]) == segment_key
+                    ),
+                    None,
+                )
+                if selected_segment is None:
+                    raise BadRequest(
+                        "Manual front calibration anchor requires calibration_segment_id"
+                    )
+                configured_anchors = list(selected_segment["reference_channels"])
+        else:
+            if strategy["mode"] == "disabled":
+                raise BadRequest("当前项目后段 QC 策略为 disabled，已禁用 QC 巡检写入")
+            if strategy["mode"] == "signature":
+                configured_anchors = list(strategy["reference_channels"])
+            else:
+                selected_ms = self.ms_events[
+                    self.ms_events["event_id"].eq(ms_event_id)
+                ]
+                if selected_ms.empty:
+                    raise BadRequest(f"Unknown MS event_id: {ms_event_id}")
+                ms_time = float(selected_ms.iloc[0]["time_min"])
+                matching_windows = [
+                    window
+                    for window in strategy["windows"]
+                    if float(window["start_min"]) <= ms_time <= float(window["end_min"])
+                    and (
+                        not post_qc_window_id
+                        or str(window["window_id"]) == str(post_qc_window_id)
+                    )
+                ]
+                if len(matching_windows) != 1:
+                    raise BadRequest(
+                        "Manual scheduled QC anchor 必须属于唯一配置窗口"
+                    )
+                selected_post_window = matching_windows[0]
+                configured_anchors = list(
+                    selected_post_window["reference_channels"]
+                )
         normalized_anchor_ids: dict[str, str | None] | None = None
         if lif_anchor_peak_ids is not None:
-            configured_anchors = normalize_acquisition_layout(self.acquisition_layout)["qc_anchor_channels"]
+            unexpected_selected = sorted(
+                channel
+                for channel, peak_id in lif_anchor_peak_ids.items()
+                if optional_peak_id(peak_id) and channel not in configured_anchors
+            )
+            if unexpected_selected:
+                raise BadRequest(
+                    "Manual QC anchor contains channels outside the active segment/policy: "
+                    + ", ".join(unexpected_selected)
+                )
             normalized_anchor_ids = {
                 channel: optional_peak_id(lif_anchor_peak_ids.get(channel))
                 for channel in configured_anchors
             }
             g2_peak_id = normalized_anchor_ids.get("G2")
             r1_peak_id = normalized_anchor_ids.get("R1")
-        if stage not in {"qc_calibration", "qc_survey"}:
-            raise BadRequest("Manual QC anchor can only be created in QC calibration or QC survey")
         allow_lif_missing = stage == "qc_survey"
         if stage == "qc_survey" and not self.frozen_time_model():
             raise BadRequest("Freeze local time model before creating QC survey anchors")
@@ -6737,6 +8774,9 @@ class AppData:
             ms_event_id,
             allow_lif_missing=allow_lif_missing,
             lif_anchor_peak_ids=normalized_anchor_ids,
+            anchor_channels=configured_anchors,
+            calibration_segment=selected_segment,
+            post_qc_window=selected_post_window,
         )
         annotation_id = manual_annotation_id(
             g2_peak_id,
@@ -6869,10 +8909,35 @@ class AppData:
         active_version = str(self.active_time_model().get("time_model_version", ""))
         frozen = self.frozen_time_model()
         stored_version = str(stored.get("time_model_version", "")) if stored else ""
-        if post_qc and stored and stored_version != active_version:
+        strategy = self.project_config().get("post_qc_strategy", {}) if post_qc else {}
+        current_strategy_hash = (
+            str(self.project_config().get("post_qc_strategy_hash") or "")
+            if post_qc
+            else ""
+        )
+        stored_strategy_hash = (
+            str(stored.get("post_qc_strategy_hash") or "") if stored else ""
+        )
+        stale_time_model = bool(post_qc and stored and stored_version != active_version)
+        stale_strategy = bool(
+            post_qc
+            and stored
+            and not strategy.get("compatibility_mode")
+            and stored_strategy_hash != current_strategy_hash
+        )
+        if stale_time_model or stale_strategy:
             review_status = "pending"
         else:
             review_status = str(stored.get("review_status")) if stored else "pending"
+        generated_type = (
+            "qc_survey_post_10p5"
+            if post_qc and bool(strategy.get("compatibility_mode"))
+            else f"qc_survey_{strategy.get('mode')}"
+            if post_qc
+            else "qc_calibration_segment_anchor"
+            if group.get("calibration_segment_id")
+            else "qc_calibration_anchor_0_10p5"
+        )
         return {
             **group,
             **self.time_model_payload_fields(),
@@ -6880,15 +8945,23 @@ class AppData:
             "candidate_id": generated_id,
             "candidate_type": (
                 str(stored.get("candidate_type"))
-                if stored and stored.get("candidate_type")
-                else ("qc_survey_post_10p5" if post_qc else "qc_calibration_anchor_0_10p5")
+                if stored and stored.get("candidate_type") and not stale_strategy
+                else generated_type
             ),
             "source": str(stored.get("source")) if stored else "auto_candidate",
             "review_status": review_status,
             "exportable": review_status == "accepted",
             "review_enabled": (not post_qc) or bool(frozen),
-            "stale_review_status": str(stored.get("review_status")) if post_qc and stored and stored_version != active_version else None,
-            "stale_time_model_version": stored_version if post_qc and stored and stored_version != active_version else None,
+            "post_qc_strategy_hash": (
+                current_strategy_hash if post_qc else None
+            ),
+            "stale_review_status": (
+                str(stored.get("review_status"))
+                if stored and (stale_time_model or stale_strategy)
+                else None
+            ),
+            "stale_time_model_version": stored_version if stale_time_model else None,
+            "stale_post_qc_strategy_hash": stored_strategy_hash if stale_strategy else None,
         }
 
     def build_post_qc_candidates(self, context_start_min: float, context_end_min: float, time_mode: str) -> list[dict[str, Any]]:
@@ -6897,6 +8970,11 @@ class AppData:
         if time_mode != "aligned" or context_end_min <= qc_end:
             return []
         if not self.frozen_time_model():
+            return []
+        strategy = normalize_post_qc_strategy(
+            config.get("post_qc_strategy"), self.acquisition_layout
+        )
+        if strategy["mode"] == "disabled":
             return []
         model = self.active_time_model()
         pair_offset = self.alignment.get("qc_groups", {}).get("lif_anchor_b_minus_anchor_a_offset_sec")
@@ -6907,21 +8985,113 @@ class AppData:
         ms_shift_sec = 0.0
         if context_end_min >= float(model.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)):
             ms_shift_sec = float(model.get("ms_local_delta_sec", 0.0) or 0.0)
-        groups = qc_triplets_for_range(
-            self.lif_peaks,
-            self.ms_events,
-            context_start_min=context_start_min,
-            context_end_min=context_end_min,
-            qc_calibration_end_min=qc_end,
-            green_shift_sec=float(self.alignment["green_to_ms_shift_sec"]),
-            red_shift_sec=float(self.alignment["red_to_ms_shift_sec"]),
-            ms_shift_sec=ms_shift_sec,
-            pair_offset_sec=float(pair_offset),
-            tolerance_sec=POST_QC_CANDIDATE_TOL_SEC,
-            axis_shifts_sec=self.alignment.get("axis_shifts_sec"),
-            channel_time_axes=self.alignment.get("channel_time_axes"),
-            qc_anchor_channels=self.alignment.get("qc_anchor_channels"),
-        )
+        if bool(strategy.get("compatibility_mode")):
+            groups = qc_triplets_for_range(
+                self.lif_peaks,
+                self.ms_events,
+                context_start_min=context_start_min,
+                context_end_min=context_end_min,
+                qc_calibration_end_min=qc_end,
+                green_shift_sec=float(self.alignment["green_to_ms_shift_sec"]),
+                red_shift_sec=float(self.alignment["red_to_ms_shift_sec"]),
+                ms_shift_sec=ms_shift_sec,
+                pair_offset_sec=float(pair_offset),
+                tolerance_sec=POST_QC_CANDIDATE_TOL_SEC,
+                axis_shifts_sec=self.alignment.get("axis_shifts_sec"),
+                channel_time_axes=self.alignment.get("channel_time_axes"),
+                qc_anchor_channels=self.alignment.get("qc_anchor_channels"),
+            )
+        else:
+            current_strategy_hash = str(config.get("post_qc_strategy_hash") or "")
+            if strategy["mode"] == "signature":
+                requested_ranges = [
+                    {
+                        "start_min": max(float(context_start_min), qc_end),
+                        "end_min": float(context_end_min),
+                        "reference_channels": list(strategy["reference_channels"]),
+                        "window_id": None,
+                    }
+                ]
+            else:
+                requested_ranges = [
+                    {
+                        "start_min": max(
+                            float(context_start_min), qc_end, float(window["start_min"])
+                        ),
+                        "end_min": min(
+                            float(context_end_min), float(window["end_min"])
+                        ),
+                        "reference_channels": list(window["reference_channels"]),
+                        "window_id": str(window["window_id"]),
+                    }
+                    for window in strategy["windows"]
+                ]
+            annotation_start = float(
+                model.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+            )
+            axis_shifts = dict(self.alignment.get("axis_shifts_sec") or {})
+            channel_axes = dict(
+                self.alignment.get("channel_time_axes")
+                or normalize_acquisition_layout(self.acquisition_layout)["channel_time_axes"]
+            )
+            groups = []
+            seen_relations: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+            for requested in requested_ranges:
+                range_start = float(requested["start_min"])
+                range_end = float(requested["end_min"])
+                if range_end < range_start:
+                    continue
+                split_policies: list[tuple[bool, float]] = []
+                if range_start < annotation_start:
+                    split_policies.append((False, 0.0))
+                if range_end >= annotation_start:
+                    split_policies.append(
+                        (
+                            True,
+                            float(model.get("ms_local_delta_sec", 0.0) or 0.0),
+                        )
+                    )
+                for post_annotation, split_delta in split_policies:
+                    matched = multi_anchor_groups_for_range(
+                        self.lif_peaks,
+                        self.ms_events,
+                        anchor_channels=list(requested["reference_channels"]),
+                        channel_time_axes=channel_axes,
+                        axis_shifts_sec=axis_shifts,
+                        context_start_min=range_start,
+                        context_end_min=range_end,
+                        minimum_raw_time_min=qc_end,
+                        ms_shift_sec=split_delta,
+                        tolerance_sec=POST_QC_CANDIDATE_TOL_SEC,
+                    )
+                    for group in matched:
+                        # The raw MS event time owns the delta regime.  Calling
+                        # the matcher over the full requested range preserves
+                        # valid near-boundary LIF evidence, while this strict
+                        # partition assigns annotation_start itself to the
+                        # frozen post delta exactly once.
+                        group_is_post = (
+                            float(group.get("ms_time_min")) >= annotation_start
+                        )
+                        if group_is_post != post_annotation:
+                            continue
+                        group["post_qc_strategy_mode"] = str(strategy["mode"])
+                        group["post_qc_window_id"] = requested["window_id"]
+                        group["post_qc_strategy_hash"] = current_strategy_hash
+                        relation = qc_relation_key(group)
+                        if relation is not None and relation in seen_relations:
+                            continue
+                        if relation is not None:
+                            seen_relations.add(relation)
+                        groups.append(group)
+            groups.sort(
+                key=lambda item: (
+                    float(item.get("ms_plot_time_min", item.get("ms_time_min", 0.0))),
+                    str(item.get("post_qc_window_id") or ""),
+                )
+            )
+            for rank, group in enumerate(groups, start=1):
+                group["rank"] = rank
         allowed_ids = self.cell_event_map_event_ids()
         accepted_cell_ids = self.accepted_cell_annotation_ms_event_ids()
         groups = [
@@ -6946,7 +9116,7 @@ class AppData:
             **self.time_model_payload_fields(),
             "annotation_id": annotation_id,
             "candidate_id": annotation_id,
-            "candidate_type": "cell_high_confidence",
+            "candidate_type": str(row.get("candidate_type") or "cell_high_confidence"),
             "source": "auto_candidate",
             "review_status": review_status,
             "exportable": review_status == "accepted",
@@ -6982,10 +9152,44 @@ class AppData:
             )
         rows.sort(key=lambda item: (float(item["ms_plot_time_min"]), str(item["lif_channel"])))
         allowed_ids = self.cell_event_map_event_ids()
+        rows = [
+            row
+            for row in rows
+            if allowed_ids is None or str(row.get("ms_event_id")) in allowed_ids
+        ]
+        rows_by_ms: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            rows_by_ms.setdefault(str(row.get("ms_event_id") or ""), []).append(row)
+        for event_rows in rows_by_ms.values():
+            channels = {str(row.get("lif_channel") or "") for row in event_rows}
+            if len(channels) <= 1:
+                continue
+            alternatives = [
+                {
+                    "lif_channel": str(item.get("lif_channel") or ""),
+                    "lif_peak_id": str(item.get("lif_peak_id") or ""),
+                    "label": str(item.get("label") or "cell"),
+                    "abs_residual_sec": float(item.get("abs_residual_sec", 0.0) or 0.0),
+                }
+                for item in event_rows
+            ]
+            alternatives.sort(
+                key=lambda item: (item["abs_residual_sec"], item["lif_channel"])
+            )
+            for row in event_rows:
+                row.update(
+                    {
+                        "candidate_type": "cell_cross_channel_ambiguous",
+                        "cross_channel_candidate_conflict": True,
+                        "arbitration_status": "manual_required",
+                        "arbitration_reason": "multiple_cell_channels_match_same_ms_event",
+                        "cross_channel_alternatives": alternatives,
+                        "selection_reason": "manual_cross_channel_arbitration_required",
+                    }
+                )
         enriched = [
             self.enrich_cell_candidate(row)
             for row in rows
-            if allowed_ids is None or str(row.get("ms_event_id")) in allowed_ids
         ]
         accepted_cell_ids = self.accepted_cell_annotation_ms_event_ids()
         return [
@@ -7087,6 +9291,8 @@ class AppData:
                 row_version = str(row.get("time_model_version") or "")
                 if not active_version or row_version != active_version:
                     continue
+            if stage == "qc_survey" and not self.qc_survey_matches_current_strategy(row):
+                continue
             dynamic_plot_times = row.get("lif_anchor_plot_times_min")
             plot_times = [row.get("lif_plot_time_min"), row.get("ms_plot_time_min")]
             if isinstance(dynamic_plot_times, dict):
@@ -7124,6 +9330,34 @@ class AppData:
         )
         return "qc_survey" if ms_time_float >= annotation_start else "qc_calibration"
 
+    def qc_survey_matches_current_strategy(self, row: dict[str, Any]) -> bool:
+        config = self.project_config()
+        strategy = normalize_post_qc_strategy(
+            config.get("post_qc_strategy"), self.acquisition_layout
+        )
+        if strategy["mode"] == "disabled":
+            return False
+        candidate_type = self.infer_candidate_type(row)
+        if strategy.get("compatibility_mode"):
+            if not (
+                candidate_type == "qc_survey_post_10p5"
+                or candidate_type.startswith("manual_qc")
+            ):
+                return False
+            try:
+                ms_time = float(row.get("ms_time_min"))
+            except (TypeError, ValueError):
+                return False
+            annotation_start = float(
+                config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+            )
+            return ms_time >= annotation_start
+        if not candidate_type.startswith("qc_survey_"):
+            return False
+        return bool(row.get("post_qc_strategy_hash")) and str(
+            row.get("post_qc_strategy_hash")
+        ) == str(config.get("post_qc_strategy_hash") or "")
+
     def is_qc_survey_annotation(self, row: dict[str, Any]) -> bool:
         if str(row.get("review_status")) != "accepted":
             return False
@@ -7132,15 +9366,7 @@ class AppData:
         row_version = str(row.get("time_model_version") or "")
         if not active_version or row_version != active_version:
             return False
-        candidate_type = str(row.get("candidate_type") or "")
-        if candidate_type == "qc_survey_post_10p5" or candidate_type.startswith("manual_qc"):
-            try:
-                ms_time = float(row.get("ms_time_min"))
-            except (TypeError, ValueError):
-                return False
-            annotation_start = float(self.project_config().get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN))
-            return ms_time >= annotation_start
-        return False
+        return self.qc_survey_matches_current_strategy(row)
 
     def accepted_qc_survey_ms_event_ids(self) -> set[str]:
         ids: set[str] = set()
@@ -8145,7 +10371,7 @@ HTML = r"""<!doctype html>
       padding: 16px;
     }
     .modal.import-modal {
-      width: min(1100px, 100%);
+      width: min(1240px, 100%);
     }
     .modal-head {
       display: flex;
@@ -8270,7 +10496,7 @@ HTML = r"""<!doctype html>
     .lif-input-head,
     .lif-input-row {
       display: grid;
-      grid-template-columns: 44px 82px 138px 116px minmax(160px, 1fr) 32px;
+      grid-template-columns: 44px 70px 86px 116px 132px 72px minmax(160px, 1fr) 32px;
       gap: 8px;
       align-items: center;
       min-width: 0;
@@ -8395,6 +10621,90 @@ HTML = r"""<!doctype html>
       font-size: 11px;
       line-height: 1.35;
     }
+    .protocol-editor {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .protocol-row {
+      display: grid;
+      grid-template-columns: 34px 130px 84px 84px minmax(190px, 1fr) 92px 32px;
+      gap: 7px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid #d7dce3;
+      border-radius: 7px;
+      background: #f8fafc;
+    }
+    .protocol-row input,
+    .protocol-row select {
+      width: 100%;
+      min-width: 0;
+    }
+    .protocol-channel-options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+    .protocol-channel-options label,
+    .protocol-confirm {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+      font-size: 11px;
+    }
+    .protocol-channel-options input,
+    .protocol-confirm input {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+    }
+    .import-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e4e7ec;
+    }
+    .import-section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin: 0 0 7px;
+      color: #111827;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .policy-fields {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      gap: 8px;
+    }
+    .policy-fields label {
+      display: grid;
+      gap: 4px;
+      color: #475467;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .policy-fields input,
+    .policy-fields select {
+      width: 100%;
+    }
+    .preset-box {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      padding: 9px 10px;
+      border: 1px solid #b7c2d4;
+      border-radius: 7px;
+      background: #f8fafc;
+    }
+    .preset-box span {
+      color: #667085;
+      font-size: 11px;
+    }
     .mode-options {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -8517,6 +10827,7 @@ HTML = r"""<!doctype html>
         grid-template-columns: 42px minmax(0, 1fr) minmax(0, 1fr) 32px;
         grid-template-areas:
           "slot channel identity remove"
+          ". detector axis ."
           ". use use ."
           ". file file .";
       }
@@ -8528,6 +10839,12 @@ HTML = r"""<!doctype html>
       }
       .lif-identity {
         grid-area: identity;
+      }
+      .lif-detector {
+        grid-area: detector;
+      }
+      .lif-axis {
+        grid-area: axis;
       }
       .lif-use-options {
         grid-area: use;
@@ -8550,6 +10867,16 @@ HTML = r"""<!doctype html>
         grid-column: 1 / -1;
         margin-bottom: -4px;
       }
+      .protocol-row {
+        grid-template-columns: 34px minmax(0, 1fr) minmax(0, 1fr) 32px;
+      }
+      .protocol-row > *:nth-child(5),
+      .protocol-row > *:nth-child(6) {
+        grid-column: 2 / 4;
+      }
+      .policy-fields {
+        grid-template-columns: 1fr 1fr;
+      }
     }
   </style>
 </head>
@@ -8563,8 +10890,8 @@ HTML = r"""<!doctype html>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
       <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
-      <span id="exportHint" class="header-export-hint">导出全项目已接受标注</span>
-      <button id="exportAcceptedCsv" class="header-export-button">导出已接受 CSV</button>
+      <span id="exportHint" class="header-export-hint">主 CSV 仅含 Cell/后段 QC；前段 anchor 留在 SQLite</span>
+      <button id="exportAcceptedCsv" class="header-export-button">导出 Cell/QC 主 CSV</button>
     </div>
   </header>
 
@@ -8589,23 +10916,23 @@ HTML = r"""<!doctype html>
       <div class="metric"><span>MS scan 点数</span><strong id="msPointCount">-</strong></div>
       <p class="side-title" style="margin-top:18px;">任务阶段</p>
       <div class="stage-tabs">
-        <button class="stage-tab active" data-stage="qc_calibration">QC 校正</button>
-        <button class="stage-tab" data-stage="local_calibration">后段局部校正</button>
-        <button class="stage-tab" data-stage="event_annotation">事件标注</button>
+        <button class="stage-tab active" data-stage="qc_calibration">前段参考校准</button>
+        <button class="stage-tab" data-stage="local_calibration">无标签后段 delta</button>
+        <button class="stage-tab" data-stage="event_annotation">事件标注 / QC 巡检</button>
       </div>
-      <div id="stageNote" class="stage-note">前 10.5 min QC anchor 审核，用于确认 shift-only 时间校正。</div>
+      <div id="stageNote" class="stage-note">按项目协议逐段审核前段参考 anchor，用于确认各物理时间轴的 shift-only 校正。</div>
       <div id="eventFilter" class="segmented" style="display:none;" aria-label="事件类型筛选">
         <button type="button" class="active" data-event-filter="all">全部</button>
         <button type="button" data-event-filter="qc">QC</button>
         <button type="button" data-event-filter="cell">细胞</button>
       </div>
       <div id="qcRefitPanel" class="manual-box" style="display:none; margin-top:8px;">
-        <button id="previewQcRefit" class="small-button" style="width:100%;">基于已接受 anchors 预览重算</button>
+        <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考 anchors 预览重算</button>
         <div id="qcRefitStats" class="empty" style="margin-top:6px;">尚未生成重算预览。</div>
-        <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用 QC 对齐</button>
+        <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用 QC 对齐（按物理轴）</button>
       </div>
       <div id="localDeltaPanel" class="manual-box" style="display:none; margin-top:8px;">
-        <button id="estimateDelta" class="small-button" style="width:100%;">自动估计 MS 后段平移</button>
+        <button id="estimateDelta" class="small-button" style="width:100%;">用无标签峰拓扑估计 MS delta</button>
         <div id="deltaBaseSummary" class="empty" style="margin-top:6px;">base shift: -</div>
         <div class="metric"><span>当前 delta</span><strong id="deltaReadout">0.00 sec</strong></div>
         <input id="deltaSlider" class="delta-slider" type="range" min="-20" max="20" step="0.25" value="0" />
@@ -8613,7 +10940,7 @@ HTML = r"""<!doctype html>
           <button id="deltaMinus" class="small-button secondary">-0.25 sec</button>
           <button id="deltaPlus" class="small-button secondary">+0.25 sec</button>
         </div>
-        <button id="freezeDelta" class="small-button" style="width:100%; margin-top:7px;">冻结 delta</button>
+        <button id="freezeDelta" class="small-button" style="width:100%; margin-top:7px;">确认并冻结无标签 delta</button>
         <div id="deltaStats" class="empty" style="margin-top:6px;">未加载预览。</div>
       </div>
       <p class="side-title" style="margin-top:18px;">轨道</p>
@@ -8623,8 +10950,7 @@ HTML = r"""<!doctype html>
       <div id="baseTimePanel">
         <p id="baseTimeTitle" class="side-title" style="margin-top:18px;">自动时间校正</p>
         <div class="metric"><span id="modeMetricLabel">模式</span><strong id="modeLabel">-</strong></div>
-        <div class="metric"><span id="greenMetricLabel">G2 显示平移</span><strong id="greenShift">-</strong></div>
-        <div class="metric"><span id="redMetricLabel">red_axis 显示平移</span><strong id="redShift">-</strong></div>
+        <div id="axisShiftMetrics"></div>
         <div id="msDeltaMetric" class="metric"><span>MS 后段 delta</span><strong id="msDeltaShift">-</strong></div>
         <div class="metric"><span id="matchMetricLabel">QC anchor 组</span><strong id="matchCount">-</strong></div>
       </div>
@@ -8708,9 +11034,13 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="importTitle" class="modal-title">新建标注项目</p>
-          <div class="empty">配置 2–4 个 LIF 通道及其 QC / 细胞用途，并选择 MS 与单细胞事件坐标文件。</div>
+          <div class="empty">配置 2–4 个 LIF 通道的科学角色与共享物理时间轴，再逐段确认前段校准参考窗口；后段 QC 独立配置。</div>
         </div>
         <button id="closeImportProject" class="small-button secondary">关闭</button>
+      </div>
+      <div class="preset-box">
+        <button id="applyHsc1Preset" type="button" class="small-button secondary">套用 HSC1 配置预设</button>
+        <span>HSC1：G1/LSK → G2/Lin−，共享 green_axis；标注起点 24 min；后段 QC disabled。窗口边界仍须由你确认。</span>
       </div>
       <div class="import-grid">
         <label>Raw 数据管理</label>
@@ -8728,15 +11058,17 @@ HTML = r"""<!doctype html>
           <div class="lif-input-head" aria-hidden="true">
             <span>输入</span>
             <span>通道<small>G1–R2</small></span>
+            <span>检测器<small>Green / Red</small></span>
+            <span>物理时间轴<small>同轴填同名</small></span>
             <span>样本标签<small>细胞用途必填</small></span>
-            <span>用途<small>QC / 细胞</small></span>
+            <span>科学角色<small>细胞标注</small></span>
             <span>LIF 原始文件</span>
             <span></span>
           </div>
           <div id="importLifRows"></div>
           <div class="lif-import-actions">
             <button id="addImportLif" type="button" class="small-button secondary">＋ 添加 LIF</button>
-            <span id="importRoleSummary" class="qc-anchor-rule">QC 0 · 细胞 0</span>
+            <span id="importRoleSummary" class="qc-anchor-rule">细胞 0 · 共 0 个 LIF</span>
           </div>
         </div>
         <label for="importMs">MS 文件</label>
@@ -8750,6 +11082,46 @@ HTML = r"""<!doctype html>
           <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
         </div>
       </div>
+      <section class="import-section" aria-labelledby="calibrationProtocolTitle">
+        <div class="import-section-title">
+          <span id="calibrationProtocolTitle">前段分段校准参考窗口（项目级参数）</span>
+          <span class="row-actions" style="margin:0;">
+            <button id="suggestImportWindows" type="button" class="small-button secondary">分析已选 LIF 并建议窗口</button>
+            <button id="addImportSegment" type="button" class="small-button secondary">＋ 添加参考段</button>
+          </span>
+        </div>
+        <div class="qc-anchor-rule">每段按时间顺序填写；通道可为 Green-only、Red-only 或 Red+Green。原始峰形只作建议，只有勾选“边界已确认”后才能创建项目。</div>
+        <div id="importSuggestionStatus" class="qc-anchor-rule">尚未分析原始峰形。</div>
+        <div id="importCalibrationSegments" class="protocol-editor"></div>
+      </section>
+      <section class="import-section" aria-labelledby="postQcPolicyTitle">
+        <div class="import-section-title"><span id="postQcPolicyTitle">事件起点与后段 QC 策略</span></div>
+        <div class="policy-fields">
+          <label>事件标注起点 (min)
+            <input id="importAnnotationStart" type="number" min="0" step="0.1" value="40" />
+          </label>
+          <label>无标签 delta 取证范围 (min)
+            <input id="importSeedWindow" type="number" min="0.1" step="0.5" value="2.5" />
+          </label>
+          <label>后段 QC 策略
+            <select id="importPostQcMode">
+              <option value="disabled" selected>disabled（不巡检）</option>
+              <option value="signature">signature（按通道特征）</option>
+              <option value="scheduled_windows">scheduled_windows（定时窗口）</option>
+            </select>
+          </label>
+          <label id="importPostQcChannelsLabel">后段 QC 通道（signature）
+            <select id="importPostQcChannels" multiple size="2" aria-label="后段 QC signature 参考通道"></select>
+          </label>
+        </div>
+        <div id="importScheduledQcPanel" style="display:none; margin-top:8px;">
+          <div class="import-section-title">
+            <span>定时 QC 窗口</span>
+            <button id="addImportScheduledQc" type="button" class="small-button secondary">＋ 添加 QC 窗口</button>
+          </div>
+          <div id="importScheduledQcWindows" class="protocol-editor"></div>
+        </div>
+      </section>
       <div id="importHint" class="empty" style="margin-top:10px;"></div>
       <div class="modal-actions">
         <button id="runImportProject" class="small-button">生成并进入项目</button>
@@ -8783,15 +11155,36 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="projectConfigTitle" class="modal-title">配置</p>
-          <div class="empty">Acquisition / phase 时间节点</div>
+          <div class="empty">项目级校准协议、事件起点与后段 QC 策略。修改已冻结模型所依赖的参数时会明确要求确认失效。</div>
         </div>
         <button id="closeConfigProject" class="small-button secondary">关闭</button>
       </div>
       <div id="timeConfigPanel" class="config-grid">
-        <span>QC 结束(min)</span><input id="cfgQcEnd" type="number" step="0.1" />
-        <span>标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
-        <span>后段预校准取证范围(min)</span><input id="cfgSeedWindow" type="number" step="0.5" />
+        <span>前段协议结束(min)</span><input id="cfgQcEnd" type="number" step="0.1" />
+        <span>事件标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
+        <span>后段预校准取证范围(min)（无标签 delta）</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
+      <section id="cfgProtocolPanel" class="import-section">
+        <div class="import-section-title"><span>分段 calibration_protocol</span></div>
+        <div class="qc-anchor-rule">通道与顺序保持不变；可逐段修订项目边界。每次保存都必须确认边界。</div>
+        <div id="cfgCalibrationSegments" class="protocol-editor"></div>
+      </section>
+      <section id="cfgPostQcPanel" class="import-section">
+        <div class="import-section-title"><span>后段 QC 策略（与前段参考段独立）</span><button id="cfgAddScheduledQc" type="button" class="small-button secondary">＋ 添加定时窗口</button></div>
+        <div class="policy-fields">
+          <label>策略
+            <select id="cfgPostQcMode">
+              <option value="disabled">disabled</option>
+              <option value="signature">signature</option>
+              <option value="scheduled_windows">scheduled_windows</option>
+            </select>
+          </label>
+          <label id="cfgPostQcChannelsLabel">signature 通道
+            <select id="cfgPostQcChannels" multiple size="2"></select>
+          </label>
+        </div>
+        <div id="cfgScheduledQcWindows" class="protocol-editor" style="margin-top:8px;"></div>
+      </section>
       <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
         <div class="attach-map-heading">
           <p class="side-title">为旧项目附加 UMAP 事件坐标</p>
@@ -8817,7 +11210,7 @@ HTML = r"""<!doctype html>
       </div>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
-        <button id="saveConfig" class="small-button">保存项目时间节点</button>
+        <button id="saveConfig" class="small-button">保存项目协议与时间配置</button>
       </div>
     </div>
   </div>
@@ -8844,7 +11237,15 @@ HTML = r"""<!doctype html>
       actionBusy: false,
       configSaveBusy: false,
       importRows: [],
-      nextImportRowId: 1
+      nextImportRowId: 1,
+      importSegments: [],
+      nextImportSegmentId: 1,
+      importScheduledQcWindows: [],
+      nextImportScheduledQcId: 1,
+      importSignatureChannels: [],
+      importSuggestionRevision: 0,
+      configProtocolDraft: null,
+      configPostQcDraft: null
     };
     const stateChannel = ('BroadcastChannel' in window)
       ? new BroadcastChannel('lma-studio-state-v1')
@@ -8867,7 +11268,7 @@ HTML = r"""<!doctype html>
     function tracksForCurrentProject() {
       if (state.meta?.bootstrap || !state.meta?.project) return [];
       const layoutChannels = state.meta?.acquisition_layout?.lif_channels || [];
-      const qcChannels = new Set(state.meta?.acquisition_layout?.qc_anchor_channels || []);
+      const qcChannels = new Set(calibrationReferenceChannels());
       const relevantChannels = new Set(
         layoutChannels
           .filter(row => qcChannels.has(row.channel) || row.use_for_cell_annotation !== false)
@@ -8910,15 +11311,55 @@ HTML = r"""<!doctype html>
       )).join('');
     }
 
-    function qcAnchorChannels() {
-      return state.meta?.acquisition_layout?.qc_anchor_channels || state.current?.alignment?.qc_anchor_channels || ['G2', 'R1'];
+    function calibrationProtocol() {
+      return state.current?.project_config?.calibration_protocol
+        || state.meta?.project_config?.calibration_protocol
+        || state.meta?.calibration_protocol
+        || state.current?.alignment?.calibration_protocol
+        || null;
+    }
+
+    function calibrationReferenceChannels() {
+      const protocol = calibrationProtocol();
+      if (Array.isArray(protocol?.reference_channels) && protocol.reference_channels.length) return protocol.reference_channels;
+      return state.meta?.acquisition_layout?.qc_anchor_channels
+        || state.current?.alignment?.qc_anchor_channels
+        || ['G2', 'R1'];
+    }
+
+    function activeCalibrationSegment() {
+      const segments = calibrationProtocol()?.segments || [];
+      if (!segments.length) return null;
+      const start = Number(state.current?.start_min ?? state.start ?? 0);
+      const end = Number(state.current?.end_min ?? (start + state.width));
+      return segments.find(segment => Number(segment.end_min) >= start && Number(segment.start_min) <= end)
+        || segments.reduce((nearest, segment) => {
+          if (!nearest) return segment;
+          const distance = Math.min(Math.abs(Number(segment.start_min) - start), Math.abs(Number(segment.end_min) - start));
+          const nearestDistance = Math.min(Math.abs(Number(nearest.start_min) - start), Math.abs(Number(nearest.end_min) - start));
+          return distance < nearestDistance ? segment : nearest;
+        }, null);
+    }
+
+    function qcAnchorChannels(row = null) {
+      if (Array.isArray(row?.anchor_channels) && row.anchor_channels.length) return row.anchor_channels;
+      if (row?.lif_anchor_peak_ids && typeof row.lif_anchor_peak_ids === 'object') return Object.keys(row.lif_anchor_peak_ids);
+      if (state.stage === 'qc_calibration') {
+        const segment = activeCalibrationSegment();
+        if (Array.isArray(segment?.reference_channels) && segment.reference_channels.length) return segment.reference_channels;
+      }
+      if (state.stage === 'event_annotation') {
+        const strategy = state.current?.project_config?.post_qc_strategy || state.meta?.project_config?.post_qc_strategy || {};
+        if (Array.isArray(strategy.reference_channels) && strategy.reference_channels.length) return strategy.reference_channels;
+      }
+      return calibrationReferenceChannels();
     }
 
     function qcAnchorPeakIds(row) {
       const dynamic = row?.lif_anchor_peak_ids;
       if (dynamic && typeof dynamic === 'object' && !Array.isArray(dynamic)) return dynamic;
       const result = {};
-      qcAnchorChannels().forEach((channel, index) => {
+      qcAnchorChannels(row).forEach((channel, index) => {
         const channelValue = row?.[`${String(channel).toLowerCase()}_peak_id`];
         const legacyValue = index === 0 ? row?.anchor_a_peak_id : (index === 1 ? row?.anchor_b_peak_id : null);
         result[channel] = channelValue || legacyValue || null;
@@ -8931,7 +11372,7 @@ HTML = r"""<!doctype html>
       const dynamic = row?.[key];
       if (dynamic && typeof dynamic === 'object' && !Array.isArray(dynamic)) return dynamic;
       const result = {};
-      qcAnchorChannels().forEach((channel, index) => {
+      qcAnchorChannels(row).forEach((channel, index) => {
         const channelValue = row?.[`${String(channel).toLowerCase()}_${mode}_time_min`];
         const legacyValue = index === 0
           ? row?.[`anchor_a_${mode}_time_min`]
@@ -8944,7 +11385,7 @@ HTML = r"""<!doctype html>
     function qcAnchorTimeText(row) {
       const rawTimes = qcAnchorTimes(row, 'raw');
       return [
-        ...qcAnchorChannels().map(channel => `${channel} ${fmtMaybe(rawTimes[channel], 3)}`),
+        ...qcAnchorChannels(row).map(channel => `${channel} ${fmtMaybe(rawTimes[channel], 3)}`),
         `MS760 ${fmtMaybe(row?.ms_time_min, 3)}`,
       ].join(' · ');
     }
@@ -9139,14 +11580,15 @@ HTML = r"""<!doctype html>
       URL.revokeObjectURL(url);
     }
 
-    function newImportLifRow() {
+    function newImportLifRow(initial = {}) {
       const row = {
         id: state.nextImportRowId++,
-        path: '',
-        channel: '',
-        identity_prior: '',
-        use_for_qc: false,
-        use_for_cell_annotation: false,
+        path: String(initial.path || ''),
+        channel: String(initial.channel || ''),
+        identity_prior: String(initial.identity_prior || ''),
+        detector: String(initial.detector || ''),
+        time_axis: String(initial.time_axis || ''),
+        use_for_cell_annotation: Boolean(initial.use_for_cell_annotation),
       };
       return row;
     }
@@ -9157,7 +11599,8 @@ HTML = r"""<!doctype html>
         path: String(row.path || '').trim(),
         channel: String(row.channel || '').trim().toUpperCase(),
         identity_prior: String(row.identity_prior || '').trim(),
-        use_for_qc: Boolean(row.use_for_qc),
+        detector: String(row.detector || '').trim().toLowerCase(),
+        time_axis: String(row.time_axis || '').trim(),
         use_for_cell_annotation: Boolean(row.use_for_cell_annotation),
       }));
     }
@@ -9175,12 +11618,23 @@ HTML = r"""<!doctype html>
               ${['G1','G2','R1','R2'].map(channel => `<option value="${channel}"${row.channel === channel ? ' selected' : ''}>${channel}</option>`).join('')}
             </select>
           </div>
+          <div class="lif-field lif-detector">
+            <span class="lif-mobile-label">检测器</span>
+            <select data-import-field="detector" aria-label="LIF ${index + 1} 检测器">
+              <option value="">选择</option>
+              <option value="green"${row.detector === 'green' ? ' selected' : ''}>Green</option>
+              <option value="red"${row.detector === 'red' ? ' selected' : ''}>Red</option>
+            </select>
+          </div>
+          <div class="lif-field lif-axis">
+            <span class="lif-mobile-label">物理时间轴</span>
+            <input data-import-field="time_axis" type="text" value="${escapeText(row.time_axis)}" placeholder="green_axis" aria-label="LIF ${index + 1} 物理时间轴" />
+          </div>
           <div class="lif-field lif-identity">
             <span class="lif-mobile-label">样本标签</span>
             <input data-import-field="identity_prior" type="text" value="${escapeText(row.identity_prior)}" placeholder="${row.use_for_cell_annotation ? '细胞用途必填' : '可留空'}" aria-label="LIF ${index + 1} 样本标签" />
           </div>
           <div class="lif-use-options">
-            <label><input data-import-field="use_for_qc" type="checkbox"${row.use_for_qc ? ' checked' : ''} /> QC</label>
             <label><input data-import-field="use_for_cell_annotation" type="checkbox"${row.use_for_cell_annotation ? ' checked' : ''} /> 细胞</label>
           </div>
           <div class="lif-file-picker">
@@ -9191,7 +11645,7 @@ HTML = r"""<!doctype html>
           <button type="button" class="small-button secondary lif-remove" data-remove-import-row="${row.id}" aria-label="删除 LIF ${index + 1}"${state.importRows.length <= 2 ? ' disabled' : ''}>×</button>
         </div>
       `).join('');
-      refreshImportQcAnchorOptions();
+      refreshImportProtocolOptions();
     }
 
     function duplicateImportLifPathMessage() {
@@ -9207,16 +11661,234 @@ HTML = r"""<!doctype html>
       return '';
     }
 
-    function refreshImportQcAnchorOptions() {
+    function refreshImportProtocolOptions() {
       const rows = importLifRows();
-      const qc = rows.filter(row => row.use_for_qc).length;
+      const validChannels = new Set(rows.map(row => row.channel).filter(Boolean));
+      state.importSegments.forEach(segment => {
+        segment.reference_channels = (segment.reference_channels || []).filter(channel => validChannels.has(channel));
+      });
+      state.importScheduledQcWindows.forEach(windowRow => {
+        windowRow.reference_channels = (windowRow.reference_channels || []).filter(channel => validChannels.has(channel));
+      });
+      state.importSignatureChannels = state.importSignatureChannels.filter(channel => validChannels.has(channel));
       const cell = rows.filter(row => row.use_for_cell_annotation).length;
-      el('importRoleSummary').textContent = `QC ${qc} · 细胞 ${cell} · 共 ${rows.length} 个 LIF`;
+      el('importRoleSummary').textContent = `细胞 ${cell} · 共 ${rows.length} 个 LIF`;
       el('addImportLif').disabled = rows.length >= 4;
+      renderImportSegments();
+      renderImportPostQcControls();
     }
 
-    function selectedImportQcAnchorChannels() {
-      return importLifRows().filter(row => row.use_for_qc).map(row => row.channel).filter(Boolean);
+    function newImportSegment(initial = {}) {
+      return {
+        id: state.nextImportSegmentId++,
+        segment_id: String(initial.segment_id || ''),
+        population_label: String(initial.population_label || ''),
+        start_min: initial.start_min ?? '',
+        end_min: initial.end_min ?? '',
+        reference_channels: Array.from(initial.reference_channels || []),
+        boundaries_confirmed: Boolean(initial.boundaries_confirmed),
+        suggestion_status: String(initial.suggestion_status || ''),
+      };
+    }
+
+    function newImportScheduledQcWindow(initial = {}) {
+      return {
+        id: state.nextImportScheduledQcId++,
+        window_id: String(initial.window_id || ''),
+        start_min: initial.start_min ?? '',
+        end_min: initial.end_min ?? '',
+        reference_channels: Array.from(initial.reference_channels || []),
+      };
+    }
+
+    function importChannelOptions(selected = []) {
+      const selectedSet = new Set(selected);
+      const channels = importLifRows().map(row => row.channel).filter(Boolean);
+      if (!channels.length) return '<span class="qc-anchor-empty">请先配置通道</span>';
+      return channels.map(channel => `
+        <label><input type="checkbox" data-segment-channel="${escapeText(channel)}"${selectedSet.has(channel) ? ' checked' : ''} /> ${escapeText(channel)}</label>
+      `).join('');
+    }
+
+    function calibrationSuggestionStatusLabel(status) {
+      const labels = {
+        suggested: '已生成建议，待用户确认',
+        ambiguous: '峰形证据有歧义，请人工定界',
+        missing: '未找到足够峰形证据',
+        missing_evidence: '未找到足够峰形证据',
+        evidence_available: '已找到峰形证据，待形成有序边界',
+        order_conflict: '峰形顺序与参考段顺序冲突',
+      };
+      return labels[String(status || '')] || String(status || '');
+    }
+
+    function invalidateImportCalibrationConfirmations(message = 'LIF 输入已变化，旧窗口建议已失效，请重新分析并确认。', bumpRevision = true) {
+      if (bumpRevision) state.importSuggestionRevision += 1;
+      state.importSegments.forEach(segment => {
+        segment.boundaries_confirmed = false;
+        segment.suggestion_status = message;
+      });
+      renderImportSegments();
+      const status = el('importSuggestionStatus');
+      if (status) status.textContent = message;
+    }
+
+    function renderImportSegments() {
+      const box = el('importCalibrationSegments');
+      if (!box) return;
+      box.innerHTML = state.importSegments.map((segment, index) => `
+        <div class="protocol-row" data-import-segment-id="${segment.id}">
+          <span><strong>#${index + 1}</strong>${segment.suggestion_status ? `<br><small>${escapeText(calibrationSuggestionStatusLabel(segment.suggestion_status))}</small>` : ''}</span>
+          <input data-segment-field="population_label" type="text" value="${escapeText(segment.population_label)}" placeholder="群体/参考段名称" aria-label="参考段 ${index + 1} 群体名称" />
+          <input data-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" placeholder="开始 min" aria-label="参考段 ${index + 1} 开始时间" />
+          <input data-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" placeholder="结束 min" aria-label="参考段 ${index + 1} 结束时间" />
+          <div class="protocol-channel-options">${importChannelOptions(segment.reference_channels)}</div>
+          <label class="protocol-confirm"><input data-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''} /> 边界已确认</label>
+          <button type="button" class="small-button secondary lif-remove" data-remove-import-segment="${segment.id}" aria-label="删除参考段 ${index + 1}"${state.importSegments.length <= 1 ? ' disabled' : ''}>×</button>
+        </div>
+      `).join('');
+    }
+
+    function renderImportScheduledQcWindows() {
+      const box = el('importScheduledQcWindows');
+      if (!box) return;
+      box.innerHTML = state.importScheduledQcWindows.map((windowRow, index) => `
+        <div class="protocol-row" data-import-scheduled-id="${windowRow.id}">
+          <strong>#${index + 1}</strong>
+          <input data-scheduled-field="window_id" type="text" value="${escapeText(windowRow.window_id)}" placeholder="窗口 ID" />
+          <input data-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min)}" placeholder="开始 min" />
+          <input data-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min)}" placeholder="结束 min" />
+          <div class="protocol-channel-options">${importChannelOptions(windowRow.reference_channels).replaceAll('data-segment-channel', 'data-scheduled-channel')}</div>
+          <span></span>
+          <button type="button" class="small-button secondary lif-remove" data-remove-import-scheduled="${windowRow.id}" aria-label="删除定时 QC 窗口 ${index + 1}">×</button>
+        </div>
+      `).join('');
+    }
+
+    function renderImportPostQcControls() {
+      const mode = el('importPostQcMode')?.value || 'disabled';
+      const channels = importLifRows().map(row => row.channel).filter(Boolean);
+      const select = el('importPostQcChannels');
+      if (select) {
+        const selected = new Set(state.importSignatureChannels);
+        select.innerHTML = channels.map(channel => `<option value="${escapeText(channel)}"${selected.has(channel) ? ' selected' : ''}>${escapeText(channel)}</option>`).join('');
+        select.disabled = mode !== 'signature';
+      }
+      if (el('importPostQcChannelsLabel')) el('importPostQcChannelsLabel').style.opacity = mode === 'signature' ? '1' : '0.55';
+      if (el('importScheduledQcPanel')) el('importScheduledQcPanel').style.display = mode === 'scheduled_windows' ? 'block' : 'none';
+      renderImportScheduledQcWindows();
+    }
+
+    function calibrationProtocolPayload() {
+      return {
+        protocol_version: 1,
+        segments: state.importSegments.map((segment, index) => ({
+          segment_id: String(segment.segment_id || segment.population_label || `reference_${index + 1}`)
+            .trim().replace(/\s+/g, '_').toLowerCase(),
+          order: index + 1,
+          start_min: Number(segment.start_min),
+          end_min: Number(segment.end_min),
+          reference_channels: Array.from(segment.reference_channels || []),
+          population_label: String(segment.population_label || '').trim(),
+          boundaries_confirmed: Boolean(segment.boundaries_confirmed),
+        })),
+      };
+    }
+
+    function calibrationSuggestionSegmentsPayload() {
+      return state.importSegments.map((segment, index) => ({
+        segment_id: String(segment.segment_id || segment.population_label || `reference_${index + 1}`)
+          .trim().replace(/\s+/g, '_').toLowerCase(),
+        order: index + 1,
+        reference_channels: Array.from(segment.reference_channels || []),
+        population_label: String(segment.population_label || '').trim(),
+      }));
+    }
+
+    async function suggestImportCalibrationWindows() {
+      if (state.actionBusy) return;
+      const requestRevision = state.importSuggestionRevision;
+      const button = el('suggestImportWindows');
+      const status = el('importSuggestionStatus');
+      const oldText = button.textContent;
+      state.actionBusy = true;
+      button.disabled = true;
+      button.textContent = '正在分析峰形…';
+      status.textContent = '正在只读分析已选 LIF 原始文件；不会创建项目或修改原始数据。';
+      try {
+        refreshImportProtocolOptions();
+        const lifInputs = importLifRows();
+        if (lifInputs.length < 2 || lifInputs.length > 4) throw new Error('窗口建议需要 2–4 个 LIF 输入。');
+        if (lifInputs.some(row => !row.path || !row.channel)) throw new Error('请先为每个 LIF 输入选择文件并填写通道。');
+        if (new Set(lifInputs.map(row => row.channel)).size !== lifInputs.length) throw new Error('LIF 通道名不能重复。');
+        const duplicatePathMessage = duplicateImportLifPathMessage();
+        if (duplicatePathMessage) throw new Error(duplicatePathMessage);
+        const segments = calibrationSuggestionSegmentsPayload();
+        if (!segments.length || segments.some(row => !row.reference_channels.length)) {
+          throw new Error('请先为每个参考段选择至少一个参考通道。');
+        }
+        const annotationStart = Number(el('importAnnotationStart').value);
+        if (!Number.isFinite(annotationStart) || annotationStart <= 0) throw new Error('请先填写大于 0 的事件标注起点。');
+        const result = await postJson('/api/suggest-calibration-windows', {
+          lif_inputs: lifInputs,
+          segments,
+          annotation_start_min: annotationStart,
+        });
+        if (requestRevision !== state.importSuggestionRevision) {
+          status.textContent = 'LIF 输入在分析期间已变化，本次旧建议已丢弃；请按当前文件重新分析。';
+          return;
+        }
+        const byId = new Map((result.segments || []).map(row => [String(row.segment_id), row]));
+        state.importSegments.forEach((segment, index) => {
+          const requestId = segments[index].segment_id;
+          const suggestion = byId.get(requestId) || result.segments?.[index] || {};
+          if (suggestion.suggested_start_min !== null && suggestion.suggested_start_min !== undefined && suggestion.suggested_start_min !== '' && Number.isFinite(Number(suggestion.suggested_start_min))) {
+            segment.start_min = Number(suggestion.suggested_start_min);
+          }
+          if (suggestion.suggested_end_min !== null && suggestion.suggested_end_min !== undefined && suggestion.suggested_end_min !== '' && Number.isFinite(Number(suggestion.suggested_end_min))) {
+            segment.end_min = Number(suggestion.suggested_end_min);
+          }
+          segment.boundaries_confirmed = false;
+          segment.suggestion_status = calibrationSuggestionStatusLabel(
+            suggestion.status || '未获得建议'
+          );
+        });
+        renderImportSegments();
+        const summaries = (result.channel_summaries || [])
+          .map(row => `${row.channel} ${Number(row.merged_peak_count || 0).toLocaleString()} 峰`)
+          .join(' · ');
+        const warnings = (result.warnings || []).join(' ');
+        status.textContent = [
+          result.can_apply_suggestions ? '已回填建议边界；所有“边界已确认”均保持未勾选，请核对峰形和顺序后逐段确认。' : '证据不足，未形成可完整应用的有序方案。',
+          summaries,
+          warnings,
+        ].filter(Boolean).join(' ');
+      } catch (err) {
+        status.textContent = `峰形建议失败：${err.message}`;
+        alert(`峰形建议失败: ${err.message}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = oldText;
+        state.actionBusy = false;
+      }
+    }
+
+    function postQcStrategyPayload() {
+      const mode = el('importPostQcMode').value;
+      if (mode === 'disabled') return { mode };
+      if (mode === 'signature') return {
+        mode,
+        reference_channels: Array.from(el('importPostQcChannels').selectedOptions).map(option => option.value),
+      };
+      return {
+        mode,
+        windows: state.importScheduledQcWindows.map((windowRow, index) => ({
+          window_id: String(windowRow.window_id || `post_qc_${index + 1}`).trim(),
+          start_min: Number(windowRow.start_min),
+          end_min: Number(windowRow.end_min),
+          reference_channels: Array.from(windowRow.reference_channels || []),
+        })),
+      };
     }
 
     let activeModal = null;
@@ -9257,6 +11929,7 @@ HTML = r"""<!doctype html>
 
     function setImportModal(open) {
       if (open) {
+        state.importSuggestionRevision += 1;
         [
           'importProjectDir',
           'importMs',
@@ -9264,8 +11937,17 @@ HTML = r"""<!doctype html>
         ].forEach((targetId) => {
           el(targetId).value = '';
         });
-        state.importRows = [newImportLifRow(), newImportLifRow(), newImportLifRow()];
+        state.importRows = [newImportLifRow(), newImportLifRow()];
+        state.importSegments = [newImportSegment()];
+        state.importScheduledQcWindows = [];
+        state.importSignatureChannels = [];
+        el('importAnnotationStart').value = '40';
+        el('importSeedWindow').value = '2.5';
+        el('importPostQcMode').value = 'disabled';
         renderImportLifRows();
+        renderImportSegments();
+        renderImportPostQcControls();
+        el('importSuggestionStatus').textContent = '尚未分析原始峰形。';
         const externalMode = document.querySelector('input[name="rawInputMode"][value="external_reference"]');
         if (externalMode) externalMode.checked = true;
         el('importHint').textContent = '';
@@ -9285,7 +11967,7 @@ HTML = r"""<!doctype html>
     function setProjectConfigModal(open) {
       if (!open && state.configSaveBusy) return;
       if (open) {
-        renderConfigInputs();
+        renderConfigInputs(true);
         setConfigSaveStatus('');
         const attachAllowed = Boolean(state.meta?.cell_event_map?.attach_allowed);
         el('attachMapPanel').style.display = attachAllowed ? 'block' : 'none';
@@ -9421,22 +12103,27 @@ HTML = r"""<!doctype html>
     }
 
     function updateExportHint() {
-      const summary = state.current?.annotation_store || state.meta?.annotation_store || {};
-      const accepted = Number(summary.counts?.accepted || 0);
-      el('exportHint').textContent = `已接受 ${accepted.toLocaleString()} 条`;
+      el('exportHint').textContent = '主 CSV 仅含 Cell/后段 QC；前段 anchor 留在 SQLite';
     }
 
     function stageNote() {
       const tm = state.current?.time_model || state.meta?.time_model || {};
       const frozen = tm.status === 'frozen';
       const cfg = state.current?.project_config || state.meta?.project_config || {};
-      const qcEnd = Number(cfg.qc_calibration_end_min || 10.5);
       const anchors = qcAnchorChannels();
       if (state.stage === 'local_calibration') return '标注起点后的未标注峰拓扑预校准：只估计 MS 后段局部平移，不产生 annotation。';
-      if (state.stage === 'event_annotation') return frozen
-        ? `同一阶段审核 map 白名单内的 QC anchor 与细胞二元组；QC 沿用 ${anchors.join('/')}，两类均逐条确认。`
+      if (state.stage === 'event_annotation') {
+        const strategy = cfg.post_qc_strategy || {};
+        const policy = strategy.mode === 'disabled'
+          ? '后段 QC 已禁用，只显示细胞候选'
+          : `后段 QC=${strategy.mode}（${(strategy.reference_channels || []).join('/') || '按窗口'}）`;
+        return frozen
+        ? `同一阶段审核 map 白名单内的事件；${policy}；跨通道命中同一 MS event 时必须人工仲裁。`
         : '请先在“后段局部校正”中冻结 delta，再进入事件标注。';
-      return `前 ${fmt(qcEnd, 1)} min QC anchor 审核，用于确认 shift-only 时间校正。`;
+      }
+      const segment = activeCalibrationSegment();
+      if (!segment) return '当前项目未找到可显示的校准参考段。';
+      return `参考段 #${segment.order} ${segment.population_label || segment.segment_id}：${fmt(segment.start_min, 2)}-${fmt(segment.end_min, 2)} min；审核 ${anchors.join('/')} 与 MS 的 shift-only 对齐。`;
     }
 
     function timeModelDisplayName(tm) {
@@ -9445,29 +12132,47 @@ HTML = r"""<!doctype html>
       return `${status} ${delta >= 0 ? '+' : ''}${fmt(delta, 2)}s`;
     }
 
+    function configuredPhysicalAxes() {
+      const axes = (state.meta?.acquisition_layout?.lif_channels || [])
+        .map(row => String(row.time_axis || '').trim())
+        .filter(Boolean);
+      return Array.from(new Set(axes));
+    }
+
+    function renderAxisShiftMetrics(windowState, physicalAxes, suffix) {
+      const box = el('axisShiftMetrics');
+      if (!box) return;
+      const alignment = windowState?.alignment || {};
+      const shifts = alignment.axis_shifts_sec || {};
+      box.innerHTML = physicalAxes.map(axis => {
+        let value = shifts[axis];
+        if (!Number.isFinite(Number(value)) && axis === 'green_axis') value = alignment.green_to_ms_shift_sec;
+        if (!Number.isFinite(Number(value)) && axis === 'red_axis') value = alignment.red_to_ms_shift_sec;
+        const display = Number.isFinite(Number(value)) ? `${fmt(Number(value), 2)} sec` : '未估计';
+        return `<div class="metric" data-physical-axis="${escapeText(axis)}"><span>${escapeText(axis)} ${escapeText(suffix)}</span><strong>${escapeText(display)}</strong></div>`;
+      }).join('');
+    }
+
     function updateTimeModelPanel() {
       const w = state.current;
       const tm = w?.time_model || state.meta?.time_model || {};
       const totalGroups = (w.alignment.qc_groups && w.alignment.qc_groups.groups ? w.alignment.qc_groups.groups.length : 0);
       const visibleGroups = (w.alignment_groups || []).length;
-      el('greenShift').textContent = `${fmt(w.alignment.green_to_ms_shift_sec, 2)} sec`;
-      el('redShift').textContent = `${fmt(w.alignment.red_to_ms_shift_sec, 2)} sec`;
+      const physicalAxes = configuredPhysicalAxes();
       if (state.stage === 'qc_calibration') {
+        renderAxisShiftMetrics(w, physicalAxes, '平移');
         el('baseTimeTitle').textContent = '自动时间校正';
         el('modeMetricLabel').textContent = '模式';
         el('modeLabel').textContent = w.time_mode === 'aligned' ? '校正后' : '原始';
-        el('greenMetricLabel').textContent = 'green_axis 平移';
-        el('redMetricLabel').textContent = 'red_axis 平移';
         el('msDeltaMetric').style.display = 'none';
         el('matchMetricLabel').textContent = 'QC anchor 组';
         el('matchCount').textContent = w.time_mode === 'aligned' ? `${visibleGroups}/${totalGroups}` : '-';
         return;
       }
+      renderAxisShiftMetrics(w, physicalAxes, 'base shift');
       el('baseTimeTitle').textContent = '当前时间模型';
       el('modeMetricLabel').textContent = '状态';
       el('modeLabel').textContent = tm.status === 'frozen' ? '已冻结' : 'draft';
-      el('greenMetricLabel').textContent = 'green_axis base shift';
-      el('redMetricLabel').textContent = 'red_axis base shift';
       el('msDeltaMetric').style.display = 'grid';
       el('msDeltaShift').textContent = `${fmt(tm.ms_local_delta_sec || 0, 2)} sec`;
       el('matchMetricLabel').textContent = '时间模型';
@@ -9601,7 +12306,7 @@ HTML = r"""<!doctype html>
       const explicit = String(row?.review_stage || '');
       const type = String(row?.candidate_type || '');
       if (explicit === 'cell_annotation' || type === 'manual_cell_pair' || type.startsWith('cell')) return 'cell';
-      if (explicit === 'qc_survey' || type === 'qc_survey_post_10p5' || type.startsWith('manual_qc')) return 'qc';
+      if (explicit === 'qc_survey' || type.startsWith('qc_survey_') || type.startsWith('manual_qc')) return 'qc';
       return '';
     }
 
@@ -9620,7 +12325,7 @@ HTML = r"""<!doctype html>
       const end = Number(state.current?.end_min);
       const anchorTimes = qcAnchorTimes(row, 'plot');
       const values = [
-        ...qcAnchorChannels().map(channel => anchorTimes[channel]),
+        ...qcAnchorChannels(row).map(channel => anchorTimes[channel]),
         row.ms_plot_time_min
       ].filter(value => value !== null && value !== undefined && value !== '').map(Number);
       return values.length >= 2 && values.every(value => Number.isFinite(value) && value >= start && value <= end);
@@ -9696,12 +12401,79 @@ HTML = r"""<!doctype html>
       el('acceptWindow').disabled = n === 0;
     }
 
-    function renderConfigInputs() {
+    function renderConfigInputs(resetDraft = false) {
       const cfg = state.current?.project_config || state.meta?.project_config || {};
       if (!cfg) return;
       el('cfgQcEnd').value = fmt(cfg.qc_calibration_end_min ?? 10.5, 1);
       el('cfgAnnotationStart').value = fmt(cfg.annotation_start_min ?? 40.0, 1);
       el('cfgSeedWindow').value = fmt(cfg.local_delta_seed_window_min ?? 2.5, 1);
+      const protocol = cfg.calibration_protocol || null;
+      const legacy = Boolean(protocol?.compatibility_mode);
+      el('cfgQcEnd').disabled = true;
+      el('cfgQcEnd').title = legacy
+        ? '旧项目 v0.3 只读兼容边界；如需新协议，请新建项目副本并显式配置。'
+        : '由最后一个 calibration segment 的已确认结束边界自动计算。';
+      el('cfgProtocolPanel').style.display = protocol ? 'block' : 'none';
+      if (resetDraft || !state.configProtocolDraft) {
+        state.configProtocolDraft = protocol ? JSON.parse(JSON.stringify(protocol)) : null;
+      }
+      if (resetDraft || !state.configPostQcDraft) {
+        state.configPostQcDraft = JSON.parse(JSON.stringify(cfg.post_qc_strategy || { mode: 'disabled' }));
+      }
+      renderConfigProtocolEditor();
+      renderConfigPostQcEditor();
+    }
+
+    function renderConfigProtocolEditor() {
+      const box = el('cfgCalibrationSegments');
+      const protocol = state.configProtocolDraft;
+      if (!box || !protocol) return;
+      const legacy = Boolean(protocol.compatibility_mode);
+      const legacyNotice = legacy
+        ? '<div class="qc-anchor-rule">旧项目 v0.3 协议以只读兼容方式显示；不会静默迁移或写回 calibration_protocol。</div>'
+        : '';
+      box.innerHTML = legacyNotice + (protocol.segments || []).map((segment, index) => `
+        <div class="protocol-row" data-cfg-segment-index="${index}">
+          <strong>#${segment.order}</strong>
+          <span><strong>${escapeText(segment.population_label || segment.segment_id)}</strong><br><small>${escapeText((segment.reference_channels || []).join('/'))}</small></span>
+          <input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(segment.segment_id)} 开始时间"${legacy ? ' disabled' : ''} />
+          <input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(segment.segment_id)} 结束时间"${legacy ? ' disabled' : ''} />
+          <span>${escapeText(segment.reference_mode || '')} · ${(segment.time_axes || []).map(escapeText).join('/')}</span>
+          <label class="protocol-confirm"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
+          <span></span>
+        </div>
+      `).join('');
+    }
+
+    function configChannelCheckboxes(selected = []) {
+      const selectedSet = new Set(selected);
+      const channels = (state.meta?.acquisition_layout?.lif_channels || []).map(row => row.channel);
+      return channels.map(channel => `<label><input type="checkbox" data-cfg-scheduled-channel="${escapeText(channel)}"${selectedSet.has(channel) ? ' checked' : ''} /> ${escapeText(channel)}</label>`).join('');
+    }
+
+    function renderConfigPostQcEditor() {
+      const strategy = state.configPostQcDraft || { mode: 'disabled' };
+      const mode = strategy.mode || 'disabled';
+      el('cfgPostQcMode').value = mode;
+      const channels = (state.meta?.acquisition_layout?.lif_channels || []).map(row => row.channel);
+      const selected = new Set(strategy.reference_channels || []);
+      el('cfgPostQcChannels').innerHTML = channels.map(channel => `<option value="${escapeText(channel)}"${selected.has(channel) ? ' selected' : ''}>${escapeText(channel)}</option>`).join('');
+      el('cfgPostQcChannels').disabled = mode !== 'signature';
+      el('cfgPostQcChannelsLabel').style.opacity = mode === 'signature' ? '1' : '0.55';
+      el('cfgAddScheduledQc').style.display = mode === 'scheduled_windows' ? 'block' : 'none';
+      const box = el('cfgScheduledQcWindows');
+      box.style.display = mode === 'scheduled_windows' ? 'grid' : 'none';
+      box.innerHTML = (strategy.windows || []).map((windowRow, index) => `
+        <div class="protocol-row" data-cfg-scheduled-index="${index}">
+          <strong>#${index + 1}</strong>
+          <input data-cfg-scheduled-field="window_id" type="text" value="${escapeText(windowRow.window_id || `post_qc_${index + 1}`)}" placeholder="窗口 ID" />
+          <input data-cfg-scheduled-field="start_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.start_min ?? '')}" placeholder="开始 min" />
+          <input data-cfg-scheduled-field="end_min" type="number" min="0" step="0.1" value="${escapeText(windowRow.end_min ?? '')}" placeholder="结束 min" />
+          <div class="protocol-channel-options">${configChannelCheckboxes(windowRow.reference_channels)}</div>
+          <span></span>
+          <button type="button" class="small-button secondary lif-remove" data-remove-cfg-scheduled="${index}" aria-label="删除定时 QC 窗口 ${index + 1}">×</button>
+        </div>
+      `).join('');
     }
 
     function renderLocalDeltaPanel() {
@@ -9776,8 +12548,19 @@ HTML = r"""<!doctype html>
       const local = state.stage === 'local_calibration';
       const qcCalibration = state.stage === 'qc_calibration';
       const eventAnnotation = state.stage === 'event_annotation';
-      const cellMode = eventAnnotation && state.manualAnnotationKind === 'cell';
+      let cellMode = eventAnnotation && state.manualAnnotationKind === 'cell';
       const frozen = (state.current?.time_model || state.meta?.time_model || {}).status === 'frozen';
+      const postQcMode = String(
+        state.current?.project_config?.post_qc_strategy?.mode
+        || state.meta?.project_config?.post_qc_strategy?.mode
+        || 'disabled'
+      );
+      const postQcEnabled = postQcMode !== 'disabled';
+      if (eventAnnotation && !postQcEnabled && state.eventFilter === 'qc') state.eventFilter = 'all';
+      if (eventAnnotation && !postQcEnabled && state.manualAnnotationKind === 'qc') {
+        state.manualAnnotationKind = 'cell';
+        cellMode = true;
+      }
       el('qcRefitPanel').style.display = qcCalibration ? 'block' : 'none';
       el('baseTimePanel').style.display = local ? 'none' : 'block';
       el('reviewPanel').style.display = (local || (eventAnnotation && !frozen)) ? 'none' : 'block';
@@ -9792,12 +12575,22 @@ HTML = r"""<!doctype html>
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
+        if (button.dataset.eventFilter === 'qc') {
+          button.disabled = !postQcEnabled;
+          button.title = postQcEnabled ? `后段 QC 策略：${postQcMode}` : '本项目后段 QC 策略为 disabled';
+        }
       });
       document.querySelectorAll('[data-manual-kind]').forEach(button => {
         button.classList.toggle('active', button.dataset.manualKind === state.manualAnnotationKind);
+        if (button.dataset.manualKind === 'qc') {
+          button.disabled = !postQcEnabled;
+          button.title = postQcEnabled ? `后段 QC 策略：${postQcMode}` : '本项目后段 QC 策略为 disabled';
+        }
       });
       if (eventAnnotation) {
-        el('reviewHelp').textContent = 'QC 与细胞候选共享同一 event-map 白名单，均需逐条确认；同一 MS event 不能同时接受两种分类。';
+        el('reviewHelp').textContent = postQcEnabled
+          ? `后段 QC=${postQcMode}；QC 与细胞候选共享同一 event-map 白名单，均需逐条确认；同一 MS event 只能接受一个跨通道关系。`
+          : '后段 QC=disabled；本阶段仅显示细胞候选。同一 MS event 跨通道冲突时必须人工选择唯一关系。';
       } else {
         const anchors = qcAnchorChannels();
         el('reviewHelp').textContent = `残差 = MS760 时间 - ${anchors.join('/')} 按时间轴聚合后的组合时间，单位 sec；越接近 0 表示时间对齐越好。`;
@@ -9843,29 +12636,60 @@ HTML = r"""<!doctype html>
         const payload = {
           qc_calibration_end_min: Number(el('cfgQcEnd').value),
           annotation_start_min: Number(el('cfgAnnotationStart').value),
-          local_delta_seed_window_min: Number(el('cfgSeedWindow').value)
+          local_delta_seed_window_min: Number(el('cfgSeedWindow').value),
+          post_qc_strategy: JSON.parse(JSON.stringify(state.configPostQcDraft || { mode: 'disabled' }))
         };
+        if (state.configProtocolDraft && !state.configProtocolDraft.compatibility_mode) {
+          payload.calibration_protocol = JSON.parse(JSON.stringify(state.configProtocolDraft));
+          payload.calibration_protocol.segments = payload.calibration_protocol.segments.map((segment, index) => ({
+            ...segment,
+            order: index + 1,
+            start_min: Number(segment.start_min),
+            end_min: Number(segment.end_min),
+            boundaries_confirmed: Boolean(segment.boundaries_confirmed)
+          }));
+          payload.qc_calibration_end_min = Math.max(...payload.calibration_protocol.segments.map(segment => segment.end_min));
+        }
+        const currentPostQcComparable = JSON.parse(JSON.stringify(currentCfg.post_qc_strategy || { mode: 'disabled' }));
+        const proposedPostQcComparable = JSON.parse(JSON.stringify(payload.post_qc_strategy));
+        delete currentPostQcComparable.compatibility_mode;
+        delete proposedPostQcComparable.compatibility_mode;
+        const postQcStrategyChanged = JSON.stringify(currentPostQcComparable) !== JSON.stringify(proposedPostQcComparable);
+        if (postQcStrategyChanged) {
+          delete payload.post_qc_strategy.compatibility_mode;
+          const postQcOk = window.confirm(
+            '修改后段 QC 策略后，已有人工后段 QC 标注会完整保留为历史记录，但对当前策略失效；当前候选和主 CSV 将按新策略重算。是否继续？'
+          );
+          if (!postQcOk) {
+            setConfigSaveStatus('未保存，后段 QC 策略保持不变。');
+            return;
+          }
+        }
         const tm = state.current?.time_model || state.meta?.time_model || {};
         const qcEndChanged = Math.abs(
           Number(currentCfg.qc_calibration_end_min ?? 0) - Number(payload.qc_calibration_end_min ?? 0)
         ) > 1e-9;
         const clearsQcAlignment = qcEndChanged && Boolean(currentCfg.qc_alignment_model);
+        const protocolChanged = Boolean(payload.calibration_protocol)
+          && JSON.stringify(payload.calibration_protocol) !== JSON.stringify(currentCfg.calibration_protocol);
+        const clearsProtocolAlignment = protocolChanged && Boolean(currentCfg.qc_alignment_model);
         const changedFrozenConfig = tm.status === 'frozen' && [
           'qc_calibration_end_min',
           'annotation_start_min',
           'local_delta_seed_window_min'
-        ].some(key => Math.abs(Number(currentCfg[key] ?? 0) - Number(payload[key] ?? 0)) > 1e-9);
-        if (changedFrozenConfig || clearsQcAlignment) {
+        ].some(key => Math.abs(Number(currentCfg[key] ?? 0) - Number(payload[key] ?? 0)) > 1e-9)
+          || (tm.status === 'frozen' && protocolChanged);
+        if (changedFrozenConfig || clearsQcAlignment || clearsProtocolAlignment) {
           const effects = [];
-          if (clearsQcAlignment) effects.push('已应用的 anchor QC 对齐');
+          if (clearsQcAlignment || clearsProtocolAlignment) effects.push('已应用的参考 anchor QC 对齐');
           if (changedFrozenConfig) effects.push('当前已冻结的后段 time model');
-          const ok = window.confirm(`修改这些时间节点会清除${effects.join('和')}。保存后需要重新完成对应校正。是否继续？`);
+          const ok = window.confirm(`修改这些项目级校准参数会明确失效${effects.join('和')}。已有人工标注会保留为旧版本记录，但后段 delta 与第三阶段候选必须重算。是否继续？`);
           if (!ok) {
             setConfigSaveStatus('未保存，项目时间节点保持不变。');
             return;
           }
           if (changedFrozenConfig) payload.clear_frozen_time_model = true;
-          if (clearsQcAlignment) payload.clear_qc_alignment_model = true;
+          if (clearsQcAlignment || clearsProtocolAlignment) payload.clear_qc_alignment_model = true;
         }
         const result = await postJson('/api/project-config', payload);
         state.meta.project_config = result.project_config;
@@ -9874,6 +12698,10 @@ HTML = r"""<!doctype html>
           state.current.project_config = result.project_config;
           state.current.time_model = result.time_model;
         }
+        state.configProtocolDraft = result.project_config.calibration_protocol
+          ? JSON.parse(JSON.stringify(result.project_config.calibration_protocol))
+          : null;
+        state.configPostQcDraft = JSON.parse(JSON.stringify(result.project_config.post_qc_strategy || { mode: 'disabled' }));
         applyStageWindowWidth();
         if (qcEndChanged) state.qcRefitPreview = null;
         const cfg = result.project_config;
@@ -9886,7 +12714,7 @@ HTML = r"""<!doctype html>
         } else if (state.stage === 'qc_calibration' && Number(state.start) > qcEnd) {
           state.start = 0;
         }
-        const savedMessage = `已保存：QC 结束 ${String(Number(cfg.qc_calibration_end_min))} min；标注起点 ${String(Number(cfg.annotation_start_min))} min；后段取证范围 ${String(Number(cfg.local_delta_seed_window_min))} min。`;
+        const savedMessage = `已保存：前段协议结束 ${String(Number(cfg.qc_calibration_end_min))} min；事件起点 ${String(Number(cfg.annotation_start_min))} min；无标签 delta 取证 ${String(Number(cfg.local_delta_seed_window_min))} min；后段 QC=${cfg.post_qc_strategy?.mode || 'disabled'}。`;
         setConfigSaveStatus(
           result.warning ? `${savedMessage} ${result.warning}` : savedMessage,
           result.warning ? 'warning' : 'success'
@@ -10052,7 +12880,7 @@ HTML = r"""<!doctype html>
     }
 
     function rowSummary(row) {
-      const isCell = row.candidate_type === 'cell_high_confidence' || row.candidate_type === 'manual_cell_pair';
+      const isCell = String(row.candidate_type || '').startsWith('cell') || row.candidate_type === 'manual_cell_pair';
       if (isCell) return `${channelDisplayLabel(row.lif_channel)} ${fmt(row.lif_raw_time_min, 3)} → MS760 ${fmt(row.ms_time_min, 3)}`;
       return `${qcAnchorTimeText(row)} min`;
     }
@@ -10151,16 +12979,20 @@ HTML = r"""<!doctype html>
         const id = row.annotation_id || row.candidate_id;
         const selected = id === state.selectedCandidateId ? ' selected' : '';
         const rejected = row.review_status === 'rejected' ? ' rejected' : '';
-        const isCell = row.candidate_type === 'cell_high_confidence' || row.candidate_type === 'manual_cell_pair';
+        const isCell = String(row.candidate_type || '').startsWith('cell') || row.candidate_type === 'manual_cell_pair';
         const times = isCell
           ? `${channelDisplayLabel(row.lif_channel)} ${fmt(row.lif_raw_time_min, 3)} → MS760 ${fmt(row.ms_time_min, 3)}`
           : qcAnchorTimeText(row);
         const deviation = decisionDeviationSec(row);
         const canReview = row.review_enabled !== false && row.source !== 'preview';
         const displayStatus = row.review_enabled === false && row.review_status === 'pending' ? 'preview' : row.review_status;
+        const arbitrationNote = row.cross_channel_candidate_conflict
+          ? ` · 跨通道冲突：${(row.cross_channel_alternatives || []).map(item => channelDisplayLabel(item.lif_channel)).join(' / ')}，请选择唯一关系`
+          : '';
         const reviewNote = candidateNeedsIndividualReview(row) ? ' · 需逐条审核' : '';
+        const acceptLabel = row.cross_channel_candidate_conflict ? '选择此通道' : '接受';
         const actions = canReview ? `
-              <button data-action="accepted" data-id="${escapeText(id)}">接受</button>
+              <button data-action="accepted" data-id="${escapeText(id)}">${escapeText(acceptLabel)}</button>
               <button data-action="rejected" data-id="${escapeText(id)}">拒绝</button>
               ${row.source === 'auto_candidate' ? `<button data-action="pending" data-id="${escapeText(id)}">待审</button>` : ''}
               ${row.source === 'manual_created' ? `<button data-action="clear_manual" data-id="${escapeText(id)}">清除</button>` : ''}
@@ -10168,7 +13000,7 @@ HTML = r"""<!doctype html>
         return `
           <div class="candidate-row${selected}${rejected}" data-candidate-id="${escapeText(id)}">
             <div class="row-title"><span>${escapeText(sourceText(row.source))} #${escapeText(row.rank ?? '')}</span><span>${escapeText(statusText(displayStatus))}</span></div>
-            <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}</div>
+            <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}${escapeText(arbitrationNote)}</div>
             <div class="row-actions">${actions}</div>
           </div>
         `;
@@ -10264,7 +13096,7 @@ HTML = r"""<!doctype html>
       try {
         const result = await postCsv('/api/export-accepted-csv', {});
         downloadTextFile(result.filename, result.text, 'text/csv;charset=utf-8');
-        hint.textContent = '导出完成';
+        hint.textContent = '主 CSV 已导出；前段 anchor 仍保留在 SQLite 审计';
       } catch (err) {
         hint.textContent = '导出失败';
         alert(`导出失败: ${err.message}`);
@@ -10282,14 +13114,14 @@ HTML = r"""<!doctype html>
       button.textContent = '生成中...';
       el('importHint').textContent = '正在生成中间表；MS 文件较大时可能需要几分钟。';
       try {
-        refreshImportQcAnchorOptions();
+        refreshImportProtocolOptions();
         const lifInputs = importLifRows();
         const channels = lifInputs.map(row => row.channel);
         if (lifInputs.length < 2 || lifInputs.length > 4) {
           throw new Error('LIF 输入必须为 2–4 个。');
         }
-        if (lifInputs.some(row => !row.path || !row.channel)) {
-          throw new Error('请为每个 LIF 输入填写文件路径和通道名。');
+        if (lifInputs.some(row => !row.path || !row.channel || !row.detector || !row.time_axis)) {
+          throw new Error('请为每个 LIF 输入填写文件、通道、检测器和物理时间轴。');
         }
         if (new Set(channels).size !== channels.length) {
           throw new Error('LIF 通道名不能重复。');
@@ -10298,7 +13130,6 @@ HTML = r"""<!doctype html>
         if (duplicatePathMessage) {
           throw new Error(duplicatePathMessage);
         }
-        const qcAnchorChannels = selectedImportQcAnchorChannels();
         const cellRows = lifInputs.filter(row => row.use_for_cell_annotation);
         if (!cellRows.length) {
           throw new Error('至少一个 LIF 通道必须用于细胞标注。');
@@ -10307,12 +13138,32 @@ HTML = r"""<!doctype html>
         if (missingCellLabels.length) {
           throw new Error(`用于细胞标注的通道必须填写样本标签：${missingCellLabels.join('、')}。`);
         }
-        if (qcAnchorChannels.length < 2 || qcAnchorChannels.length > Math.min(4, channels.length)) {
-          throw new Error(`QC anchor 必须选择 2-${Math.min(4, channels.length)} 个 LIF 通道。`);
+        const calibrationProtocol = calibrationProtocolPayload();
+        if (!calibrationProtocol.segments.length) throw new Error('至少配置一个前段校准参考段。');
+        let previousEnd = null;
+        calibrationProtocol.segments.forEach((segment, index) => {
+          if (!Number.isFinite(segment.start_min) || !Number.isFinite(segment.end_min) || segment.end_min <= segment.start_min) {
+            throw new Error(`参考段 #${index + 1} 必须填写有效的开始和结束时间。`);
+          }
+          if (previousEnd !== null && segment.start_min < previousEnd) {
+            throw new Error(`参考段 #${index + 1} 与前一段重叠或顺序错误。`);
+          }
+          if (!segment.reference_channels.length) throw new Error(`参考段 #${index + 1} 至少选择一个参考通道。`);
+          if (!segment.boundaries_confirmed) throw new Error(`参考段 #${index + 1} 的边界尚未由用户确认。`);
+          previousEnd = segment.end_min;
+        });
+        const axesByChannel = Object.fromEntries(lifInputs.map(row => [row.channel, row.time_axis]));
+        const requiredAxes = new Set(cellRows.map(row => row.time_axis));
+        const coveredAxes = new Set(calibrationProtocol.segments.flatMap(segment => segment.reference_channels.map(channel => axesByChannel[channel])));
+        const missingAxes = Array.from(requiredAxes).filter(axis => !coveredAxes.has(axis));
+        if (missingAxes.length) throw new Error(`前段校准协议未覆盖细胞通道物理轴：${missingAxes.join('、')}。`);
+        const annotationStart = Number(el('importAnnotationStart').value);
+        const seedWindow = Number(el('importSeedWindow').value);
+        if (!Number.isFinite(annotationStart) || annotationStart < Number(previousEnd)) {
+          throw new Error('事件标注起点必须不早于最后一个校准参考段的结束时间。');
         }
-        if (!qcAnchorChannels.some(channel => channel.startsWith('G')) || !qcAnchorChannels.some(channel => channel.startsWith('R'))) {
-          throw new Error('QC anchor 必须至少包含一个绿色通道和一个红色通道。');
-        }
+        if (!Number.isFinite(seedWindow) || seedWindow <= 0) throw new Error('无标签 delta 取证范围必须大于 0。');
+        const postQcStrategy = postQcStrategyPayload();
         if (!el('importProjectDir').value.trim() || !el('importMs').value.trim() || !el('importCellEventMap').value.trim()) {
           throw new Error('请选择项目保存路径、MS 原始文件和事件坐标 CSV。');
         }
@@ -10321,7 +13172,10 @@ HTML = r"""<!doctype html>
           ms_path: el('importMs').value,
           raw_input_mode: selectedRawInputMode(),
           lif_inputs: lifInputs,
-          qc_anchor_channels: qcAnchorChannels,
+          calibration_protocol: calibrationProtocol,
+          annotation_start_min: annotationStart,
+          local_delta_seed_window_min: seedWindow,
+          post_qc_strategy: postQcStrategy,
           cell_event_map_path: el('importCellEventMap').value,
         });
         applyLoadedProjectMeta(result.meta);
@@ -10366,7 +13220,7 @@ HTML = r"""<!doctype html>
         setConfigSaveStatus('请选择事件坐标 CSV。', 'error');
         return;
       }
-      if (!window.confirm('事件坐标将清洗为 canonical 五列表并一次性绑定到当前项目；v0.3.0 不支持替换。继续？')) return;
+      if (!window.confirm('事件坐标将清洗为 canonical 五列表并一次性绑定到当前项目；当前版本不支持替换。继续？')) return;
       state.actionBusy = true;
       const button = el('attachMap');
       const oldText = button.textContent;
@@ -10590,6 +13444,7 @@ HTML = r"""<!doctype html>
           lif_anchor_peak_ids: selectedAnchorIds,
           ms_event_id: state.manual.MS760.id,
           stage: qcSurvey ? 'qc_survey' : 'qc_calibration',
+          calibration_segment_id: qcSurvey ? null : activeCalibrationSegment()?.segment_id,
           window_start_min: state.current.start_min,
           window_end_min: state.current.end_min,
           time_mode: state.current.time_mode,
@@ -10853,7 +13708,7 @@ HTML = r"""<!doctype html>
 
     function qcAnchorMarkerPoints(row, markerPositions) {
       const peakIds = qcAnchorPeakIds(row);
-      const configuredChannels = qcAnchorChannels();
+      const configuredChannels = qcAnchorChannels(row);
       const anchors = configuredChannels
         .map(channel => {
           if (!peakIds[channel]) return null;
@@ -10925,7 +13780,7 @@ HTML = r"""<!doctype html>
         const ms = markerPositions[`ms760:${row.ms_event_id}`];
         if (!lif || !ms) return;
         const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
-        const baseColor = colorForChannel(row.lif_channel);
+        const baseColor = row.cross_channel_candidate_conflict ? '#d97706' : colorForChannel(row.lif_channel);
         const accepted = row.review_status === 'accepted';
         const line = svgEl('line', {
           x1: lif.x.toFixed(2),
@@ -10939,7 +13794,11 @@ HTML = r"""<!doctype html>
           'pointer-events': 'visibleStroke',
           cursor: 'pointer'
         });
-        line.__detail = { kind: 'cell_candidate', type: '细胞候选', data: row };
+        line.__detail = {
+          kind: 'cell_candidate',
+          type: row.cross_channel_candidate_conflict ? '跨通道歧义候选（需人工仲裁）' : '细胞候选',
+          data: row
+        };
         appendLineWithHitTarget(svg, line, row, () => {
           state.selectedCandidateId = row.annotation_id || row.candidate_id;
           renderCandidateList();
@@ -11008,11 +13867,7 @@ HTML = r"""<!doctype html>
     function isAcceptedQcSurveyRow(row) {
       if (row.review_status !== 'accepted') return false;
       const type = String(row.candidate_type || '');
-      if (!(type === 'qc_survey_post_10p5' || type.startsWith('manual_qc'))) return false;
-      const cfg = state.current?.project_config || state.meta?.project_config || {};
-      const annotationStart = Number(cfg.annotation_start_min || 40);
-      const msTime = Number(row.ms_time_min);
-      return Number.isFinite(msTime) && msTime >= annotationStart;
+      return type.startsWith('qc_survey_') || type.startsWith('manual_qc');
     }
 
     function drawAcceptedQcSurveyAnnotations(svg, markerPositions) {
@@ -11346,7 +14201,31 @@ HTML = r"""<!doctype html>
         if (state.importRows.length <= 2) return;
         const rowId = Number(remove.dataset.removeImportRow);
         state.importRows = state.importRows.filter(row => row.id !== rowId);
+        invalidateImportCalibrationConfirmations('LIF 通道已删除，旧窗口建议已失效，请重新分析并确认。');
         renderImportLifRows();
+        return;
+      }
+      const removeSegment = event.target.closest('[data-remove-import-segment]');
+      if (removeSegment) {
+        if (state.importSegments.length <= 1) return;
+        const segmentId = Number(removeSegment.dataset.removeImportSegment);
+        state.importSegments = state.importSegments.filter(row => row.id !== segmentId);
+        state.importSuggestionRevision += 1;
+        renderImportSegments();
+        return;
+      }
+      const removeScheduled = event.target.closest('[data-remove-import-scheduled]');
+      if (removeScheduled) {
+        const scheduledId = Number(removeScheduled.dataset.removeImportScheduled);
+        state.importScheduledQcWindows = state.importScheduledQcWindows.filter(row => row.id !== scheduledId);
+        renderImportScheduledQcWindows();
+        return;
+      }
+      const removeCfgScheduled = event.target.closest('[data-remove-cfg-scheduled]');
+      if (removeCfgScheduled && state.configPostQcDraft) {
+        const index = Number(removeCfgScheduled.dataset.removeCfgScheduled);
+        state.configPostQcDraft.windows = (state.configPostQcDraft.windows || []).filter((_row, rowIndex) => rowIndex !== index);
+        renderConfigPostQcEditor();
       }
     });
     el('importLifRows').addEventListener('input', event => {
@@ -11355,14 +14234,178 @@ HTML = r"""<!doctype html>
       if (!rowElement || !field) return;
       const row = state.importRows.find(item => item.id === Number(rowElement.dataset.importRowId));
       if (!row) return;
+      const previousValue = row[field];
       row[field] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
-      if (field === 'use_for_cell_annotation') renderImportLifRows();
-      else refreshImportQcAnchorOptions();
+      if (['path', 'channel', 'detector', 'time_axis'].includes(field) && row[field] !== previousValue) {
+        state.importSuggestionRevision += 1;
+        invalidateImportCalibrationConfirmations(
+          'LIF 文件、检测器或物理时间轴已变化，旧窗口建议已失效，请重新分析并确认。',
+          false
+        );
+      }
+      if (field === 'channel') {
+        const channel = String(row.channel || '').toUpperCase();
+        row.detector = channel.startsWith('G') ? 'green' : channel.startsWith('R') ? 'red' : row.detector;
+        row.time_axis = row.detector ? `${row.detector}_axis` : row.time_axis;
+        renderImportLifRows();
+      } else if (
+        field === 'detector'
+        && (!row.time_axis || row.time_axis === `${String(previousValue || '')}_axis`)
+      ) {
+        row.time_axis = row.detector ? `${row.detector}_axis` : '';
+        renderImportLifRows();
+      } else if (field === 'use_for_cell_annotation') renderImportLifRows();
+      else refreshImportProtocolOptions();
+    });
+    el('importCalibrationSegments').addEventListener('input', event => {
+      const rowElement = event.target.closest('[data-import-segment-id]');
+      if (!rowElement) return;
+      const segment = state.importSegments.find(item => item.id === Number(rowElement.dataset.importSegmentId));
+      if (!segment) return;
+      const channel = event.target.dataset.segmentChannel;
+      if (channel) {
+        state.importSuggestionRevision += 1;
+        const selected = new Set(segment.reference_channels);
+        if (event.target.checked) selected.add(channel); else selected.delete(channel);
+        segment.reference_channels = Array.from(selected);
+        segment.boundaries_confirmed = false;
+        segment.suggestion_status = '通道已修改，待重新核对';
+        const confirmation = rowElement.querySelector('[data-segment-field="boundaries_confirmed"]');
+        if (confirmation) confirmation.checked = false;
+        return;
+      }
+      const field = event.target.dataset.segmentField;
+      if (field) {
+        if (field !== 'boundaries_confirmed') state.importSuggestionRevision += 1;
+        segment[field] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+        if (field === 'start_min' || field === 'end_min') {
+          segment.boundaries_confirmed = false;
+          segment.suggestion_status = '边界已编辑，待确认';
+          const confirmation = rowElement.querySelector('[data-segment-field="boundaries_confirmed"]');
+          if (confirmation) confirmation.checked = false;
+        } else if (field === 'boundaries_confirmed') {
+          segment.suggestion_status = event.target.checked ? '用户已确认' : '待确认';
+        }
+      }
+    });
+    el('importScheduledQcWindows').addEventListener('input', event => {
+      const rowElement = event.target.closest('[data-import-scheduled-id]');
+      if (!rowElement) return;
+      const windowRow = state.importScheduledQcWindows.find(item => item.id === Number(rowElement.dataset.importScheduledId));
+      if (!windowRow) return;
+      const channel = event.target.dataset.scheduledChannel;
+      if (channel) {
+        const selected = new Set(windowRow.reference_channels);
+        if (event.target.checked) selected.add(channel); else selected.delete(channel);
+        windowRow.reference_channels = Array.from(selected);
+        return;
+      }
+      const field = event.target.dataset.scheduledField;
+      if (field) windowRow[field] = event.target.value;
     });
     el('addImportLif').addEventListener('click', () => {
       if (state.importRows.length >= 4) return;
       state.importRows.push(newImportLifRow());
+      invalidateImportCalibrationConfirmations('新增 LIF 通道后，旧窗口建议已失效，请重新分析并确认。');
       renderImportLifRows();
+    });
+    el('suggestImportWindows').addEventListener('click', suggestImportCalibrationWindows);
+    el('addImportSegment').addEventListener('click', () => {
+      state.importSegments.push(newImportSegment());
+      state.importSuggestionRevision += 1;
+      renderImportSegments();
+    });
+    el('addImportScheduledQc').addEventListener('click', () => {
+      state.importScheduledQcWindows.push(newImportScheduledQcWindow());
+      renderImportScheduledQcWindows();
+    });
+    el('importPostQcMode').addEventListener('change', renderImportPostQcControls);
+    el('importPostQcChannels').addEventListener('change', () => {
+      state.importSignatureChannels = Array.from(el('importPostQcChannels').selectedOptions).map(option => option.value);
+    });
+    el('cfgCalibrationSegments').addEventListener('input', event => {
+      const rowElement = event.target.closest('[data-cfg-segment-index]');
+      const field = event.target.dataset.cfgSegmentField;
+      if (!rowElement || !field || !state.configProtocolDraft) return;
+      const segment = state.configProtocolDraft.segments[Number(rowElement.dataset.cfgSegmentIndex)];
+      if (!segment) return;
+      segment[field] = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+      if (field === 'start_min' || field === 'end_min') {
+        segment.boundaries_confirmed = false;
+        const confirmation = rowElement.querySelector('[data-cfg-segment-field="boundaries_confirmed"]');
+        if (confirmation) confirmation.checked = false;
+      }
+      if (field === 'end_min') {
+        const values = state.configProtocolDraft.segments.map(row => Number(row.end_min));
+        if (values.every(Number.isFinite)) el('cfgQcEnd').value = fmt(Math.max(...values), 1);
+      }
+    });
+    el('cfgPostQcMode').addEventListener('change', () => {
+      const mode = el('cfgPostQcMode').value;
+      const previous = state.configPostQcDraft || {};
+      if (mode === 'disabled') state.configPostQcDraft = { mode: 'disabled', reference_channels: [], windows: [] };
+      if (mode === 'signature') state.configPostQcDraft = {
+        mode: 'signature',
+        reference_channels: previous.reference_channels || [],
+        windows: []
+      };
+      if (mode === 'scheduled_windows') state.configPostQcDraft = {
+        mode: 'scheduled_windows',
+        reference_channels: [],
+        windows: previous.windows || []
+      };
+      renderConfigPostQcEditor();
+    });
+    el('cfgPostQcChannels').addEventListener('change', () => {
+      if (!state.configPostQcDraft) return;
+      state.configPostQcDraft.reference_channels = Array.from(el('cfgPostQcChannels').selectedOptions).map(option => option.value);
+    });
+    el('cfgAddScheduledQc').addEventListener('click', () => {
+      if (!state.configPostQcDraft || state.configPostQcDraft.mode !== 'scheduled_windows') return;
+      state.configPostQcDraft.windows = state.configPostQcDraft.windows || [];
+      state.configPostQcDraft.windows.push({
+        window_id: `post_qc_${state.configPostQcDraft.windows.length + 1}`,
+        start_min: '',
+        end_min: '',
+        reference_channels: []
+      });
+      renderConfigPostQcEditor();
+    });
+    el('cfgScheduledQcWindows').addEventListener('input', event => {
+      const rowElement = event.target.closest('[data-cfg-scheduled-index]');
+      if (!rowElement || !state.configPostQcDraft) return;
+      const windowRow = state.configPostQcDraft.windows?.[Number(rowElement.dataset.cfgScheduledIndex)];
+      if (!windowRow) return;
+      const channel = event.target.dataset.cfgScheduledChannel;
+      if (channel) {
+        const selected = new Set(windowRow.reference_channels || []);
+        if (event.target.checked) selected.add(channel); else selected.delete(channel);
+        windowRow.reference_channels = Array.from(selected);
+        return;
+      }
+      const field = event.target.dataset.cfgScheduledField;
+      if (field) windowRow[field] = event.target.value;
+    });
+    el('applyHsc1Preset').addEventListener('click', () => {
+      state.importSuggestionRevision += 1;
+      state.importRows = [
+        newImportLifRow({ channel: 'G1', identity_prior: 'LSK', detector: 'green', time_axis: 'green_axis', use_for_cell_annotation: true }),
+        newImportLifRow({ channel: 'G2', identity_prior: 'Lin−', detector: 'green', time_axis: 'green_axis', use_for_cell_annotation: true }),
+      ];
+      state.importSegments = [
+        newImportSegment({ segment_id: 'lsk_reference', population_label: 'LSK', reference_channels: ['G1'] }),
+        newImportSegment({ segment_id: 'lin_reference', population_label: 'Lin−', reference_channels: ['G2'] }),
+      ];
+      state.importScheduledQcWindows = [];
+      state.importSignatureChannels = [];
+      el('importAnnotationStart').value = '24';
+      el('importSeedWindow').value = '2.5';
+      el('importPostQcMode').value = 'disabled';
+      renderImportLifRows();
+      renderImportSegments();
+      renderImportPostQcControls();
+      el('importSuggestionStatus').textContent = '选择 G1/G2 原始文件后，可点击“分析已选 LIF 并建议窗口”；建议不会自动确认。';
+      el('importHint').textContent = '已套用 HSC1 科学角色和共享 green_axis。请为 G1/G2 选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
     });
     document.querySelectorAll('[data-event-filter]').forEach(button => {
       button.addEventListener('click', () => {
@@ -11691,6 +14734,12 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     window_end_min=clean_value(payload.get("window_end_min")),
                     time_mode=str(payload.get("time_mode", "")) or None,
                     lif_anchor_peak_ids=anchor_map,
+                    calibration_segment_id=(
+                        str(payload.get("calibration_segment_id") or "") or None
+                    ),
+                    post_qc_window_id=(
+                        str(payload.get("post_qc_window_id") or "") or None
+                    ),
                     clear_qc_alignment_model=bool(payload.get("clear_qc_alignment_model")),
                 )
                 self.send_json({"ok": True, "annotation": row, "summary": self.data.store.summary()})
@@ -11763,13 +14812,34 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parsed.path == "/api/suggest-calibration-windows":
+                lif_inputs_payload = payload.get("lif_inputs")
+                segments_payload = payload.get("segments")
+                if not isinstance(lif_inputs_payload, list):
+                    raise BadRequest("lif_inputs must be a list")
+                if not isinstance(segments_payload, list):
+                    raise BadRequest("segments must be a list")
+                try:
+                    annotation_start_min = float(payload.get("annotation_start_min"))
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest("annotation_start_min must be numeric") from exc
+                result = suggest_calibration_windows_from_raw_inputs(
+                    lif_inputs_payload,
+                    segments_payload,
+                    annotation_start_min=annotation_start_min,
+                )
+                self.send_json({"ok": True, **result})
+                return
             if parsed.path == "/api/import-project":
                 lif_inputs_payload = payload.get("lif_inputs")
                 uses_dynamic_lif_inputs = isinstance(lif_inputs_payload, list) and bool(lif_inputs_payload)
                 if uses_dynamic_lif_inputs:
+                    calibration_protocol_payload = payload.get("calibration_protocol")
                     anchor_channels_payload = payload.get("qc_anchor_channels")
-                    if not isinstance(anchor_channels_payload, list) or not anchor_channels_payload:
-                        raise BadRequest("qc_anchor_channels 必须明确提供 2-4 个 QC anchor 通道")
+                    if not isinstance(calibration_protocol_payload, dict) and (
+                        not isinstance(anchor_channels_payload, list) or not anchor_channels_payload
+                    ):
+                        raise BadRequest("新项目必须明确提供 calibration_protocol")
                     required = ["project_dir", "ms_path", "cell_event_map_path"]
                 else:
                     required = [
@@ -11796,7 +14866,6 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                                 "identity_prior": str(item.get("identity_prior", "")),
                                 "time_axis": str(item.get("time_axis", "")),
                                 "detector": str(item.get("detector", "")),
-                                "use_for_qc": bool(item.get("use_for_qc")),
                                 "use_for_cell_annotation": bool(
                                     item.get("use_for_cell_annotation")
                                 ),
@@ -11807,7 +14876,32 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         ms_path=Path(str(payload["ms_path"])),
                         raw_input_mode=str(payload.get("raw_input_mode", RAW_INPUT_MODE_EXTERNAL)),
                         lif_inputs=lif_inputs,
-                        qc_anchor_channels=list(anchor_channels_payload),
+                        qc_anchor_channels=(
+                            list(anchor_channels_payload)
+                            if isinstance(anchor_channels_payload, list)
+                            else None
+                        ),
+                        calibration_protocol=(
+                            calibration_protocol_payload
+                            if isinstance(calibration_protocol_payload, dict)
+                            else None
+                        ),
+                        post_qc_strategy=(
+                            payload.get("post_qc_strategy")
+                            if isinstance(payload.get("post_qc_strategy"), dict)
+                            else None
+                        ),
+                        annotation_start_min=(
+                            float(payload.get("annotation_start_min"))
+                            if payload.get("annotation_start_min") is not None
+                            else None
+                        ),
+                        local_delta_seed_window_min=float(
+                            payload.get(
+                                "local_delta_seed_window_min",
+                                DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
+                            )
+                        ),
                         cell_event_map_path=Path(str(payload["cell_event_map_path"])),
                     )
                 else:

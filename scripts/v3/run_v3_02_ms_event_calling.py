@@ -16,6 +16,21 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks, peak_prominences, peak_widths
 
+try:
+    from scripts.v3.project_protocol import (
+        classify_project_phase,
+        load_project_protocol,
+        phase_boundaries_min,
+        phase_role_from_labels,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from project_protocol import (  # type: ignore[no-redef]
+        classify_project_phase,
+        load_project_protocol,
+        phase_boundaries_min,
+        phase_role_from_labels,
+    )
+
 
 ROOT = Path.cwd()
 STEP = "02_ms_event_calling"
@@ -29,8 +44,6 @@ OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
 
 TOLERANCE_PPM = 10.0
 PSEUDOCOUNT = 1.0
-QC_START_MAX_MIN = 10.5
-PRE_RUN_MAX_MIN = 40.0
 BIN_SIZE_MIN = 2.0
 COLLISION_GAP_SEC = 0.60
 BROAD_PEAK_WIDTH_SEC = 1.50
@@ -38,6 +51,7 @@ LOW_TIC_THRESHOLD = 1e6
 LOW_ARRAY_LENGTH_THRESHOLD = 6000
 LOW_ARRAY_LENGTH_SEVERE = 1000
 TIC_SUPPORT_TOL_SEC = 0.75
+PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
 
 FORBIDDEN_PATH_PARTS = [
     "hrgc-obs-check.csv",
@@ -54,7 +68,7 @@ FORBIDDEN_PATH_PARTS = [
 
 
 def configure_project_root(project_dir: str | Path) -> Path:
-    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT
+    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT, PROJECT_PHASE_POLICY
     ROOT = Path(project_dir).expanduser().resolve()
     INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
     OUT_DATA = ROOT / "data/interim/v3" / STEP
@@ -62,6 +76,7 @@ def configure_project_root(project_dir: str | Path) -> Path:
     OUT_FIG = ROOT / "results/figures/v3" / STEP
     OUT_QC = ROOT / "results/qc/v3" / STEP
     OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
+    PROJECT_PHASE_POLICY = load_project_protocol(ROOT)
     return ROOT
 
 RE_INDEX = re.compile(r"^\s*index:\s*(\d+)")
@@ -519,13 +534,54 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
 
     y = scan[signal_col].to_numpy(float)
     t = scan["scan_start_time_sec"].to_numpy(float)
-    prelim_idx, _ = find_peaks(y, height=height, prominence=prominence, distance=3)
+    threshold_fallback_reason = ""
+    signal_max = float(np.nanmax(y)) if len(y) else 0.0
+    if (
+        signal_col == "pc34_760_max_intensity"
+        and signal_max > 0
+        and (not np.isfinite(height) or height >= signal_max)
+    ):
+        positive_localmax = pd.to_numeric(
+            localmax.loc[localmax["height"].gt(0), "height"],
+            errors="coerce",
+        ).dropna()
+        localmax_median = (
+            float(positive_localmax.median())
+            if len(positive_localmax)
+            else signal_max
+        )
+        height = float(
+            max(
+                np.nextafter(0.0, 1.0),
+                min(0.10 * signal_max, localmax_median),
+            )
+        )
+        prominence = float(
+            max(
+                np.nextafter(0.0, 1.0),
+                min(prominence, 0.50 * height),
+            )
+        )
+        threshold_fallback_reason = "quiet_threshold_exceeded_signal_range"
+    prelim_distance_points = 2 if threshold_fallback_reason else 3
+    prelim_idx, _ = find_peaks(
+        y,
+        height=height,
+        prominence=prominence,
+        distance=prelim_distance_points,
+    )
     if len(prelim_idx) >= 3:
         gap_q10 = float(np.quantile(np.diff(t[prelim_idx]), 0.10))
-        min_distance_sec = float(np.clip(gap_q10, 6.0 * dt_sec, 15.0 * dt_sec))
+        min_distance_sec = (
+            float(2.0 * dt_sec)
+            if threshold_fallback_reason
+            else float(np.clip(gap_q10, 6.0 * dt_sec, 15.0 * dt_sec))
+        )
     else:
         gap_q10 = np.nan
-        min_distance_sec = float(6.0 * dt_sec)
+        min_distance_sec = float(
+            (2.0 if threshold_fallback_reason else 6.0) * dt_sec
+        )
 
     params = {
         "signal_col": signal_col,
@@ -539,6 +595,8 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         "quiet_mad_sigma": quiet_mad_sigma,
         "peak_height": height,
         "peak_prominence": prominence,
+        "threshold_fallback_reason": threshold_fallback_reason,
+        "signal_max": signal_max,
         "preliminary_peak_count": int(len(prelim_idx)),
         "preliminary_gap_q10_sec": gap_q10,
         "min_distance_sec": min_distance_sec,
@@ -609,7 +667,48 @@ def build_event_table(scan: pd.DataFrame, peaks: np.ndarray, params: dict, strat
         )
     events = pd.DataFrame(rows)
     if events.empty:
-        return events
+        # A no-event result is valid evidence and must retain the table
+        # contract so QC/reporting can explain it instead of crashing on a
+        # missing column.  Project creation may then surface a focused data
+        # suitability error at the appropriate boundary.
+        return pd.DataFrame(
+            columns=[
+                "event_id",
+                "event_strategy",
+                "primary_signal_col",
+                "scan_row_index",
+                "spectrum_index",
+                "scan_id",
+                "time_min",
+                "time_sec",
+                "apex_intensity",
+                "peak_prominence",
+                "peak_width_sec",
+                "left_sec",
+                "right_sec",
+                "window_scan_count",
+                "pc34_760_apex",
+                "qc_782_apex",
+                "pc34_760_ppm_error_at_apex",
+                "qc_782_ppm_error_at_apex",
+                "tic_apex",
+                "ratio_760_782_max_pseudo1",
+                "array_length_apex",
+                "base_peak_mz_apex",
+                "low_array_length_lt_6000_window",
+                "low_array_length_lt_1000_window",
+                "low_tic_lt_1e6_window",
+                "calling_height",
+                "calling_prominence",
+                "calling_min_distance_sec",
+                "prev_event_gap_sec",
+                "next_event_gap_sec",
+                "nearest_event_gap_sec",
+                "collision_risk_high",
+                "broad_peak_width_gt_1p5_sec",
+                "low_quality_scan_window",
+            ]
+        )
     events["prev_event_gap_sec"] = events["time_sec"].diff()
     events["next_event_gap_sec"] = events["time_sec"].shift(-1) - events["time_sec"]
     events["nearest_event_gap_sec"] = events[["prev_event_gap_sec", "next_event_gap_sec"]].min(axis=1)
@@ -690,27 +789,21 @@ def build_pc34_support_audit(pc34_events: pd.DataFrame, tic_events: pd.DataFrame
     events["qc782_positive"] = events["qc_782_apex"].gt(0)
     events["qc782_high_q75"] = events["qc_782_apex"].ge(q75_782)
     events["time_bin_10min"] = (np.floor(events["time_min"] / 10.0) * 10.0).astype(float)
-    events["segment_role"] = np.select(
-        [
-            events["time_min"].lt(QC_START_MAX_MIN),
-            events["time_min"].ge(QC_START_MAX_MIN) & events["time_min"].lt(PRE_RUN_MAX_MIN),
-            events["time_min"].ge(PRE_RUN_MAX_MIN),
-        ],
-        [
-            "all_qc_calibration_only",
-            "transition_quiet_not_main_cell_run",
-            "main_acquisition_possible_qc_like_events",
-        ],
-        default="unknown",
+    events["project_phase"] = classify_project_phase(
+        events["time_min"], PROJECT_PHASE_POLICY
     )
+    events["segment_role"] = phase_role_from_labels(events["project_phase"])
 
     rows = []
-    for start, sub in events.groupby("time_bin_10min", sort=True):
+    for (start, segment_role), sub in events.groupby(
+        ["time_bin_10min", "segment_role"], sort=True
+    ):
         rows.append(
             {
                 "start_min": float(start),
                 "end_min": float(start + 10.0),
-                "segment_role": str(sub["segment_role"].iloc[0]) if len(sub) else "unknown",
+                "segment_role": str(segment_role),
+                "project_phases": ";".join(sorted(set(sub["project_phase"].astype(str)))),
                 "pc34_event_count": int(len(sub)),
                 "tic_supported_count": int(sub["tic_support_within_0p75sec"].sum()),
                 "tic_supported_fraction": float(sub["tic_support_within_0p75sec"].mean()),
@@ -730,6 +823,7 @@ def build_pc34_support_audit(pc34_events: pd.DataFrame, tic_events: pd.DataFrame
                 "start_min": "all",
                 "end_min": "all",
                 "segment_role": "all_segments",
+                "project_phases": ";".join(sorted(set(events["project_phase"].astype(str)))),
                 "pc34_event_count": int(len(events)),
                 "tic_supported_count": int(events["tic_support_within_0p75sec"].sum()),
                 "tic_supported_fraction": float(events["tic_support_within_0p75sec"].mean()),
@@ -802,6 +896,17 @@ def build_event_qc(events: pd.DataFrame, strategy_comparison: pd.DataFrame, para
     return pd.DataFrame(rows)
 
 
+def draw_project_phase_boundaries(ax: mpl.axes.Axes) -> None:
+    for boundary in PROJECT_PHASE_POLICY["plot_boundaries"]:
+        is_annotation = boundary["kind"] == "annotation_start"
+        ax.axvline(
+            float(boundary["time_min"]),
+            color="#374151" if is_annotation else "0.72",
+            lw=0.9 if is_annotation else 0.6,
+            ls="--" if is_annotation else ":",
+        )
+
+
 def plot_ms_overview(scan: pd.DataFrame, events: pd.DataFrame, quiet_bins: pd.DataFrame, pc34_params: dict) -> None:
     binned = scan.copy()
     binned["time_bin_sec"] = np.floor(binned["scan_start_time_sec"]).astype(int)
@@ -826,8 +931,7 @@ def plot_ms_overview(scan: pd.DataFrame, events: pd.DataFrame, quiet_bins: pd.Da
     axes[2].set_ylabel("log10 782")
     axes[2].set_xlabel("time (min)")
     for ax in axes:
-        ax.axvline(10, color="0.7", lw=0.7, ls="--")
-        ax.axvline(40, color="0.7", lw=0.7, ls="--")
+        draw_project_phase_boundaries(ax)
         for _, row in quiet_bins.iterrows():
             ax.axvspan(row["start_min"], row["end_min"], color="#d9f99d", alpha=0.18, lw=0)
     fig.suptitle("V3-02 MS traces, PC34 events, and quiet platform", y=0.995)
@@ -866,7 +970,7 @@ def write_report(
         "",
         "- 本步骤只读取 V3-00 锁定的 raw MS txt；没有读取作者 CSV、h5ad、人工补峰、LIF peak 或任何 V2 输出。",
         "- PC34/760.5851 和 782.5616 是 V3-00 中声明的预指定 marker 先验；它们不是作者标签，也不来自 h5ad/UMAP/downstream feature。",
-        "- 0-10.5 min 被视为全 QC 校准段；该时段的 PC34/782 事件只能用于 QC/time-calibration 支持审计，不能当作普通 cell-run 事件解释。",
+        f"- 阶段语义来自项目协议：`{phase_boundaries_min(PROJECT_PHASE_POLICY)}`；前段参考窗口、未分配间隙和 annotation region 被分别报告。",
         "- scan summary 从原始 MS 文本流式解析，提取 PC34/760、782/QC marker、TIC、array length、scan time 和 m/z 命中误差。",
         "- 主 event caller 使用 PC34/760 extracted trace；TIC-only 和 PC34+TIC 只作为 MS-only 对照，不参与身份标注。",
         "- 阈值来自 MS 自身 quiet platform 的背景和峰状尖刺上沿，不使用作者 event list 调参。",
@@ -889,7 +993,7 @@ def write_report(
         "",
         "## PC34 支持审计",
         "",
-        "说明：PC34-only 是主 event caller；本表只帮助人工审查哪些时段缺少 TIC/782 支持或存在低质量窗口，不用于作者标签拟合。`segment_role=all_qc_calibration_only` 的 0-10.5 min 事件全部按 QC 校准证据解释。",
+        "说明：PC34-only 是主 event caller；本表只帮助人工审查哪些项目配置时段缺少 TIC/782 支持或存在低质量窗口，不用于作者标签拟合。`calibration_reference_only:*`、`pre_annotation_unassigned` 与 `annotation_region` 均由项目协议生成。",
         "",
         md_table(support_audit, max_rows=20),
         "",

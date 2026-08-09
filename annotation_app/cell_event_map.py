@@ -30,7 +30,11 @@ CELL_EVENT_MAP_CANONICAL_COLUMNS = (
     "UMAP1",
     "UMAP2",
 )
-DEFAULT_MATCH_TOLERANCE_SEC = 0.01
+# One MS scan in supported acquisitions is about 0.10 s.  A 0.15 s window
+# binds a coordinate selected on the shoulder to its unique called apex while
+# remaining below half the 0.30 s minimum event separation; ambiguity is still
+# rejected rather than guessed.
+DEFAULT_MATCH_TOLERANCE_SEC = 0.15
 PRIMARY_EVENT_STRATEGY = "pc34_primary"
 PRIMARY_SIGNAL_COLUMN = "pc34_760_max_intensity"
 

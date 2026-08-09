@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 
 repo_root = Path(SPECPATH).parents[1]
-release_version = os.environ.get("LMA_STUDIO_VERSION", "0.3.0").lstrip("v")
+release_version = os.environ.get("LMA_STUDIO_VERSION", "0.4.0-rc1").lstrip("v")
 bundle_version = release_version.split("-", 1)[0]
 
 
@@ -22,6 +22,7 @@ def production_submodule(name):
 
 
 datas = [
+    (str(repo_root / "scripts/v3/project_protocol.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_01_lif_trace_physical_qc.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_02_ms_event_calling.py"), "scripts/v3"),
 ]

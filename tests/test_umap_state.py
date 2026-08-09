@@ -315,9 +315,38 @@ class UmapAppStateTest(unittest.TestCase):
             )
 
         self.assertEqual((cell["UMAP1"], cell["UMAP2"]), (1.25, -2.5))
+        self.assertEqual(cell["Type"], "LK")
+        self.assertNotEqual(cell["Type"], "AUTHOR_LABEL")
         self.assertEqual(cell["cell_event_map_sha256"], "map-sha")
         self.assertIsNone(early_qc["UMAP1"])
-        self.assertNotIn("Type", app.export_columns())
+        self.assertIn("Type", app.export_columns())
+
+    def test_export_type_never_falls_back_to_payload_or_source_author_label(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(Path(tmp), with_map=True)
+            app.channel_identity_prior["G1"] = {
+                "identity_prior": "",
+                "identity_prior_source": "test",
+            }
+            app.acquisition_layout["lif_channels"][0]["identity_prior"] = ""
+            row = app.export_row(
+                {
+                    "annotation_id": "cell-author-label",
+                    "source": "manual_created",
+                    "review_status": "accepted",
+                    "candidate_type": "manual_cell_pair",
+                    "ms_event_id": "ms-1",
+                    "lif_channel": "G1",
+                    "lif_peak_id": "g1-1",
+                    "label": "AUTHOR_LABEL",
+                },
+                stage="cell_annotation",
+                export_id="export",
+                exported_at="now",
+            )
+
+        self.assertEqual(row["Type"], "cell")
+        self.assertNotEqual(row["Type"], "AUTHOR_LABEL")
 
 
 if __name__ == "__main__":

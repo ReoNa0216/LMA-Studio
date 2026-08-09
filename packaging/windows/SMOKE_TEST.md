@@ -1,142 +1,202 @@
-# Windows Release Smoke Test
+# Windows v0.4 Candidate Smoke Test
 
-Goal: verify that the packaged application can run without a Python setup on the user's machine and can create, open, annotate, restart, and export projects.
+Goal: verify that the packaged LMA Studio candidate can create and open projects, run the split calibration/post-QC workflow, preserve legacy projects, and export the compact downstream CSV without requiring a user Python installation.
+
+## Safety and release boundary
+
+- This is a candidate acceptance test, not a formal Release procedure.
+- Do not create or push a version tag before Windows user acceptance.
+- Open existing projects only through temporary copies. Never point a write test at `HSC1_data` or an existing user project.
+- HSC1 raw files may be selected only as read-only external references; save the generated project in a separate new directory.
+- Keep the entire `dist/LMAStudio` directory together.
 
 ## 1. Build
 
+From the repository root:
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
+powershell -ExecutionPolicy Bypass -File packaging/windows/build_windows.ps1
 ```
 
-Expected output:
+Expected:
+
+- The full automated suite passes.
+- PyInstaller creates `dist/LMAStudio/LMAStudio.exe`.
+- The normal packaged-runtime probe and simulated Internet-zone/MOTW probe both pass.
+- `dist/LMAStudio/_internal/scripts/v3` contains `project_protocol.py`, `run_v3_01_lif_trace_physical_qc.py`, and `run_v3_02_ms_event_calling.py`.
+
+## 2. First startup
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging/windows/run_exe.ps1
+```
+
+Expected:
+
+- A native window titled `LMA Studio` opens without an external browser or console.
+- The initialization page offers `新建项目` and `打开项目`.
+- No previous project is restored automatically.
+- A second launch reports that LMA Studio is already running.
+- Closing the main window terminates its loopback server and process.
+
+## 3. Create a v0.4 project
+
+Create only in a new empty project directory. Configure:
+
+- Two to four distinct LIF raw files and one MS raw file.
+- One event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`.
+- For every LIF channel: channel name, detector, shared physical `time_axis`, scientific identity/sample label, and cell-annotation role.
+- One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
+- A project-specific event annotation start and unlabeled-delta seed window.
+- An independent later QC policy: `disabled`, `signature` plus channels, or `scheduled_windows` plus ordered non-overlapping windows and channels.
+
+Exercise small fixtures for Green-only, Red-only, Red+Green, and sequential same-axis references. Also exercise two- and four-channel layouts.
+
+Click `分析已选 LIF 并建议窗口`. Expected:
+
+- The status explicitly says that the scan is read-only.
+- Suggested boundaries come from the selected raw peaks.
+- Every suggested or edited segment remains unconfirmed until the user checks `边界已确认`.
+- Missing, ambiguous, wrong-order, or overlapping evidence is surfaced and cannot be silently confirmed.
+
+After creation, verify:
+
+- `lifms_project.json` records project schema 3 and acquisition layout 4.
+- The manifest contains `calibration_protocol`, `post_qc_strategy`, channel detector/time-axis roles, and project-specific annotation settings.
+- `results/tables/v3/00_project_protocol.json` records the confirmed boundaries used by both preprocessing stages.
+- `data/interim/lma/cell_event_umap.csv` contains exactly `ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`.
+- Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
+- Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.
+
+For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc1_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+
+## 4. Open legacy projects on copies
+
+Use a temporary copy of a v0.3 G2+R1 project.
+
+Expected:
+
+- The project opens through the compatibility adapter.
+- Existing `qc_anchor_channels` retain their historical v0.3 meaning.
+- Opening does not rewrite the legacy manifest, accepted/rejected annotations, audits, or parquet inputs.
+- Existing labels and review semantics remain visible.
+- A project without an event map stays in its documented legacy workflow until a map is explicitly attached.
+- Attaching a map preserves annotations and time models and rejects a map missing an already accepted post-start event.
+
+Do not interpret historical fixed boundaries as defaults for a new project.
+
+## 5. Front segmented calibration
+
+Open `前段参考校准`.
+
+Expected:
+
+- Candidates are grouped by configured calibration segment, not one global `qc_anchor_channels` interval.
+- Green-only and Red-only segments do not require the absent detector.
+- Red+Green segments display the configured cross-detector evidence.
+- Sequential G1/G2 segments sharing `green_axis` contribute to one Green-axis translation without requiring simultaneous peaks.
+- Manual front anchors require an explicit segment and obey its channel policy.
+- Accepted-anchor preview reports included evidence, conflicts/outliers, old/new per-axis shifts, and evidence sufficiency.
+- `应用 QC 对齐（按物理轴）` applies at most one translation per physical time axis and invalidates the dependent delta/time model.
+
+Wrong-order, overlapping, missing, or unconfirmed segments must block saving or preprocessing with a readable error.
+
+## 6. Unlabeled later delta and freeze gate
+
+Open `无标签后段 delta`.
+
+Expected:
+
+- The recommendation uses generic unlabeled LIF/MS peak topology and does not depend on QC identity labels.
+- The user can inspect and edit the delta before freezing.
+- Before freezing the current time model, third-stage acceptance and direct backend writes are blocked.
+- Freezing unlocks only results bound to the current layout, protocol, front alignment, annotation start, and delta settings.
+
+After freezing, edit a confirmed segment boundary, annotation start, or delta dependency:
+
+- A clear confirmation warning appears.
+- Confirming invalidates the old frozen model, dependent delta, and third-stage candidates.
+- Existing manual annotation/audit history remains stored and is not silently deleted or reused as current output.
+- Recompute and freeze again before continuing.
+
+## 7. Event annotation and independent post-QC
+
+Open `事件标注 / QC 巡检` and verify each policy:
+
+- `disabled`: no later QC candidates or manual QC writes; only cell candidates are shown.
+- `signature`: later QC candidates use only the configured signature channels.
+- `scheduled_windows`: QC candidates occur only in declared windows with their configured channels, including a declared pre-annotation window when applicable.
+
+For all policies:
+
+- QC and cell writes require the current frozen model and canonical event-map whitelist.
+- Third-stage candidates are accepted one at a time; there is no whole-window batch acceptance.
+- One MS event cannot simultaneously hold active QC and cell semantics.
+- If G1 and G2 both match one MS event, both candidates show cross-channel ambiguity and require explicit selection of one channel.
+- Changing only `post_qc_strategy` preserves old reviews for audit, makes old strategy-bound QC rows inactive/non-exportable, and does not alter front calibration.
+
+## 8. Track and UMAP synchronization
+
+On a project with a canonical event map:
+
+- `UMAP` opens one resizable window; repeated clicks restore it rather than creating duplicates.
+- Unknown points are gray, accepted QC is black, accepted cells use the selected LIF channel color, and conflicts are explicit.
+- Accept/revoke in Track updates UMAP without reloading.
+- Clicking a UMAP point opens the same canonical `ms_event_id` in its containing 2.5-minute Track window.
+- Project/map identity prevents events from a prior project leaking into the current window.
+- Closing the main window closes UMAP and releases the listener.
+
+## 9. Compact CSV contract
+
+Click `导出 Cell/QC 主 CSV`.
+
+The header must be exactly these 16 columns, in this order:
 
 ```text
-dist\LMAStudio\LMAStudio.exe
+CellNumber,scan_Id,scan_start_time,TIC,PC(34:1)_mz,PC(34:1)_intensity,UMAP1,UMAP2,Type,annotation_kind,review_stage,LIF_channel,LIF_peak_id,MS_event_id,residual_sec,annotation_id
 ```
 
-## 2. First Startup
+Verify:
+
+- Only active accepted/exportable third-stage Cell and post-QC relations are present.
+- Front calibration anchors remain in SQLite/audit history and never create blank `CellNumber` rows in the main CSV.
+- `CellNumber` is the stable canonical event-map order identifier for mapped third-stage rows.
+- Cell `Type` comes from the accepted LIF channel’s project identity; QC rows use `QC`.
+- Source CSV `Type`, `leiden`, or author `CellNumber` values are never copied into the export.
+- Core MS/LIF values and identifiers are readable without decoding JSON payloads.
+- Protocol/model hashes, ambiguity alternatives, payloads, and audit metadata remain in SQLite.
+- The downloaded file and project-local copy under `annotation_app/annotations/exports` match.
+
+## 10. Existing-project copy regression
+
+Close every running LMA Studio window, then run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File packaging\windows\run_exe.ps1
+powershell -ExecutionPolicy Bypass -File packaging/windows/regression_existing_projects.ps1
 ```
 
 Expected:
 
-- A native window titled `LMA Studio` opens without an external browser or console window.
-- The page starts in initialization mode.
-- No previous project is loaded automatically.
-- The center of the page offers `新建项目` and `打开项目`.
-- The display controls include `Y轴: 完整 / 稳健放大`.
-- There is no raw RFU / corrected signal display switch.
-- A second launch reports that LMA Studio is already running.
-- Closing the window terminates the process and releases its random loopback port.
+- The script refuses a copy root outside system temp or without the `LMAStudioProjectRegression_*` prefix.
+- It copies `Batch03Test`, `CART_Exp1-3`, `CART_Exp2-1`, and `Young_HSC3` before opening them.
+- Original-project protected snapshots match before and after the run.
+- Copy manifest, SQLite annotations/audits/models, and parquet hashes satisfy compatibility checks.
+- The packaged export has the exact 16-column header above.
+- The result reports `DataStable=True`, `OriginalStable=True`, and `ClosedCleanly=True`.
+- The temporary regression root is removed even after failure.
 
-## 3. Create Project
+After a real HSC1 candidate project has been created outside `HSC1_data`, run the optional packaged smoke on another temporary copy:
 
-Click `新建项目` and fill:
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packaged.ps1 `
+  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc1_candidate" `
+  -HscDataDir "E:\path\to\HSC1_data"
+```
 
-- Project directory: a new empty directory.
-- Two to four LIF raw files.
-- Use `+ 添加 LIF` / remove controls to verify both 2- and 4-input layouts.
-- One MS raw file.
-- One event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`.
-- LIF channel names and identities.
-- Per-channel QC and cell roles. Exercise QC-only, cell-only, both, and disabled roles.
-- QC anchor channels: select 2-4 configured inputs, cover every cell-annotation time axis, and include at least one green and one red detector.
-- Raw input mode, preferably external reference for large MS files.
+It verifies schema 3/layout 4, G1/G2 on one `green_axis`, 24 min, disabled post-QC, Track-window APIs, the 16-column export, unchanged project/source snapshots, and safe cleanup under `%TEMP%\LMAStudioProjectRegression_*`.
 
-For the four-channel acceptance layout, add a fourth LIF row and configure
-`G1/G2/R1/R2`. A useful role test is QC=`G1/G2/R1` and
-cell=`G1/G2/R2`: this makes R1 QC-only and R2 cell-only while both physical
-time axes remain covered.
+## 11. Package boundary
 
-Expected:
+Inspect `dist/LMAStudio` and any candidate archive. They must not contain user project directories, annotation databases or exports, raw LIF/MS inputs, source/canonical event maps, project parquet tables, h5ad files, or author/manual outputs.
 
-- Every `选择` button opens a native Windows file/folder dialog parented to LMA Studio.
-- The project directory gets `lifms_project.json`.
-- `lifms_project.json` records all selected `qc_anchor_channels` and each channel's physical `time_axis`.
-- `lifms_project.json` records schema 2/layout 3, every channel's `use_for_cell_annotation`, and the canonical event-map SHA/source SHA/count.
-- `data/interim/lma/cell_event_umap.csv` contains exactly `ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`; it contains no source `Type/leiden/CellNumber`.
-- A complete but conflicting or cross-axis-incoherent QC group is visible for review but is excluded from whole-window batch acceptance.
-- Reopen a reviewed project and confirm an accepted QC relation is rendered once. The same relation must not return as pending under a different auto/manual ID, and candidates that reuse an accepted MS event or LIF peak must not enter the pending count.
-- Intermediate parquet tables are generated under `data/interim/v3`.
-- `annotation_app/annotations/annotation.sqlite` is created.
-- The UI enters the synchronized track view.
-
-## 4. Open Existing Project
-
-Click `打开项目` and choose an existing project directory.
-
-Expected:
-
-- If `lifms_project.json` exists, manifest fingerprints are checked first.
-- The SQLite database is validated against current parquet peak/event IDs.
-- Valid projects open without auto-requiring raw inputs.
-- A schema-v1 project without a map opens with the legacy unfiltered workflow and shows `UMAP（未配置）`; opening it does not change manifest/SQLite/parquet hashes.
-- Clicking `UMAP（未配置）` opens the configuration dialog with a readable explanation instead of silently doing nothing.
-- The attach-map path field occupies the available dialog width, shows the selected path, and keeps the validation/write action disabled until a CSV is selected.
-- The explicit attach-map action refuses a CSV that omits an already accepted post-start event, and a successful attach preserves all annotations and time models.
-
-## 5. Core Workflow
-
-On a project copy, test:
-
-- `QC 校正`: accept/reject a candidate and create/clear one manual QC anchor.
-- `QC 校正`: after at least two accepted anchors per physical axis, preview the accepted-anchor refit, verify the per-axis old/new shifts, and apply it. Applying must reset the downstream time model to draft with `MS local delta = 0`.
-- After applying the QC refit, change one QC-calibration accept/reject decision. The app must require confirmation, clear the applied QC model and downstream time model, then return to the automatic QC suggestion.
-- Change `QC 结束(min)` after applying the refit. The app must ask before clearing the saved QC alignment model and require a new QC refit afterward.
-- `后段局部校正`: use automatic MS local delta estimate, adjust delta, and freeze.
-- `事件标注`: switch `全部 / QC / 细胞`, create a manual QC anchor with a missing LIF side, then create one manual LIF-MS760 cell pair.
-- Verify an out-of-map MS event is passive in the UI and rejected by the backend even if its ID is submitted directly.
-- Accepting QC then trying to accept cell on the same MS event (and the reverse order) must be rejected until the first relation is revoked.
-- The third stage has no whole-window batch-accept action.
-- Restart the exe and reopen the project; annotations should remain.
-
-## 6. UMAP Window
-
-On a project with a map:
-
-- Click `打开 UMAP`; a separate resizable native window opens, while the main synchronized-track window remains unchanged.
-- Repeated clicks restore the same UMAP window rather than creating duplicates.
-- The window initially shows all points centered. Maximizing/restoring the window automatically refits the cloud to the new plot area.
-- The visible `UMAP1` / `UMAP2` axes and tick values update with wheel zoom and drag pan.
-- `显示全部点` restores all points to a centered, readable scale without changing annotations; the on-canvas hint explains wheel zoom, drag pan, and click-to-locate.
-- Hover shows only the MS760 time and current human-readable label; it does not expose internal event/scan IDs.
-- Pan, wheel-zoom, reset, hover, resize, and high-DPI rendering remain responsive.
-- Unknown points are gray, accepted QC is black, accepted cells use the corresponding LIF channel color, and conflicts have an explicit red outline/X.
-- Accept/revoke in the main window updates UMAP without reloading either window.
-- Clicking a UMAP point switches the main window to event annotation and centers the matching `ms_event_id`.
-- Clicking a UMAP point uses the containing 2.5 min grid window rather than centering on an arbitrary decimal start; for example, an event at `50.075 min` opens `50.0-52.5 min`.
-- Before the local delta is frozen, third-stage candidates/manual tools remain unavailable and direct backend acceptance is rejected. Applying the optional accepted-anchor QC refit is not a prerequisite; either the automatic QC base alignment or an applied refit may feed the frozen local model.
-- Closing/reopening only the UMAP window does not change SQLite or close the main window. Closing the main window closes the UMAP window.
-- Open a different project and confirm the UMAP window clears the prior project/map state before drawing the new one.
-
-## 7. Export
-
-Click `导出已接受 CSV`.
-
-Expected:
-
-- A CSV is downloaded.
-- The embedded WebView opens a native save dialog for the download.
-- A copy is stored under `annotation_app/annotations/exports`.
-- The filename uses project name plus timestamp.
-- Pending and rejected records are not exported.
-- Third-stage rows contain `UMAP1`, `UMAP2`, and `cell_event_map_sha256`; early QC rows leave them blank.
-- No source `Type`, `leiden`, or `CellNumber` column is exported.
-
-## 8. Desktop Lifecycle
-
-Close and reopen `LMAStudio.exe` twice.
-
-Expected:
-
-- Each launch returns to the initialization page instead of reopening the previous project.
-- No `LMAStudio.exe` process remains after closing.
-- `%LOCALAPPDATA%\LMA Studio\logs\lma-studio.log` contains startup and shutdown records but no project data payloads.
-
-## 9. Package Boundary
-
-Inspect the final `dist\LMAStudio` directory and archive. It must not contain
-any user project directory, raw LIF/MS input, source/canonical UMAP CSV,
-`annotation.sqlite`, parquet table, exported annotation CSV, or h5ad file.
+A manual GitHub Actions `workflow_dispatch` may upload a candidate artifact. Do not create a tag or formal GitHub Release before Windows user acceptance.
