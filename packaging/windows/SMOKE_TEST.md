@@ -209,7 +209,9 @@ powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packa
   -HscDataDir "E:\path\to\HSC1_data"
 ```
 
-It verifies schema 3/layout 4, G1/G2 on one shared Green time axis, 24 min, `Off` post-run QC, Track-window APIs, the 16-column export, unchanged temporary-copy/original-project/source snapshots (`ProjectStable`, `OriginalProjectStable`, and `HscSourceStable`), and safe cleanup under `%TEMP%\LMAStudioProjectRegression_*`.
+It verifies schema 3/layout 4, G1/G2 on one shared Green time axis, 24 min, `Off` post-run QC, Track-window APIs, the 6.002/6.017 min boundary QC candidates, the 16-column export, unchanged temporary-copy/original-project/source snapshots (`ProjectStable`, `OriginalProjectStable`, and `HscSourceStable`), and safe cleanup under `%TEMP%\LMAStudioProjectRegression_*`.
+
+To exercise the real `Save anchor` write path, add `-ExerciseBoundaryAnchorWrite`. Both boundary relations must be accepted only in the temporary project copy; the result reports `CopyWriteIsolated=True`, while `OriginalProjectStable=True` and `HscSourceStable=True` remain required. This write exercise intentionally reports `ProjectStable=False` because the disposable copy is the authorized write target.
 
 ## 11. Package boundary
 

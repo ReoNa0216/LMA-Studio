@@ -5,7 +5,8 @@ param(
     [string]$HscDataDir,
     [string]$PythonExe = "D:\Miniconda\envs\lifms_annotation_win\python.exe",
     [string]$CopyRoot = "",
-    [switch]$CleanupStaleCopy
+    [switch]$CleanupStaleCopy,
+    [switch]$ExerciseBoundaryAnchorWrite
 )
 
 $ErrorActionPreference = "Stop"
@@ -155,6 +156,54 @@ try {
         throw "HSC1 post-QC strategy is not disabled."
     }
 
+    $BoundaryWindow = Invoke-RestMethod `
+        -Uri "$BaseUrl/api/window?start_min=6&window_min=1&time_mode=aligned" `
+        -TimeoutSec 60
+    $BoundaryEventIds = @(
+        "MS_pc34_primary_000112",
+        "MS_pc34_primary_000113"
+    )
+    $BoundaryGroups = @(
+        $BoundaryWindow.alignment_groups |
+            Where-Object { $BoundaryEventIds -contains [string]$_.ms_event_id }
+    )
+    if ($BoundaryGroups.Count -ne 2) {
+        throw "HSC1 boundary QC candidates 6.002/6.017 were not both assigned to the 6-7 min MS window."
+    }
+    if ($ExerciseBoundaryAnchorWrite) {
+        $BoundaryRelations = @(
+            @{
+                lif_peak_id = "G1_merged_000195"
+                ms_event_id = "MS_pc34_primary_000112"
+            },
+            @{
+                lif_peak_id = "G1_merged_000196"
+                ms_event_id = "MS_pc34_primary_000113"
+            }
+        )
+        foreach ($Relation in $BoundaryRelations) {
+            $SaveBody = @{
+                lif_anchor_peak_ids = @{ G1 = $Relation.lif_peak_id }
+                ms_event_id = $Relation.ms_event_id
+                stage = "qc_calibration"
+                calibration_segment_id = "lsk_reference"
+                window_start_min = 6.0
+                window_end_min = 7.0
+                time_mode = "aligned"
+            } | ConvertTo-Json -Compress -Depth 6
+            $Saved = Invoke-RestMethod `
+                -Method Post `
+                -Uri "$BaseUrl/api/manual-triplet" `
+                -Headers @{ "X-Annotation-Write-Token" = $Meta.write_token } `
+                -ContentType "application/json; charset=utf-8" `
+                -Body $SaveBody `
+                -TimeoutSec 60
+            if ([string]$Saved.annotation.review_status -ne "accepted") {
+                throw "Packaged Save anchor did not accept boundary relation $($Relation.ms_event_id)."
+            }
+        }
+    }
+
     $Window24 = Invoke-RestMethod `
         -Uri "$BaseUrl/api/window?start_min=24&window_min=2.5&time_mode=aligned" `
         -TimeoutSec 60
@@ -212,8 +261,11 @@ try {
     }
 
     $After = Get-ProjectSnapshot $CopyProject
-    if ($Before -cne $After) {
+    if (!$ExerciseBoundaryAnchorWrite -and $Before -cne $After) {
         throw "Packaged HSC1 read-only smoke changed protected project state."
+    }
+    if ($ExerciseBoundaryAnchorWrite -and $Before -ceq $After) {
+        throw "Packaged boundary Save anchor exercise did not change its temporary project copy."
     }
     $OriginalProjectAfter = Get-ProjectSnapshot $SourceProject
     if ($OriginalProjectBefore -cne $OriginalProjectAfter) {
@@ -231,12 +283,15 @@ try {
         PhysicalAxes = $Axes -join "/"
         AnnotationStartMin = [double]$Meta.project_config.annotation_start_min
         PostQcMode = [string]$Meta.project_config.post_qc_strategy.mode
+        BoundaryQcCandidates = $BoundaryGroups.Count
+        BoundaryAnchorWriteExercised = [bool]$ExerciseBoundaryAnchorWrite
         Window24CellCandidates = @($Window24.cell_candidates).Count
         Window24PostQcCandidates = @($Window24.post_qc_candidates).Count
         Window50CellCandidates = @($Window50.cell_candidates).Count
         DeltaStatus = [string]$Delta.recommendation_status
         CsvHeaderColumns = ($ActualHeader -split ",").Count
-        ProjectStable = $true
+        ProjectStable = !$ExerciseBoundaryAnchorWrite
+        CopyWriteIsolated = [bool]$ExerciseBoundaryAnchorWrite
         OriginalProjectStable = $true
         HscSourceStable = $true
         SmokeProcessExited = $true
