@@ -396,6 +396,106 @@ class ProtocolRegressionTest(unittest.TestCase):
             self.assertEqual([row["annotation_id"] for row in owner_rows], [annotation["annotation_id"]])
             self.assertEqual(next_rows, [])
 
+    def test_saved_hsc_cell_relation_at_49p001_is_visible_once_in_one_minute_windows(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = create_hsc_app(Path(tmp))
+            active = app.active_time_model()
+            frozen = app.store.upsert_time_model(
+                {**active, "status": "frozen", "ms_local_delta_sec": -1.0},
+                action="test_freeze_hsc_49_relation",
+            )
+            annotation = app.store.upsert_review(
+                annotation_id="manual_cell:hsc-49p001",
+                source="manual_created",
+                review_status="accepted",
+                action="test_hsc_49_relation",
+                payload={
+                    "candidate_type": "manual_cell_pair",
+                    "review_stage": "cell_annotation",
+                    "lif_channel": "G1",
+                    "lif_peak_id": "G1_merged_000589",
+                    "lif_raw_time_min": 49.5098333333332,
+                    "lif_plot_time_min": 49.110216796875115,
+                    "ms_event_id": "MS_pc34_primary_000770",
+                    "ms_time_min": 49.0013,
+                    "ms_plot_time_min": 48.984633333333335,
+                    "time_model_version": frozen["time_model_version"],
+                },
+            )
+
+            previous_rows = app.window_annotations(
+                48.0,
+                49.0,
+                context_start_min=47.92,
+                context_end_min=49.08,
+            )
+            saved_window_rows = app.window_annotations(
+                49.0,
+                50.0,
+                context_start_min=48.92,
+                context_end_min=50.08,
+            )
+
+            self.assertEqual(previous_rows, [])
+            self.assertEqual(
+                [row["annotation_id"] for row in saved_window_rows],
+                [annotation["annotation_id"]],
+            )
+
+    def test_saved_boundary_relations_have_one_complete_display_window_at_common_widths(self):
+        for width in (0.25, 0.5, 1.0, 2.5):
+            for direction in ("lif_after", "lif_before"):
+                with self.subTest(width=width, direction=direction), tempfile.TemporaryDirectory(
+                    ignore_cleanup_errors=True
+                ) as tmp:
+                    app = create_hsc_app(Path(tmp))
+                    active = app.active_time_model()
+                    frozen = app.store.upsert_time_model(
+                        {**active, "status": "frozen", "ms_local_delta_sec": 0.0},
+                        action="test_freeze_boundary_matrix",
+                    )
+                    boundary = 10.0 + width
+                    annotation_id = f"manual_cell:boundary-{width}-{direction}"
+                    lif_after = direction == "lif_after"
+                    app.store.upsert_review(
+                        annotation_id=annotation_id,
+                        source="manual_created",
+                        review_status="accepted",
+                        action="test_boundary_matrix",
+                        payload={
+                            "candidate_type": "manual_cell_pair",
+                            "review_stage": "cell_annotation",
+                            "lif_channel": "G1",
+                            "lif_peak_id": f"g1-boundary-{width}-{direction}",
+                            "lif_plot_time_min": boundary + (0.11 if lif_after else -0.11),
+                            "ms_event_id": f"ms-boundary-{width}-{direction}",
+                            "ms_plot_time_min": boundary + (-0.015 if lif_after else 0.015),
+                            "time_model_version": frozen["time_model_version"],
+                        },
+                    )
+
+                    left = app.window_annotations(
+                        10.0,
+                        boundary,
+                        context_start_min=9.92,
+                        context_end_min=boundary + 0.08,
+                    )
+                    right = app.window_annotations(
+                        boundary,
+                        boundary + width,
+                        context_start_min=boundary - 0.08,
+                        context_end_min=boundary + width + 0.08,
+                    )
+
+                    expected_left = [] if lif_after else [annotation_id]
+                    expected_right = [annotation_id] if lif_after else []
+                    self.assertEqual(
+                        [row["annotation_id"] for row in left], expected_left
+                    )
+                    self.assertEqual(
+                        [row["annotation_id"] for row in right], expected_right
+                    )
+
     def test_candidate_id_error_is_not_misreported_as_project_format_damage(self):
         public = user_facing_error_message(
             BadRequest(

@@ -23,6 +23,7 @@ UMAP_HTML = r"""<!doctype html>
     .toolbar {
       min-height: 52px;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       gap: 14px;
       padding: 8px 12px;
@@ -41,6 +42,28 @@ UMAP_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .spacer { flex: 1; }
+    .mz-search {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+      white-space: nowrap;
+    }
+    .mz-search label { font-size: 12px; font-weight: 650; }
+    .mz-search input {
+      height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 8px;
+      color: var(--ink);
+      background: var(--surface);
+      font: inherit;
+    }
+    .mz-search input:focus { outline: 2px solid rgba(47,111,237,.18); border-color: #2f6fed; }
+    .mz-value { width: 104px; }
+    .mz-tolerance { width: 78px; }
+    .mz-status { min-width: 0; max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 11px; }
+    .compact-button { width: auto; padding: 0 9px; font-size: 12px; font-weight: 650; white-space: nowrap; }
     .legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 12px; font-size: 12px; }
     .legend-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
     .swatch { width: 9px; height: 9px; border-radius: 50%; border: 1px solid rgba(0,0,0,.12); }
@@ -105,6 +128,8 @@ UMAP_HTML = r"""<!doctype html>
       .toolbar { align-items: flex-start; flex-wrap: wrap; }
       .legend { order: 3; width: 100%; justify-content: flex-start; }
       .identity { max-width: 45vw; }
+      .mz-search { order: 2; width: 100%; flex-wrap: wrap; }
+      .mz-status { max-width: none; }
     }
   </style>
 </head>
@@ -113,6 +138,16 @@ UMAP_HTML = r"""<!doctype html>
     <header class="toolbar">
       <span class="title">事件 UMAP</span>
       <span id="identity" class="identity">正在读取项目…</span>
+      <form id="mzSearch" class="mz-search" title="按每个 MS760 事件的 PC(34:1) 峰顶 m/z 定位；只查询，不修改标注">
+        <label for="mzQuery">PC(34:1) m/z</label>
+        <input id="mzQuery" class="mz-value" type="number" step="any" inputmode="decimal" placeholder="e.g. 760.585">
+        <label for="mzTolerance">±</label>
+        <input id="mzTolerance" class="mz-tolerance" type="number" min="0" step="0.0001" value="0.0001" inputmode="decimal" aria-label="m/z tolerance in Da">
+        <span class="identity">Da</span>
+        <button id="findMz" class="compact-button" type="submit">Find</button>
+        <button id="clearMz" class="compact-button" type="button">Clear</button>
+        <span id="mzStatus" class="mz-status" aria-live="polite"></span>
+      </form>
       <span class="spacer"></span>
       <div id="legend" class="legend"></div>
       <button id="fit" class="fit-button" type="button"
@@ -145,6 +180,9 @@ UMAP_HTML = r"""<!doctype html>
     const empty = document.getElementById('empty');
     const identity = document.getElementById('identity');
     const legend = document.getElementById('legend');
+    const mzQuery = document.getElementById('mzQuery');
+    const mzTolerance = document.getElementById('mzTolerance');
+    const mzStatus = document.getElementById('mzStatus');
     let payload = null;
     let points = [];
     let revision = '';
@@ -155,6 +193,7 @@ UMAP_HTML = r"""<!doctype html>
     let moved = false;
     let dragStart = null;
     let hoverPoint = null;
+    let matchedMzEventIds = new Set();
     let lastCanvasWidth = 0;
     let lastCanvasHeight = 0;
 
@@ -188,6 +227,13 @@ UMAP_HTML = r"""<!doctype html>
       return COLORS.unknown;
     }
 
+    function pointMz(point) {
+      const value = point?.mz;
+      if (value === null || value === undefined || value === '') return NaN;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : NaN;
+    }
+
     function setEmpty(message) {
       empty.textContent = message || '';
       empty.style.display = message ? 'grid' : 'none';
@@ -197,10 +243,10 @@ UMAP_HTML = r"""<!doctype html>
       return `${data?.project_id || ''}:${data?.map_sha256 || ''}`;
     }
 
-    function bounds() {
-      if (!points.length) return null;
+    function bounds(sourcePoints = points) {
+      if (!sourcePoints.length) return null;
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-      for (const point of points) {
+      for (const point of sourcePoints) {
         minX = Math.min(minX, Number(point.UMAP1));
         maxX = Math.max(maxX, Number(point.UMAP1));
         minY = Math.min(minY, Number(point.UMAP2));
@@ -219,13 +265,16 @@ UMAP_HTML = r"""<!doctype html>
       return { left, right, top, bottom, width: right - left, height: bottom - top };
     }
 
-    function fitView() {
-      const box = bounds();
+    function fitPointSet(sourcePoints) {
+      const box = bounds(sourcePoints);
       if (!box || !canvas.clientWidth || !canvas.clientHeight) return;
+      const full = bounds(points) || box;
       const area = plotArea();
       const padding = Math.min(22, Math.max(8, Math.min(area.width, area.height) * .06));
-      const dx = Math.max(box.maxX - box.minX, 1e-6);
-      const dy = Math.max(box.maxY - box.minY, 1e-6);
+      const minimumDx = Math.max((full.maxX - full.minX) * .12, 1e-6);
+      const minimumDy = Math.max((full.maxY - full.minY) * .12, 1e-6);
+      const dx = Math.max(box.maxX - box.minX, minimumDx);
+      const dy = Math.max(box.maxY - box.minY, minimumDy);
       const usableW = Math.max(area.width - padding * 2, 1);
       const usableH = Math.max(area.height - padding * 2, 1);
       view.scale = Math.min(usableW / dx, usableH / dy);
@@ -233,6 +282,10 @@ UMAP_HTML = r"""<!doctype html>
       view.ty = (area.top + area.bottom) / 2 + ((box.minY + box.maxY) / 2) * view.scale;
       fitted = true;
       draw();
+    }
+
+    function fitView() {
+      fitPointSet(points);
     }
 
     function screenPoint(point) {
@@ -402,6 +455,13 @@ UMAP_HTML = r"""<!doctype html>
           ctx.strokeStyle = '#344054';
           ctx.stroke();
         }
+        if (matchedMzEventIds.has(String(point.ms_event_id))) {
+          ctx.beginPath();
+          ctx.arc(screen.x, screen.y, radius + 4, 0, Math.PI * 2);
+          ctx.lineWidth = 2.4;
+          ctx.strokeStyle = '#d92d20';
+          ctx.stroke();
+        }
       }
       ctx.restore();
     }
@@ -447,6 +507,7 @@ UMAP_HTML = r"""<!doctype html>
       }
       tooltip.innerHTML = `
         <strong>MS760 时间：${Number(point.scan_start_time).toFixed(6)} min</strong>
+        ${Number.isFinite(pointMz(point)) ? `<div>PC(34:1) m/z：${pointMz(point).toFixed(6)}</div>` : ''}
         <div>${escapeText(statusText(point))}</div>`;
       tooltip.style.display = 'block';
       const margin = 12;
@@ -489,6 +550,8 @@ UMAP_HTML = r"""<!doctype html>
           revision = '';
           fitted = false;
           hoverPoint = null;
+          matchedMzEventIds = new Set();
+          mzStatus.textContent = '';
           tooltip.style.display = 'none';
           draw();
         }
@@ -524,6 +587,42 @@ UMAP_HTML = r"""<!doctype html>
       } catch (error) {
         if (projectKey) await loadFullState();
       }
+    }
+
+    function findMzPoints() {
+      const targetText = String(mzQuery.value).trim();
+      const toleranceText = String(mzTolerance.value).trim();
+      const target = targetText ? Number(targetText) : NaN;
+      const tolerance = toleranceText ? Number(toleranceText) : NaN;
+      if (!Number.isFinite(target)) {
+        mzStatus.textContent = 'Enter m/z';
+        mzQuery.focus();
+        return;
+      }
+      if (!Number.isFinite(tolerance) || tolerance < 0) {
+        mzStatus.textContent = 'Check ± Da';
+        mzTolerance.focus();
+        return;
+      }
+      const matches = points.filter(point => (
+        Number.isFinite(pointMz(point))
+        && Math.abs(pointMz(point) - target) <= tolerance
+      ));
+      matchedMzEventIds = new Set(matches.map(point => String(point.ms_event_id)));
+      if (!matches.length) {
+        mzStatus.textContent = 'No match';
+        draw();
+        return;
+      }
+      mzStatus.textContent = `${matches.length} point${matches.length === 1 ? '' : 's'}`;
+      fitPointSet(matches);
+    }
+
+    function clearMzSearch() {
+      matchedMzEventIds = new Set();
+      mzQuery.value = '';
+      mzStatus.textContent = '';
+      draw();
     }
 
     canvas.addEventListener('pointerdown', event => {
@@ -581,6 +680,11 @@ UMAP_HTML = r"""<!doctype html>
       draw();
     }, { passive: false });
     document.getElementById('fit').addEventListener('click', fitView);
+    document.getElementById('mzSearch').addEventListener('submit', event => {
+      event.preventDefault();
+      findMzPoints();
+    });
+    document.getElementById('clearMz').addEventListener('click', clearMzSearch);
     window.addEventListener('resize', resizeCanvas);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) pollRevision();

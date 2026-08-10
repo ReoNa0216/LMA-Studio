@@ -324,7 +324,7 @@ class V04UiRegressionTest(unittest.TestCase):
         )
         self.assertNotIn("MS weak", draw)
 
-    def test_saved_boundary_cell_pair_moves_to_its_ms_owner_window(self):
+    def test_saved_boundary_cell_pair_moves_to_its_complete_display_window(self):
         create_pair = javascript_function_body("createManualTriplet", "setAttrs")
         self.assertRegex(
             create_pair,
@@ -333,8 +333,18 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertIn("focusSavedCellRelation(response.annotation)", create_pair)
 
         focus = javascript_function_body("focusSavedCellRelation", "createManualTriplet")
-        self.assertIn("ms_plot_time_min", focus)
-        self.assertIn("eventGridWindowStart", focus)
+        self.assertIn("relationDisplayWindowStart", focus)
+        relation_window = javascript_function_body(
+            "relationDisplayWindowStart", "fmtAxis"
+        )
+        self.assertIn("eventGridWindowStart", relation_window)
+        self.assertIn("relationBelongsToDisplayWindow", relation_window)
+
+    def test_saved_cell_relation_focus_uses_a_window_that_contains_both_ends(self):
+        focus = javascript_function_body("focusSavedCellRelation", "createManualTriplet")
+        self.assertIn("relationDisplayWindowStart", focus)
+        self.assertIn("lif_plot_time_min", HTML)
+        self.assertIn("WINDOW_CONTEXT_MARGIN_MIN", HTML)
         self.assertIn("已保存；已转到包含完整关系的窗口", focus)
 
     def test_post_qc_modes_explain_when_each_mode_is_appropriate(self):

@@ -15,7 +15,7 @@ on:
       version:
         description: Artifact version for a manual candidate build
         required: true
-        default: v0.4.0-rc4
+        default: v0.4.0-rc5
         type: string
   push:
     tags:

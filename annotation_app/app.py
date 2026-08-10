@@ -86,7 +86,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.0-rc4"
+APP_VERSION = "lma_studio_v0.4.0-rc5"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -1692,6 +1692,72 @@ def front_qc_group_belongs_to_window(
     context_start = start - max(0.0, float(context_margin_min))
     context_end = end + max(0.0, float(context_margin_min))
     return all(context_start <= value <= context_end for value in plot_times)
+
+
+def saved_relation_belongs_to_window(
+    *,
+    ms_plot_time_min: float | None,
+    lif_plot_times_min: list[float],
+    window_start_min: float,
+    window_end_min: float,
+    context_start_min: float,
+    context_end_min: float,
+    context_margin_min: float = WINDOW_CONTEXT_MARGIN_MIN,
+) -> bool:
+    """Give a saved relation one window that can draw every endpoint.
+
+    Normally the MS event owns the window.  A manually selected relation can,
+    however, cross farther over a boundary than the fixed display context.  In
+    that case the MS-owner window cannot draw the LIF endpoint at all.  The
+    adjacent LIF window becomes the owner only when it can draw the complete
+    relation and the normal MS-owner window cannot.  This prevents both the
+    49.001-min "belongs nowhere" gap and duplicate lines in adjacent windows.
+    """
+
+    start = float(window_start_min)
+    end = float(window_end_min)
+    context_start = float(context_start_min)
+    context_end = float(context_end_min)
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        return False
+    lif_times = [
+        float(value)
+        for value in lif_plot_times_min
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    ms_time = (
+        float(ms_plot_time_min)
+        if isinstance(ms_plot_time_min, (int, float))
+        and math.isfinite(float(ms_plot_time_min))
+        else None
+    )
+    plot_times = ([ms_time] if ms_time is not None else []) + lif_times
+    if not plot_times or not all(context_start <= value <= context_end for value in plot_times):
+        return False
+
+    def in_main(value: float, main_start: float, main_end: float) -> bool:
+        return main_start <= value <= main_end
+
+    if ms_time is None:
+        return any(in_main(value, start, end) for value in lif_times)
+    if in_main(ms_time, start, end):
+        return True
+    if not any(in_main(value, start, end) for value in lif_times):
+        return False
+
+    width = end - start
+    if ms_time < start:
+        ms_owner_start, ms_owner_end = start - width, start
+    elif ms_time > end:
+        ms_owner_start, ms_owner_end = end, end + width
+    else:
+        return False
+    margin = max(0.0, float(context_margin_min))
+    ms_owner_can_draw_complete_relation = all(
+        ms_owner_start - margin <= value <= ms_owner_end + margin
+        for value in plot_times
+    )
+    return not ms_owner_can_draw_complete_relation
 
 
 def qc_group_auto_accept_block_reason(group: dict[str, Any]) -> str | None:
@@ -7048,6 +7114,17 @@ class AppData:
                 config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
             ),
         )
+        mz_by_scan_id: dict[str, float] = {}
+        mz_column = "pc34_760_mz_at_max_intensity"
+        if {"scan_id", mz_column}.issubset(self.ms_scan.columns):
+            for scan_id, mz_value in self.ms_scan[["scan_id", mz_column]].itertuples(
+                index=False, name=None
+            ):
+                cleaned_mz = clean_value(mz_value)
+                if isinstance(cleaned_mz, (int, float)) and math.isfinite(float(cleaned_mz)):
+                    mz_by_scan_id.setdefault(str(scan_id), float(cleaned_mz))
+        for point in state["points"]:
+            point["mz"] = mz_by_scan_id.get(str(point.get("scan_id")))
         state.update(
             {
                 "project_id": self.project_identity(),
@@ -10352,18 +10429,19 @@ class AppData:
             if stage == "qc_survey" and not self.qc_survey_matches_current_strategy(row):
                 continue
             dynamic_plot_times = row.get("lif_anchor_plot_times_min")
-            plot_times = [row.get("lif_plot_time_min"), row.get("ms_plot_time_min")]
+            lif_plot_times = [row.get("lif_plot_time_min")]
             if isinstance(dynamic_plot_times, dict):
-                plot_times.extend(dynamic_plot_times.values())
+                lif_plot_times.extend(dynamic_plot_times.values())
             else:
-                plot_times.extend([row.get("g2_plot_time_min"), row.get("r1_plot_time_min")])
-            visible_times = [float(t) for t in plot_times if isinstance(t, (int, float))]
-            ms_plot_time = row.get("ms_plot_time_min")
-            if isinstance(ms_plot_time, (int, float)) and not (
-                float(window_start_min) <= float(ms_plot_time) <= float(window_end_min)
+                lif_plot_times.extend([row.get("g2_plot_time_min"), row.get("r1_plot_time_min")])
+            if saved_relation_belongs_to_window(
+                ms_plot_time_min=row.get("ms_plot_time_min"),
+                lif_plot_times_min=lif_plot_times,
+                window_start_min=float(window_start_min),
+                window_end_min=float(window_end_min),
+                context_start_min=context_start,
+                context_end_min=context_end,
             ):
-                continue
-            if visible_times and all(context_start <= t <= context_end for t in visible_times):
                 rows.append(row)
         rows.sort(key=lambda item: float(item.get("ms_plot_time_min", 0.0)))
         return rows
@@ -12791,6 +12869,72 @@ HTML = r"""<!doctype html>
       return Math.round(clamped * 1e9) / 1e9;
     }
 
+    const WINDOW_CONTEXT_MARGIN_MIN = 0.08;
+
+    function relationLifPlotTimes(row) {
+      const numeric = value => {
+        if (value === null || value === undefined || value === '') return null;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+      const values = [numeric(row?.lif_plot_time_min)];
+      const dynamic = row?.lif_anchor_plot_times_min;
+      if (dynamic && typeof dynamic === 'object') {
+        values.push(...Object.values(dynamic).map(numeric));
+      } else {
+        values.push(numeric(row?.g2_plot_time_min), numeric(row?.r1_plot_time_min));
+      }
+      return values.filter(value => value !== null);
+    }
+
+    function relationBelongsToDisplayWindow(row, start, end) {
+      const rawMs = row?.ms_plot_time_min;
+      const ms = rawMs === null || rawMs === undefined || rawMs === '' ? NaN : Number(rawMs);
+      const lif = relationLifPlotTimes(row);
+      const all = [...(Number.isFinite(ms) ? [ms] : []), ...lif];
+      if (!all.length || !all.every(value => (
+        value >= start - WINDOW_CONTEXT_MARGIN_MIN
+        && value <= end + WINDOW_CONTEXT_MARGIN_MIN
+      ))) return false;
+      const inMain = value => value >= start && value <= end;
+      if (!Number.isFinite(ms)) return lif.some(inMain);
+      if (inMain(ms)) return true;
+      if (!lif.some(inMain)) return false;
+      const width = end - start;
+      const ownerStart = ms < start ? start - width : end;
+      const ownerEnd = ownerStart + width;
+      const ownerCanDrawAll = all.every(value => (
+        value >= ownerStart - WINDOW_CONTEXT_MARGIN_MIN
+        && value <= ownerEnd + WINDOW_CONTEXT_MARGIN_MIN
+      ));
+      return !ownerCanDrawAll;
+    }
+
+    function relationDisplayWindowStart(row) {
+      const currentStart = Number(state.current?.start_min);
+      const currentEnd = Number(state.current?.end_min);
+      if (
+        [currentStart, currentEnd].every(Number.isFinite)
+        && relationBelongsToDisplayWindow(row, currentStart, currentEnd)
+      ) return currentStart;
+
+      const msRaw = Number(row?.ms_time_min);
+      const width = Number(state.width || state.meta?.default_window_min || 2.5);
+      if (!Number.isFinite(msRaw) || !Number.isFinite(width) || width <= 0) return currentStart;
+      const primary = eventGridWindowStart(msRaw);
+      const projectMin = Number(state.meta?.time_min_min || 0);
+      const projectMax = Number(state.meta?.time_min_max || primary + width);
+      const maxStart = Math.max(projectMin, projectMax - width);
+      const clamp = value => Math.round(
+        Math.max(projectMin, Math.min(maxStart, value)) * 1e9
+      ) / 1e9;
+      const candidates = [primary, clamp(primary - width), clamp(primary + width)];
+      for (const candidate of [...new Set(candidates)]) {
+        if (relationBelongsToDisplayWindow(row, candidate, candidate + width)) return candidate;
+      }
+      return primary;
+    }
+
     function fmtAxis(n) {
       const value = Number(n);
       if (!Number.isFinite(value)) return '';
@@ -15080,15 +15224,10 @@ HTML = r"""<!doctype html>
     }
 
     function focusSavedCellRelation(row) {
-      const msPlotTime = Number(row?.ms_plot_time_min);
-      const start = Number(state.current?.start_min);
-      const end = Number(state.current?.end_min);
-      if (![msPlotTime, start, end].every(Number.isFinite) || (msPlotTime >= start && msPlotTime <= end)) {
-        return false;
-      }
-      const msRawTime = Number(row?.ms_time_min);
-      if (!Number.isFinite(msRawTime)) return false;
-      state.start = eventGridWindowStart(msRawTime);
+      const targetStart = relationDisplayWindowStart(row);
+      const currentStart = Number(state.current?.start_min);
+      if (!Number.isFinite(targetStart) || Math.abs(targetStart - currentStart) <= 1e-9) return false;
+      state.start = targetStart;
       el('start').value = state.start.toFixed(2);
       showInteractionHint('已保存；已转到包含完整关系的窗口');
       return true;

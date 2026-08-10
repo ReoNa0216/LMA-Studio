@@ -24,7 +24,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc4 and must not be published as a formal Release before Windows user acceptance.
+The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc5 and must not be published as a formal Release before Windows user acceptance.
 
 Windows x64:
 
@@ -73,9 +73,9 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.0-rc4 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.0-rc5 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload candidate artifacts only. Formal GitHub Release publication is tag-triggered and is intentionally deferred until user acceptance.
 
-Current candidate notes: [README_CANDIDATE_v0.4.0-rc4.md](README_CANDIDATE_v0.4.0-rc4.md). HSC1 walkthrough: [docs/HSC1_v0.4.0-rc4_UAT.md](docs/HSC1_v0.4.0-rc4_UAT.md).
+Current candidate notes: [README_CANDIDATE_v0.4.0-rc5.md](README_CANDIDATE_v0.4.0-rc5.md). HSC1 walkthrough: [docs/HSC1_v0.4.0-rc5_UAT.md](docs/HSC1_v0.4.0-rc5_UAT.md).
