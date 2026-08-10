@@ -73,6 +73,10 @@ Start · Window · Time · Y · Labels · Weak peaks · Show
 
 候选太密时把 `Window` 调为 `0.25`、`0.5` 或 `1.0` min，再点 `Show`。这只改变显示范围，不会改变项目的 MS Δt 取证范围。
 
+自动待审列表不是全部可人工标注的峰。要补一条没有自动候选线的关系，选择 `Cell pair`，再点 `Select peaks`：主窗口内启用了细胞角色的 core LIF 峰会恢复为可点击；依次选择 LIF 与 MS760 后点 `Save pair`。`Labels = Auto` 只给每个时间分区的一个显著峰显示时间，其他峰可悬停查看；需要时改成 `Labels = All`。
+
+MS 轨道没有 core/weak 分层。浅色 MS 圆点表示它不在事件坐标 CSV，不能用于 Cell pair，但现在可以悬停或点击查看原因；较大的红边圆点表示相邻事件或信号质量需注意，也不是 Weak peak。只有非浅色、属于事件坐标表的 MS760 才可选择。
+
 ## 5. Weak peak 如何人工配对
 
 `Weak peaks` 默认关闭。打开后，弱候选峰显示为空心虚线圆点，但始终不参与自动校准、QC、时间差估计或模型训练。
