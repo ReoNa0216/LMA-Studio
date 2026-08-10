@@ -6,7 +6,8 @@ param(
     [string]$PythonExe = "D:\Miniconda\envs\lifms_annotation_win\python.exe",
     [string]$CopyRoot = "",
     [switch]$CleanupStaleCopy,
-    [switch]$ExerciseBoundaryAnchorWrite
+    [switch]$ExerciseBoundaryAnchorWrite,
+    [switch]$ExerciseSavedPairPerformance
 )
 
 $ErrorActionPreference = "Stop"
@@ -210,6 +211,80 @@ try {
     $Window50 = Invoke-RestMethod `
         -Uri "$BaseUrl/api/window?start_min=50&window_min=5&time_mode=aligned" `
         -TimeoutSec 60
+    $SavedPairSeconds = $null
+    $SavedPairRefreshSeconds = $null
+    $SavedPairTotalSeconds = $null
+    $SavedPairAnnotationId = ""
+    if ($ExerciseSavedPairPerformance) {
+        $PerformanceWindow = Invoke-RestMethod `
+            -Uri "$BaseUrl/api/window?start_min=57&window_min=1&time_mode=aligned&include_weak_lif_peaks=true" `
+            -TimeoutSec 60
+        $PerformanceRelation = @(
+            $PerformanceWindow.annotations |
+                Where-Object {
+                    [string]$_.review_status -eq "accepted" -and
+                    [string]$_.review_stage -eq "cell_annotation" -and
+                    [string]$_.lif_peak_id -ne "" -and
+                    [string]$_.ms_event_id -ne "" -and
+                    [double]$_.lif_plot_time_min -ge 57.0 -and
+                    [double]$_.lif_plot_time_min -le 58.0 -and
+                    [double]$_.ms_plot_time_min -ge 57.0 -and
+                    [double]$_.ms_plot_time_min -le 58.0
+                } |
+                Select-Object -First 1
+        )
+        if ($PerformanceRelation.Count -ne 1) {
+            throw "HSC1 copy has no accepted 57-58 min Cell pair for the packaged performance probe."
+        }
+        $PerformanceRelation = $PerformanceRelation[0]
+        $SavedPairBody = @{
+            lif_channel = [string]$PerformanceRelation.lif_channel
+            lif_peak_id = [string]$PerformanceRelation.lif_peak_id
+            ms_event_id = [string]$PerformanceRelation.ms_event_id
+            window_start_min = 57.0
+            window_end_min = 58.0
+            time_mode = "aligned"
+        } | ConvertTo-Json -Compress
+        $SavedPairWatch = [Diagnostics.Stopwatch]::StartNew()
+        $SavedPair = Invoke-RestMethod `
+            -Method Post `
+            -Uri "$BaseUrl/api/manual-cell-pair" `
+            -Headers @{ "X-Annotation-Write-Token" = $Meta.write_token } `
+            -ContentType "application/json; charset=utf-8" `
+            -Body $SavedPairBody `
+            -TimeoutSec 60
+        $SavedPairWatch.Stop()
+        $SavedPairRefreshWatch = [Diagnostics.Stopwatch]::StartNew()
+        $PerformanceWindowAfter = Invoke-RestMethod `
+            -Uri "$BaseUrl/api/window?start_min=57&window_min=1&time_mode=aligned&include_weak_lif_peaks=true" `
+            -TimeoutSec 60
+        $SavedPairRefreshWatch.Stop()
+        if ([string]$SavedPair.annotation.review_status -ne "accepted") {
+            throw "Packaged Save pair performance probe was not accepted."
+        }
+        if ([string]$SavedPair.annotation.annotation_id -ne [string]$PerformanceRelation.annotation_id) {
+            throw "Packaged Save pair performance probe changed the existing relation identity."
+        }
+        $SavedPairVisible = @(
+            $PerformanceWindowAfter.annotations |
+                Where-Object {
+                    [string]$_.annotation_id -eq [string]$PerformanceRelation.annotation_id
+                }
+        )
+        if ($SavedPairVisible.Count -ne 1) {
+            throw "Packaged Save pair performance relation was not visible after refresh."
+        }
+        $SavedPairSeconds = $SavedPairWatch.Elapsed.TotalSeconds
+        $SavedPairRefreshSeconds = $SavedPairRefreshWatch.Elapsed.TotalSeconds
+        $SavedPairTotalSeconds = $SavedPairSeconds + $SavedPairRefreshSeconds
+        $SavedPairAnnotationId = [string]$SavedPair.annotation.annotation_id
+        if ($SavedPairSeconds -gt 2.0 -or $SavedPairRefreshSeconds -gt 2.0) {
+            throw (
+                "Packaged Save pair performance regressed: save={0:N3}s, refresh={1:N3}s." -f `
+                    $SavedPairSeconds, $SavedPairRefreshSeconds
+            )
+        }
+    }
     $DeltaResponse = Invoke-RestMethod `
         -Method Post `
         -Uri "$BaseUrl/api/estimate-local-delta-preview" `
@@ -261,11 +336,12 @@ try {
     }
 
     $After = Get-ProjectSnapshot $CopyProject
-    if (!$ExerciseBoundaryAnchorWrite -and $Before -cne $After) {
+    $CopyWriteExercised = [bool]($ExerciseBoundaryAnchorWrite -or $ExerciseSavedPairPerformance)
+    if (!$CopyWriteExercised -and $Before -cne $After) {
         throw "Packaged HSC1 read-only smoke changed protected project state."
     }
-    if ($ExerciseBoundaryAnchorWrite -and $Before -ceq $After) {
-        throw "Packaged boundary Save anchor exercise did not change its temporary project copy."
+    if ($CopyWriteExercised -and $Before -ceq $After) {
+        throw "Packaged write exercise did not change its temporary project copy."
     }
     $OriginalProjectAfter = Get-ProjectSnapshot $SourceProject
     if ($OriginalProjectBefore -cne $OriginalProjectAfter) {
@@ -285,13 +361,18 @@ try {
         PostQcMode = [string]$Meta.project_config.post_qc_strategy.mode
         BoundaryQcCandidates = $BoundaryGroups.Count
         BoundaryAnchorWriteExercised = [bool]$ExerciseBoundaryAnchorWrite
+        SavedPairPerformanceExercised = [bool]$ExerciseSavedPairPerformance
+        SavedPairSeconds = if ($null -eq $SavedPairSeconds) { "" } else { [math]::Round($SavedPairSeconds, 3) }
+        SavedPairRefreshSeconds = if ($null -eq $SavedPairRefreshSeconds) { "" } else { [math]::Round($SavedPairRefreshSeconds, 3) }
+        SavedPairTotalSeconds = if ($null -eq $SavedPairTotalSeconds) { "" } else { [math]::Round($SavedPairTotalSeconds, 3) }
+        SavedPairAnnotationId = $SavedPairAnnotationId
         Window24CellCandidates = @($Window24.cell_candidates).Count
         Window24PostQcCandidates = @($Window24.post_qc_candidates).Count
         Window50CellCandidates = @($Window50.cell_candidates).Count
         DeltaStatus = [string]$Delta.recommendation_status
         CsvHeaderColumns = ($ActualHeader -split ",").Count
-        ProjectStable = !$ExerciseBoundaryAnchorWrite
-        CopyWriteIsolated = [bool]$ExerciseBoundaryAnchorWrite
+        ProjectStable = !$CopyWriteExercised
+        CopyWriteIsolated = $CopyWriteExercised
         OriginalProjectStable = $true
         HscSourceStable = $true
         SmokeProcessExited = $true
