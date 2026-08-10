@@ -27,4 +27,17 @@ Use `docs/HSC1_v0.4.0-rc4_UAT.md` for the current walkthrough.
 
 ## Windows build evidence
 
-Build evidence is populated after the rc4 source commit and reproducible Windows packaging run.
+Verified on 2026-08-10:
+
+- Source commit used for the build: `237c50729f546f9faf25310ffdec5993c9afb54c`.
+- Automated suite: 280 tests passed; 1 POSIX-only test skipped on Windows. Main-page and UMAP JavaScript syntax checks also passed.
+- EXE: `dist\LMAStudio\LMAStudio.exe`, 19,177,953 bytes.
+- EXE SHA256: `61C8BBE6AA64F95D165B40DF29EEFCCB41218A08229ECD1126AF83EE2C8CB495`.
+- Normal and simulated downloaded-file runtime probes passed.
+- Bundle audit checked 120 scientific binaries: no foreign source, missing bundle row, or hash mismatch. The packaged `pyexpat`/`libexpat` pair had no missing name or ordinal.
+- Packaged HSC1 regression used a complete temporary project copy. It reported schema 3/layout 4, G1/G2 on one Green axis, 24 min start, Post-run QC `Off`, 971 CSV rows, 10 `unknown`, 0 QC, and the exact 16-column header.
+- The packaged `Save pair` write took 0.140 s and the following Track refresh 0.589 s (0.729 s total) on the annotation-rich HSC1 copy.
+- Separate source-level HSC1 copy probes measured accept+refresh at 0.525 s and reject+refresh at 0.486 s.
+- Both packaged HSC1 runs reported `OriginalProjectStable=True` and `HscSourceStable=True`; their disposable copies were removed.
+- Retired-project checks used complete temporary copies of Batch03Test, CART_Exp1-3, CART_Exp2-1, and Young_HSC3. All were rejected before writes and all protected originals remained unchanged.
+- No `v0.4` tag or formal Release was created.
