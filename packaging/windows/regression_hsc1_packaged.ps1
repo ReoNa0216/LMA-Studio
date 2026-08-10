@@ -157,6 +157,52 @@ try {
         throw "HSC1 post-QC strategy is not disabled."
     }
 
+    $Saved49AnnotationId = "manual_cell:b2dd9e046d"
+    $Window48 = Invoke-RestMethod `
+        -Uri "$BaseUrl/api/window?start_min=48&window_min=1&time_mode=aligned" `
+        -TimeoutSec 60
+    $Window49 = Invoke-RestMethod `
+        -Uri "$BaseUrl/api/window?start_min=49&window_min=1&time_mode=aligned" `
+        -TimeoutSec 60
+    $Saved49InPrevious = @(
+        $Window48.annotations |
+            Where-Object { [string]$_.annotation_id -eq $Saved49AnnotationId }
+    )
+    $Saved49InCompleteWindow = @(
+        $Window49.annotations |
+            Where-Object { [string]$_.annotation_id -eq $Saved49AnnotationId }
+    )
+    if ($Saved49InPrevious.Count -ne 0 -or $Saved49InCompleteWindow.Count -ne 1) {
+        throw "Saved 49.001-min Cell pair must appear exactly once in the complete 49-50 min window."
+    }
+
+    $UmapState = Invoke-RestMethod -Uri "$BaseUrl/api/cell-event-map" -TimeoutSec 60
+    $UmapPoints = @($UmapState.points)
+    $UmapPointsWithMz = @($UmapPoints | Where-Object { $null -ne $_.mz })
+    if ($UmapPointsWithMz.Count -ne $UmapPoints.Count) {
+        throw "Every HSC1 event-map point must expose its bound PC(34:1) m/z."
+    }
+    $MzTargetPoint = @(
+        $UmapPoints |
+            Where-Object { [string]$_.ms_event_id -eq "MS_pc34_primary_000770" }
+    )
+    if (
+        $MzTargetPoint.Count -ne 1 -or
+        [math]::Abs([double]$MzTargetPoint[0].mz - 760.591882537) -gt 0.000000001
+    ) {
+        throw "HSC1 m/z lookup binding for MS_pc34_primary_000770 changed."
+    }
+    $MzDefaultMatches = @(
+        $UmapPoints |
+            Where-Object {
+                $null -ne $_.mz -and
+                [math]::Abs([double]$_.mz - 760.591883) -le 0.0001
+            }
+    )
+    if ($MzDefaultMatches.Count -ne 1) {
+        throw "Default m/z tolerance must locate exactly one HSC1 target point for the rc5 UAT value."
+    }
+
     $BoundaryWindow = Invoke-RestMethod `
         -Uri "$BaseUrl/api/window?start_min=6&window_min=1&time_mode=aligned" `
         -TimeoutSec 60
@@ -390,6 +436,10 @@ try {
         PhysicalAxes = $Axes -join "/"
         AnnotationStartMin = [double]$Meta.project_config.annotation_start_min
         PostQcMode = [string]$Meta.project_config.post_qc_strategy.mode
+        Saved49PreviousWindowCount = $Saved49InPrevious.Count
+        Saved49CompleteWindowCount = $Saved49InCompleteWindow.Count
+        UmapPointsWithMz = $UmapPointsWithMz.Count
+        UmapDefaultMzMatches = $MzDefaultMatches.Count
         BoundaryQcCandidates = $BoundaryGroups.Count
         BoundaryAnchorWriteExercised = [bool]$ExerciseBoundaryAnchorWrite
         SavedPairPerformanceExercised = [bool]$ExerciseSavedPairPerformance
