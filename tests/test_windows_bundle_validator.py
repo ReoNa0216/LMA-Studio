@@ -1,4 +1,5 @@
 import importlib.util
+import builtins
 from pathlib import Path
 import tempfile
 import unittest
@@ -58,6 +59,19 @@ class WindowsBundleValidatorTest(unittest.TestCase):
             *extra_rows,
         ]
         self.toc.write_text(repr(rows), encoding="utf-8")
+
+    def test_module_can_be_collected_on_non_windows_without_pefile(self):
+        original_import = builtins.__import__
+
+        def import_without_pefile(name, *args, **kwargs):
+            if name == "pefile":
+                raise ModuleNotFoundError("No module named 'pefile'")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=import_without_pefile):
+            module = load_validator_module()
+
+        self.assertIsNone(module.pefile)
 
     def test_official_python_embedded_expat_is_valid_without_external_dll(self):
         self._write_toc()

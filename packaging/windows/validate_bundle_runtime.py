@@ -10,7 +10,10 @@ from pathlib import Path
 import sys
 from typing import Any, Iterable
 
-import pefile
+try:
+    import pefile
+except ModuleNotFoundError:  # The validator is imported by cross-platform tests.
+    pefile = None
 
 
 CORE_RUNTIME_DLLS = (
@@ -58,10 +61,14 @@ def is_within(path: Path, root: Path) -> bool:
 
 
 def pe_machine(path: Path) -> int:
+    if pefile is None:
+        raise RuntimeError("pefile is required to audit Windows PE binaries")
     return int(pefile.PE(str(path), fast_load=True).FILE_HEADER.Machine)
 
 
 def imported_dll_names(path: Path) -> set[str]:
+    if pefile is None:
+        raise RuntimeError("pefile is required to audit Windows PE binaries")
     pe = pefile.PE(str(path), fast_load=False)
     return {
         row.dll.decode(errors="replace").casefold()
@@ -70,6 +77,8 @@ def imported_dll_names(path: Path) -> set[str]:
 
 
 def expat_abi(path: Path, *, extension: bool) -> dict[str, Any]:
+    if pefile is None:
+        raise RuntimeError("pefile is required to audit Windows PE binaries")
     pe = pefile.PE(str(path), fast_load=False)
     if extension:
         entry = next(
