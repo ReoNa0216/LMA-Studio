@@ -89,6 +89,41 @@ WRITE_TOKEN = uuid.uuid4().hex
 APP_VERSION = "lma_studio_v0.4.0-rc3"
 APP_DISPLAY_NAME = "LMA Studio"
 
+
+_REQUEST_READ_SNAPSHOT = threading.local()
+
+
+@contextlib.contextmanager
+def request_read_snapshot():
+    """Memoize immutable reads for one logical UI operation.
+
+    Window rendering and manual-pair validation inspect the same project
+    configuration, active time model, and annotation set many times.  Without
+    a request boundary those helpers reopen SQLite once per annotation (an
+    N+1 read pattern).  The cache is deliberately thread-local and short-lived:
+    it never survives a request and therefore cannot hide later user edits.
+    """
+
+    existing = getattr(_REQUEST_READ_SNAPSHOT, "values", None)
+    if existing is not None:
+        yield
+        return
+    _REQUEST_READ_SNAPSHOT.values = {}
+    try:
+        yield
+    finally:
+        delattr(_REQUEST_READ_SNAPSHOT, "values")
+
+
+def request_cached_read(owner: Any, key: str, loader: Callable[[], Any]) -> Any:
+    values = getattr(_REQUEST_READ_SNAPSHOT, "values", None)
+    if values is None:
+        return loader()
+    cache_key = (id(owner), str(key))
+    if cache_key not in values:
+        values[cache_key] = loader()
+    return values[cache_key]
+
 DEFAULT_WINDOW_MIN = 2.5
 MAX_TRACE_POINTS_PER_SERIES = 2200
 DEFAULT_LIF_SIGNAL_MODE = "signal"
@@ -3549,6 +3584,13 @@ class AnnotationStore:
             return self._decode_annotation_row(row) if row else None
 
     def records(self) -> list[dict[str, Any]]:
+        return request_cached_read(
+            self,
+            "annotation_records",
+            self._records_uncached,
+        )
+
+    def _records_uncached(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT * FROM annotations ORDER BY ms_time_min, annotation_id").fetchall()
             return [self._decode_annotation_row(row) for row in rows]
@@ -7963,6 +8005,13 @@ class AppData:
         return {channel: self.channel_shift_sec(channel, "aligned") for channel in self.cell_annotation_channels()}
 
     def project_config(self) -> dict[str, Any]:
+        return request_cached_read(
+            self,
+            "project_config",
+            self._project_config_uncached,
+        )
+
+    def _project_config_uncached(self) -> dict[str, Any]:
         config = self.store.project_config()
         protocol_manifest = self.manifest or {
             "project_schema_version": 2,
@@ -8015,6 +8064,13 @@ class AppData:
         }
 
     def active_time_model(self) -> dict[str, Any]:
+        return request_cached_read(
+            self,
+            "active_time_model",
+            self._active_time_model_uncached,
+        )
+
+    def _active_time_model_uncached(self) -> dict[str, Any]:
         model = self.store.active_time_model()
         if model:
             return model
@@ -9627,6 +9683,25 @@ class AppData:
         window_end_min: float | None = None,
         time_mode: str | None = None,
     ) -> dict[str, Any]:
+        with request_read_snapshot():
+            return self._create_manual_cell_pair_from_request_snapshot(
+                lif_channel=lif_channel,
+                lif_peak_id=lif_peak_id,
+                ms_event_id=ms_event_id,
+                window_start_min=window_start_min,
+                window_end_min=window_end_min,
+                time_mode=time_mode,
+            )
+
+    def _create_manual_cell_pair_from_request_snapshot(
+        self,
+        lif_channel: str,
+        lif_peak_id: str,
+        ms_event_id: str,
+        window_start_min: float | None = None,
+        window_end_min: float | None = None,
+        time_mode: str | None = None,
+    ) -> dict[str, Any]:
         lif_channel = str(lif_channel).strip()
         lif_peak_id = optional_peak_id(lif_peak_id) or ""
         ms_event_id = optional_peak_id(ms_event_id) or ""
@@ -10236,6 +10311,25 @@ class AppData:
         return rows
 
     def window(
+        self,
+        start_min: float,
+        window_min: float,
+        time_mode: str = "aligned",
+        preview_ms_delta_sec: float | None = None,
+        lif_signal_mode: str = DEFAULT_LIF_SIGNAL_MODE,
+        include_weak_lif_peaks: bool = False,
+    ) -> dict[str, Any]:
+        with request_read_snapshot():
+            return self._window_from_request_snapshot(
+                start_min=start_min,
+                window_min=window_min,
+                time_mode=time_mode,
+                preview_ms_delta_sec=preview_ms_delta_sec,
+                lif_signal_mode=lif_signal_mode,
+                include_weak_lif_peaks=include_weak_lif_peaks,
+            )
+
+    def _window_from_request_snapshot(
         self,
         start_min: float,
         window_min: float,
