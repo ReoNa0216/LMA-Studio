@@ -12,6 +12,7 @@ This is a Windows user-acceptance candidate, not a formal Release.
 - A front QC relation that straddles a Track-window boundary now belongs to the window containing its MS760 event, while its LIF anchor may remain in the displayed ±0.08 min context. This removes the boundary blind spot without duplicating the relation in the adjacent window; such relations remain excluded from whole-window batch acceptance.
 - Stale candidate IDs now produce a refresh/reselect instruction instead of being misreported as project-format damage.
 - `Events / QC → Cell pair → Select peaks` now unlocks every eligible core LIF peak in the main window, including peaks that did not enter the automatic pending list. Switching selection mode repaints the markers immediately.
+- A saved Cell pair that straddles a Track-window boundary is now owned by the window containing its MS760 event; the LIF endpoint may remain in the loaded ±0.08 min context. Saving from the adjacent window automatically moves the view to the owning window instead of making the accepted relation appear to vanish.
 - Pale MS markers outside the event-coordinate whitelist remain non-selectable but now expose an explicit hover/click explanation. MS markers are not classified as weak; larger red-rimmed MS circles denote collision/quality risk.
 - The narrow MS-offset action is now the compact, single-line `Estimate MS Δt` button.
 
@@ -31,12 +32,13 @@ Use `docs/HSC1_v0.4.0-rc3_UAT.md` for the current walkthrough. The exact Windows
 
 ## Windows build evidence (2026-08-10)
 
-- Source commit used for the build: `be387f0c09eeb23b4b823f4a88a97ec25fb7d591`.
-- Automated suite: 240 tests passed; 1 POSIX-only test skipped on Windows.
-- EXE: `dist\LMAStudio\LMAStudio.exe`, 19,172,535 bytes.
-- EXE SHA256: `19CE04CC9D284916D6DACC09E22B0827E3D63F4F0B7B344F8448E2168110D6F6`.
+- Source commit used for the build: `8789a9cfda28cc56c1f7ef8fdaf5ea078b743040`.
+- Automated suite: 242 tests passed; 1 POSIX-only test skipped on Windows.
+- EXE: `dist\LMAStudio\LMAStudio.exe`, 19,173,038 bytes.
+- EXE SHA256: `1F59C943678857A7E76DD47115D7CE2449CD0940F44BE89F412C9CEF6DC7060D`.
 - Bundle audit: 120 scientific binaries checked; no foreign source, missing row, or hash mismatch. The packaged `pyexpat`/`libexpat` ABI and all seven guarded runtime DLL hashes matched the selected build environment.
 - Normal and simulated downloaded-file runtime probes passed.
-- Packaged HSC1 read-only regression used a temporary complete project copy and reported two 6.002/6.017 min boundary candidates, two 24–26.5 min Cell candidates, no post-run QC candidates, `ProjectStable=True`, `OriginalProjectStable=True`, `HscSourceStable=True`, `SmokeProcessExited=True`, plus the exact 16-column CSV header.
+- Packaged HSC1 read-only regression used a temporary complete project copy and reported two 6.002/6.017 min boundary candidates, one 24–26.5 min Cell candidate, no post-run QC candidates, `ProjectStable=True`, `OriginalProjectStable=True`, `HscSourceStable=True`, `SmokeProcessExited=True`, plus the exact 16-column CSV header.
+- A packaged boundary regression loaded the accepted MS760 26.513 min / G1 26.902 min Cell pair from a complete temporary HSC1 copy. It appeared exactly once in its MS-owned window, stayed absent from the adjacent window, and the packaged UI contained the automatic saved-relation focus behavior; the original HSC1 tree remained byte-for-byte unchanged.
 - A separate packaged write exercise accepted both boundary relations through the real `/api/manual-triplet` path on another temporary copy, reported `CopyWriteIsolated=True`, and again proved the original HSC1 project and `HSC1_data` unchanged before deleting the copy.
 - Retired-project rejection regression used temporary copies of Batch03Test, CART_Exp1-3, CART_Exp2-1, and Young_HSC3; every copy was rejected before writes and all originals remained unchanged.
