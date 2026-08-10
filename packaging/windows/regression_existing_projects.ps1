@@ -21,7 +21,7 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_RetiredDetector_rc5"
+    Join-Path $TempBase "LMAStudioProjectRegression_RetiredDetector_v040"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
 $ProjectNames = @("Batch03Test", "CART_Exp1-3", "CART_Exp2-1", "Young_HSC3")

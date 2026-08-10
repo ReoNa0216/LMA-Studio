@@ -1,4 +1,6 @@
-# LMA Studio v0.4.0-rc5 Candidate
+# LMA Studio v0.4.0-rc5 Candidate (superseded by v0.4.0)
+
+This candidate used the wrong UMAP lookup field. The final v0.4.0 release uses MS760 time from the event-coordinate table. Use `README_RELEASE.md` and `docs/HSC1_v0.4.0_UAT.md`; the remainder of this file is historical evidence only.
 
 This is a user-acceptance candidate, not a formal Release.
 

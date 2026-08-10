@@ -23,7 +23,7 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc5"
+    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_v040"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
 $CopyProject = Join-Path $CopyRoot "HSC1"
@@ -178,29 +178,29 @@ try {
 
     $UmapState = Invoke-RestMethod -Uri "$BaseUrl/api/cell-event-map" -TimeoutSec 60
     $UmapPoints = @($UmapState.points)
-    $UmapPointsWithMz = @($UmapPoints | Where-Object { $null -ne $_.mz })
-    if ($UmapPointsWithMz.Count -ne $UmapPoints.Count) {
-        throw "Every HSC1 event-map point must expose its bound PC(34:1) m/z."
+    $UmapPointsWithTime = @($UmapPoints | Where-Object { $null -ne $_.scan_start_time })
+    if ($UmapPointsWithTime.Count -ne $UmapPoints.Count) {
+        throw "Every HSC1 event-map point must expose its MS760 time."
     }
-    $MzTargetPoint = @(
+    $TimeTargetPoint = @(
         $UmapPoints |
             Where-Object { [string]$_.ms_event_id -eq "MS_pc34_primary_000770" }
     )
     if (
-        $MzTargetPoint.Count -ne 1 -or
-        [math]::Abs([double]$MzTargetPoint[0].mz - 760.591882537) -gt 0.000000001
+        $TimeTargetPoint.Count -ne 1 -or
+        [math]::Abs([double]$TimeTargetPoint[0].scan_start_time - 49.0013) -gt 0.000000001
     ) {
-        throw "HSC1 m/z lookup binding for MS_pc34_primary_000770 changed."
+        throw "HSC1 MS760-time binding for MS_pc34_primary_000770 changed."
     }
-    $MzDefaultMatches = @(
+    $TimeDefaultMatches = @(
         $UmapPoints |
             Where-Object {
-                $null -ne $_.mz -and
-                [math]::Abs([double]$_.mz - 760.591883) -le 0.0001
+                $null -ne $_.scan_start_time -and
+                [math]::Abs([double]$_.scan_start_time - 49.001) -le 0.001
             }
     )
-    if ($MzDefaultMatches.Count -ne 1) {
-        throw "Default m/z tolerance must locate exactly one HSC1 target point for the rc5 UAT value."
+    if ($TimeDefaultMatches.Count -ne 1) {
+        throw "Default MS760-time tolerance must locate exactly one HSC1 target point for the UAT value."
     }
 
     $BoundaryWindow = Invoke-RestMethod `
@@ -438,8 +438,8 @@ try {
         PostQcMode = [string]$Meta.project_config.post_qc_strategy.mode
         Saved49PreviousWindowCount = $Saved49InPrevious.Count
         Saved49CompleteWindowCount = $Saved49InCompleteWindow.Count
-        UmapPointsWithMz = $UmapPointsWithMz.Count
-        UmapDefaultMzMatches = $MzDefaultMatches.Count
+        UmapPointsWithTime = $UmapPointsWithTime.Count
+        UmapDefaultTimeMatches = $TimeDefaultMatches.Count
         BoundaryQcCandidates = $BoundaryGroups.Count
         BoundaryAnchorWriteExercised = [bool]$ExerciseBoundaryAnchorWrite
         SavedPairPerformanceExercised = [bool]$ExerciseSavedPairPerformance

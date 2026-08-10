@@ -1,6 +1,6 @@
 # LMA Studio v0.4.0-rc3 Candidate (superseded)
 
-Use `README_CANDIDATE_v0.4.0-rc5.md` for the current candidate. This file preserves rc3 evidence only.
+Use `README_RELEASE.md` and `docs/HSC1_v0.4.0_UAT.md` for the final release. This file preserves rc3 evidence only.
 
 This is a Windows user-acceptance candidate, not a formal Release.
 

@@ -1,4 +1,4 @@
-# Windows v0.4.0-rc5 Candidate Smoke Test
+# Windows v0.4.0 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -71,7 +71,7 @@ After creation, verify:
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
 - Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.
 
-For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc5_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+For the HSC1 regression, follow `docs/HSC1_v0.4.0_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 
@@ -206,7 +206,7 @@ After a real HSC1 candidate project has been created outside `HSC1_data`, run th
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packaged.ps1 `
-  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc5_candidate" `
+  -ProjectDir "E:\path\to\HSC1_v0.4.0_release_copy" `
   -HscDataDir "E:\path\to\HSC1_data"
 ```
 
@@ -218,4 +218,4 @@ To exercise the real `Save anchor` write path, add `-ExerciseBoundaryAnchorWrite
 
 Inspect `dist/LMAStudio` and any candidate archive. They must not contain user project directories, annotation databases or exports, raw LIF/MS inputs, source/canonical event maps, project parquet tables, h5ad files, or author/manual outputs.
 
-A manual GitHub Actions `workflow_dispatch` may upload a candidate artifact. Do not create a tag or formal GitHub Release before Windows user acceptance.
+A manual GitHub Actions `workflow_dispatch` may upload a non-publishing test artifact. Formal GitHub Release publication is tag-triggered after the release gates pass.

@@ -86,7 +86,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.0-rc5"
+APP_VERSION = "lma_studio_v0.4.0"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -7114,17 +7114,6 @@ class AppData:
                 config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
             ),
         )
-        mz_by_scan_id: dict[str, float] = {}
-        mz_column = "pc34_760_mz_at_max_intensity"
-        if {"scan_id", mz_column}.issubset(self.ms_scan.columns):
-            for scan_id, mz_value in self.ms_scan[["scan_id", mz_column]].itertuples(
-                index=False, name=None
-            ):
-                cleaned_mz = clean_value(mz_value)
-                if isinstance(cleaned_mz, (int, float)) and math.isfinite(float(cleaned_mz)):
-                    mz_by_scan_id.setdefault(str(scan_id), float(cleaned_mz))
-        for point in state["points"]:
-            point["mz"] = mz_by_scan_id.get(str(point.get("scan_id")))
         state.update(
             {
                 "project_id": self.project_identity(),

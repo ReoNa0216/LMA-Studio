@@ -1,6 +1,6 @@
-# LMA Studio v0.4.0-rc4 Candidate (superseded by rc5)
+# LMA Studio v0.4.0-rc4 Candidate (superseded by v0.4.0)
 
-Use `README_CANDIDATE_v0.4.0-rc5.md` and `docs/HSC1_v0.4.0-rc5_UAT.md` for current testing. The remainder of this file preserves rc4 evidence only.
+Use `README_RELEASE.md` and `docs/HSC1_v0.4.0_UAT.md` for the final release. The remainder of this file preserves rc4 evidence only.
 
 This is a Windows user-acceptance candidate, not a formal Release.
 
@@ -25,7 +25,7 @@ Projects made with the retired peak-recognition standard remain rejected before 
 - macOS ARM64 remains an Actions candidate artifact.
 - Do not create a version tag or formal GitHub Release before Windows user acceptance.
 
-The matching historical walkthrough is `docs/HSC1_v0.4.0-rc4_UAT.md`; current testing uses rc5 as noted above.
+The matching historical walkthrough is `docs/HSC1_v0.4.0-rc4_UAT.md`; current testing uses the final v0.4.0 guide noted above.
 
 ## Windows build evidence
 

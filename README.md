@@ -16,7 +16,7 @@ It opens its own native desktop window, lets users create or open project direct
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
-- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, and clicking a point focuses the same event in the main track window.
+- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations.
 - Export a compact 16-column full event roster intended for downstream cell labeling. Unannotated events use `Type=unknown`; internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
 - Use external raw input references to avoid copying large MS files into every project.
 - Reject projects created with the retired peak-recognition standard before any project write. The original project remains unchanged; use a new empty directory and the original LIF/MS/coordinate inputs to rebuild under the current standard.
@@ -24,7 +24,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc5 and must not be published as a formal Release before Windows user acceptance.
+The current release line is v0.4.0.
 
 Windows x64:
 
@@ -50,6 +50,8 @@ LMA Studio projects are directory-based. A project contains generated intermedia
 
 The application package does not include user raw data, project SQLite databases, canonical/source UMAP CSV files, parquet tables, exported CSV files, author CSV files, or h5ad files.
 
+For an existing project, the runtime-critical files are `lifms_project.json`, the annotation SQLite database, the four manifest-bound parquet tables under `data/interim/v3`, and the canonical event map under `data/interim/lma`. Files under `reports` and most of `results` are small, reproducible audit artifacts rather than runtime inputs. Keep them with the project for provenance; `quiet_platform` files describe automatically selected background-estimation bins and are not a QC population or an event class.
+
 ## Developer Build
 
 The Windows build expects Python 3.11 and prefers a conda environment named `lifms_annotation_win`.
@@ -73,9 +75,9 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.0-rc5 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.0 bash packaging/macos/build_macos.sh
 ```
 
-Manual `workflow_dispatch` builds upload candidate artifacts only. Formal GitHub Release publication is tag-triggered and is intentionally deferred until user acceptance.
+Manual `workflow_dispatch` builds upload non-publishing test artifacts. Formal GitHub Release publication is tag-triggered after all release gates pass.
 
-Current candidate notes: [README_CANDIDATE_v0.4.0-rc5.md](README_CANDIDATE_v0.4.0-rc5.md). HSC1 walkthrough: [docs/HSC1_v0.4.0-rc5_UAT.md](docs/HSC1_v0.4.0-rc5_UAT.md).
+Release notes: [README_RELEASE.md](README_RELEASE.md). HSC1 walkthrough: [docs/HSC1_v0.4.0_UAT.md](docs/HSC1_v0.4.0_UAT.md).

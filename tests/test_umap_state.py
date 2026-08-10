@@ -183,26 +183,32 @@ class UmapAppStateTest(unittest.TestCase):
         self.assertNotIn("<div class=\"muted\">event:", UMAP_HTML)
         self.assertNotIn("<div class=\"muted\">scan:", UMAP_HTML)
 
-    def test_umap_points_include_pc34_mz_for_read_only_location_queries(self):
+    def test_umap_points_keep_ms760_time_without_search_only_mz_payload(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = make_app(Path(tmp), with_map=True)
 
             state = app.projected_cell_event_map_state()
 
-            self.assertAlmostEqual(state["points"][0]["mz"], 760.5854)
+            self.assertAlmostEqual(state["points"][0]["scan_start_time"], 41.0)
+            self.assertNotIn("mz", state["points"][0])
 
-    def test_umap_page_can_find_mz_with_tolerance_and_draw_red_outlines(self):
-        self.assertIn('id="mzQuery"', UMAP_HTML)
-        self.assertIn('id="mzTolerance"', UMAP_HTML)
-        self.assertIn('value="0.0001"', UMAP_HTML)
-        self.assertIn('PC(34:1) m/z', UMAP_HTML)
-        self.assertIn('function findMzPoints()', UMAP_HTML)
-        self.assertIn('function pointMz(point)', UMAP_HTML)
-        self.assertIn("Math.abs(pointMz(point) - target) <= tolerance", UMAP_HTML)
-        self.assertIn("String(mzQuery.value).trim()", UMAP_HTML)
+    def test_umap_page_can_find_ms760_time_with_tolerance_and_draw_red_outlines(self):
+        self.assertIn('id="timeQuery"', UMAP_HTML)
+        self.assertIn('id="timeTolerance"', UMAP_HTML)
+        self.assertIn('value="0.001"', UMAP_HTML)
+        self.assertIn('MS760 time (min)', UMAP_HTML)
+        self.assertIn('function findTimePoints()', UMAP_HTML)
+        self.assertIn('function pointMs760Time(point)', UMAP_HTML)
+        self.assertIn(
+            "Math.abs(pointMs760Time(point) - target) <= tolerance",
+            UMAP_HTML,
+        )
+        self.assertIn("String(timeQuery.value).trim()", UMAP_HTML)
         self.assertIn("ctx.strokeStyle = '#d92d20'", UMAP_HTML)
-        self.assertIn("matchedMzEventIds.has(String(point.ms_event_id))", UMAP_HTML)
-        self.assertIn('id="clearMz"', UMAP_HTML)
+        self.assertIn("matchedTimeEventIds.has(String(point.ms_event_id))", UMAP_HTML)
+        self.assertIn('id="clearTime"', UMAP_HTML)
+        self.assertNotIn('id="mzQuery"', UMAP_HTML)
+        self.assertNotIn('PC(34:1) m/z', UMAP_HTML)
 
     def test_umap_legend_omits_qc_when_no_current_event_is_qc(self):
         body = re.search(
