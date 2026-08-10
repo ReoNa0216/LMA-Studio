@@ -40,4 +40,5 @@ Verified on 2026-08-10:
 - Separate source-level HSC1 copy probes measured accept+refresh at 0.525 s and reject+refresh at 0.486 s.
 - Both packaged HSC1 runs reported `OriginalProjectStable=True` and `HscSourceStable=True`; their disposable copies were removed.
 - Retired-project checks used complete temporary copies of Batch03Test, CART_Exp1-3, CART_Exp2-1, and Young_HSC3. All were rejected before writes and all protected originals remained unchanged.
+- macOS ARM64 Actions run [`31376412190`](https://github.com/ReoNa0216/LMA-Studio/actions/runs/31376412190) passed on candidate commit `ff6df3b90fbb5490576b8a9e4621c580e934374b`. Artifact `lma-studio-macos-arm64` (ID `9058136138`, 88,573,560 bytes) was uploaded; the Windows and publish jobs were skipped.
 - No `v0.4` tag or formal Release was created.
