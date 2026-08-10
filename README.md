@@ -2,7 +2,7 @@
 
 LMA Studio (LIF-MS Annotation Studio) is a local desktop application for human-assisted LIF-MS annotation review.
 
-It opens its own native desktop window, lets users create or open project directories, review QC anchors and cell-level LIF-MS candidates, and export accepted annotations as CSV. The application stores review state in each project's local SQLite database.
+It opens its own native desktop window, lets users create or open project directories, review QC anchors and cell-level LIF-MS candidates, and export a downstream cell roster as CSV. The application stores review state in each project's local SQLite database.
 
 ## Current Scope
 
@@ -16,15 +16,15 @@ It opens its own native desktop window, lets users create or open project direct
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
-- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; clicking a point focuses the same event in the main track window.
-- Export a compact 16-column CSV intended for downstream cell labeling. Internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
+- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, and clicking a point focuses the same event in the main track window.
+- Export a compact 16-column full event roster intended for downstream cell labeling. Unannotated events use `Type=unknown`; internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
 - Use external raw input references to avoid copying large MS files into every project.
 - Reject projects created with the retired peak-recognition standard before any project write. The original project remains unchanged; use a new empty directory and the original LIF/MS/coordinate inputs to rebuild under the current standard.
 - Invalidate dependent time models and third-stage results explicitly when a frozen-model input changes, while preserving manual annotation history.
 
 ## Desktop Releases
 
-The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc3 and must not be published as a formal Release before Windows user acceptance.
+The latest formal GitHub Release remains v0.3.0. The current development candidate is v0.4.0-rc4 and must not be published as a formal Release before Windows user acceptance.
 
 Windows x64:
 
@@ -73,9 +73,9 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.0-rc3 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.0-rc4 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload candidate artifacts only. Formal GitHub Release publication is tag-triggered and is intentionally deferred until user acceptance.
 
-Current candidate notes: [README_CANDIDATE_v0.4.0-rc3.md](README_CANDIDATE_v0.4.0-rc3.md). HSC1 walkthrough: [docs/HSC1_v0.4.0-rc3_UAT.md](docs/HSC1_v0.4.0-rc3_UAT.md).
+Current candidate notes: [README_CANDIDATE_v0.4.0-rc4.md](README_CANDIDATE_v0.4.0-rc4.md). HSC1 walkthrough: [docs/HSC1_v0.4.0-rc4_UAT.md](docs/HSC1_v0.4.0-rc4_UAT.md).

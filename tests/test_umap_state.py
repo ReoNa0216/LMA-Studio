@@ -1,5 +1,7 @@
 import csv
+import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -173,6 +175,18 @@ class UmapAppStateTest(unittest.TestCase):
         self.assertNotIn("<div class=\"muted\">event:", UMAP_HTML)
         self.assertNotIn("<div class=\"muted\">scan:", UMAP_HTML)
 
+    def test_umap_legend_omits_qc_when_no_current_event_is_qc(self):
+        body = re.search(
+            r"function renderLegend\(data\) \{(?P<body>.*?)\n    \}",
+            UMAP_HTML,
+            re.S,
+        )
+        self.assertIsNotNone(body)
+        self.assertRegex(
+            body.group("body"),
+            r"if\s*\(Number\(counts\.qc\s*\|\|\s*0\)\s*>\s*0\)",
+        )
+
     def test_backend_whitelist_and_cross_classification_conflict(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = make_app(Path(tmp), with_map=True)
@@ -218,6 +232,49 @@ class UmapAppStateTest(unittest.TestCase):
             after = app.projected_cell_event_map_state()
             self.assertEqual(after["counts"]["unknown"], 1)
             self.assertNotEqual(before["revision"], after["revision"])
+
+    def test_disabled_post_qc_does_not_project_historical_qc_on_umap(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(Path(tmp), with_map=True)
+            app.store.update_project_config(
+                {"post_qc_strategy": {"mode": "disabled"}}
+            )
+            app.store.upsert_review(
+                annotation_id="historical-qc",
+                source="manual_created",
+                review_status="accepted",
+                payload={
+                    "review_stage": "qc_survey",
+                    "candidate_type": "manual_qc_anchor_partial",
+                    "ms_event_id": "ms-1",
+                    "ms_time_min": 41.0,
+                    "time_model_version": "tm-current",
+                    "label": "QC",
+                },
+                action="test_historical_qc_after_disable",
+            )
+
+            state = app.projected_cell_event_map_state()
+
+            self.assertEqual(
+                state["counts"],
+                {"cell": 0, "qc": 0, "unknown": 1, "conflict": 0},
+            )
+            self.assertEqual(state["points"][0]["classification"], "unknown")
+
+    def test_main_csv_keeps_unannotated_event_map_rows_as_unknown(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(Path(tmp), with_map=True)
+
+            exported = app.export_accepted_annotations_csv()
+            frame = pd.read_csv(io.StringIO(exported["csv_text"]))
+
+            self.assertEqual(exported["row_count"], 1)
+            self.assertEqual(frame["Type"].tolist(), ["unknown"])
+            self.assertEqual(frame["CellNumber"].tolist(), ["Cell00001"])
+            self.assertEqual(frame["MS_event_id"].tolist(), ["ms-1"])
+            self.assertTrue(frame["LIF_channel"].isna().all())
+            self.assertTrue(frame["annotation_id"].isna().all())
 
     def test_third_stage_acceptance_requires_current_frozen_time_model(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

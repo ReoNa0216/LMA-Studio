@@ -462,9 +462,9 @@ UMAP_HTML = r"""<!doctype html>
       const channels = [...new Set(points.filter(p => p.classification === 'cell').map(p => p.lif_channel).filter(Boolean))].sort();
       const items = [
         ['未标注', COLORS.unknown, counts.unknown || 0],
-        ['QC', COLORS.qc, counts.qc || 0],
         ...channels.map(name => [name, stableColor(name), points.filter(p => p.classification === 'cell' && p.lif_channel === name).length]),
       ];
+      if (Number(counts.qc || 0) > 0) items.splice(1, 0, ['QC', COLORS.qc, counts.qc]);
       if (Number(counts.conflict || 0)) items.push(['冲突', '#d92d20', counts.conflict]);
       legend.innerHTML = items.map(([label, color, count]) =>
         `<span class="legend-item"><i class="swatch" style="background:${color}"></i>${escapeText(label)} ${count}</span>`

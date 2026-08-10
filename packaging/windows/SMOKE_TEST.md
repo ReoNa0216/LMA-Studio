@@ -1,4 +1,4 @@
-# Windows v0.4.0-rc3 Candidate Smoke Test
+# Windows v0.4.0-rc4 Candidate Smoke Test
 
 Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -71,7 +71,7 @@ After creation, verify:
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
 - Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.
 
-For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc3_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+For full HSC1 acceptance, follow `docs/HSC1_v0.4.0-rc4_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 
@@ -148,7 +148,7 @@ For all policies:
 - QC and cell writes require the current frozen model and canonical event-map whitelist.
 - Third-stage candidates are accepted one at a time; there is no whole-window batch acceptance.
 - One MS event cannot simultaneously hold active QC and cell semantics.
-- If G1 and G2 both match one MS event, both candidates show cross-channel ambiguity and require explicit selection of one channel.
+- If G1 and G2 both match one MS event, the ambiguous candidates are hidden from the normal list and plot. `Show conflicts` exposes one grouped card for explicit selection of one channel.
 - Changing only `post_qc_strategy` preserves old reviews for audit, makes old strategy-bound QC rows inactive/non-exportable, and does not alter front calibration.
 
 ## 8. Track and UMAP synchronization
@@ -156,7 +156,7 @@ For all policies:
 On a project with a canonical event map:
 
 - `UMAP` opens one resizable window; repeated clicks restore it rather than creating duplicates.
-- Unknown points are gray, accepted QC is black, accepted cells use the selected LIF channel color, and conflicts are explicit.
+- Unknown points are gray and accepted cells use the selected LIF channel color. Accepted current QC is black, but the QC legend is omitted when its current count is zero; conflicts remain explicit.
 - Accept/revoke in Track updates UMAP without reloading.
 - Clicking a UMAP point opens the same canonical `ms_event_id` in its containing 2.5-minute Track window.
 - Project/map identity prevents events from a prior project leaking into the current window.
@@ -174,10 +174,11 @@ CellNumber,scan_Id,scan_start_time,TIC,PC(34:1)_mz,PC(34:1)_intensity,UMAP1,UMAP
 
 Verify:
 
-- Only active accepted/exportable third-stage Cell and post-QC relations are present.
+- Every canonical event-map row is present exactly once. Events without a current accepted Cell or post-QC relation use `Type=unknown` and blank annotation-specific fields.
 - Front calibration anchors remain in SQLite/audit history and never create blank `CellNumber` rows in the main CSV.
 - `CellNumber` is the stable canonical event-map order identifier for mapped third-stage rows.
 - Cell `Type` comes from the accepted LIF channel’s project identity; QC rows use `QC`.
+- When post-run QC is `Off`, historical QC rows remain in audit history but export as the current event classification (normally `unknown` unless labeled as a Cell), never as `QC`.
 - Source CSV `Type`, `leiden`, or author `CellNumber` values are never copied into the export.
 - Core MS/LIF values and identifiers are readable without decoding JSON payloads.
 - Protocol/model hashes, ambiguity alternatives, payloads, and audit metadata remain in SQLite.
@@ -205,7 +206,7 @@ After a real HSC1 candidate project has been created outside `HSC1_data`, run th
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packaged.ps1 `
-  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc3_candidate" `
+  -ProjectDir "E:\path\to\HSC1_v0.4.0_rc4_candidate" `
   -HscDataDir "E:\path\to\HSC1_data"
 ```
 

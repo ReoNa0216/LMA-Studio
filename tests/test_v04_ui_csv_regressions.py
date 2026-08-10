@@ -89,6 +89,11 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertIn("必须包含 scan_start_time、UMAP1、UMAP2", HTML)
         self.assertRegex(HTML, r"CellNumber.*batch.*其他列.*保留.*忽略")
 
+    def test_export_copy_explains_full_roster_and_unknown_rows(self):
+        self.assertIn("全部事件均导出", HTML)
+        self.assertIn("未标注为 unknown", HTML)
+        self.assertIn("前段 QC anchor 留在审计库", HTML)
+
     def test_import_segment_status_uses_a_full_width_grid_row(self):
         body = javascript_function_body(
             "renderImportSegments",
@@ -200,6 +205,53 @@ class V04UiRegressionTest(unittest.TestCase):
             panels,
             r"createManual['\"]?\)\.textContent\s*=\s*cellMode\s*\?\s*'Save pair'\s*:\s*'Save anchor'",
         )
+
+    def test_cross_channel_ambiguities_are_hidden_by_default_and_grouped_on_request(self):
+        self.assertIn('id="showCrossChannelConflicts"', HTML)
+        self.assertIn('id="crossChannelConflictHint"', HTML)
+        self.assertIn("showCrossChannelConflicts: false", HTML)
+        self.assertIn("function pendingCrossChannelConflictGroups", HTML)
+        self.assertIn("function visibleCellCandidates", HTML)
+
+        candidates = javascript_function_body("candidateRows", "manualBelongsToStage")
+        self.assertIn("visibleCellCandidates", candidates)
+        self.assertNotIn("选择此通道", HTML)
+
+        render = javascript_function_body("renderCandidateList", "confirmQcEvidenceInvalidation")
+        self.assertIn("pendingCrossChannelConflictGroups", render)
+        self.assertRegex(render, r"Use\s+\$\{[^}]*lif_channel")
+        self.assertRegex(render, r"(?i)ambiguous event")
+
+        draw = javascript_function_body("drawCellCandidates", "drawManualAnnotations")
+        self.assertIn("visibleCellCandidates", draw)
+
+        peak_visibility = javascript_function_body(
+            "visibleThirdStageLifPeakIds",
+            "automaticPeakLabelIds",
+        )
+        self.assertIn("visibleCellCandidates", peak_visibility)
+
+    def test_candidate_actions_wrap_inside_the_sidebar(self):
+        actions_rule = re.search(r"\.row-actions\s*\{(?P<body>[^}]*)\}", HTML)
+        self.assertIsNotNone(actions_rule)
+        self.assertRegex(actions_rule.group("body"), r"flex-wrap\s*:\s*wrap")
+
+        buttons_rule = re.search(
+            r"\.row-actions\s+button,\s*\.small-button\s*\{(?P<body>[^}]*)\}",
+            HTML,
+        )
+        self.assertIsNotNone(buttons_rule)
+        self.assertRegex(buttons_rule.group("body"), r"max-width\s*:\s*100%")
+        self.assertRegex(buttons_rule.group("body"), r"overflow-wrap\s*:\s*anywhere")
+
+    def test_review_actions_show_feedback_before_waiting_for_the_server(self):
+        body = javascript_function_body("reviewCandidate", "clearManualAnnotation")
+        busy_index = body.index("state.actionBusy = true")
+        feedback_index = body.index("showInteractionHint", busy_index)
+        request_index = body.index("await postJson('/api/review'", busy_index)
+        self.assertLess(feedback_index, request_index)
+        self.assertIn("Accepting", body)
+        self.assertIn("Rejecting", body)
 
     def test_stage_switch_clears_unsaved_manual_selection(self):
         stage_handler = HTML.rsplit(

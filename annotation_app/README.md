@@ -56,11 +56,11 @@ The frozen time model is bound to the acquisition-layout hash, calibration-proto
 
 ## UMAP and Track synchronization
 
-The coordinate source CSV must contain `scan_start_time`, `UMAP1`, and `UMAP2`, but it may contain any number of unrelated columns. The importer locates and loads only those three required columns; source `CellNumber`, `batch`, `Type`, `leiden`, and other fields are ignored. The UMAP window displays only canonical event-map points. Colors are projected from current accepted SQLite semantics. Track-to-UMAP and UMAP-to-Track messages are bound to both project ID and map SHA, and navigation uses canonical `ms_event_id`.
+The coordinate source CSV must contain `scan_start_time`, `UMAP1`, and `UMAP2`, but it may contain any number of unrelated columns. The importer locates and loads only those three required columns; source `CellNumber`, `batch`, `Type`, `leiden`, and other fields are ignored. The UMAP window displays only canonical event-map points. Colors are projected from current accepted SQLite semantics, and the QC legend is omitted when there is no active current QC event. Track-to-UMAP and UMAP-to-Track messages are bound to both project ID and map SHA, and navigation uses canonical `ms_event_id`.
 
 ## Compact CSV contract
 
-The main accepted-annotation CSV intentionally contains only 16 columns:
+The main event-roster CSV intentionally contains only 16 columns:
 
 ```text
 CellNumber,scan_Id,scan_start_time,TIC,PC(34:1)_mz,PC(34:1)_intensity,
@@ -68,7 +68,7 @@ UMAP1,UMAP2,Type,annotation_kind,review_stage,LIF_channel,LIF_peak_id,
 MS_event_id,residual_sec,annotation_id
 ```
 
-`Type` is generated from the accepted project relation: channel identity for cell rows and `QC` for QC rows. It is never copied from the source coordinate CSV. Detailed protocol/model hashes, ambiguity alternatives, payloads, and audits remain in SQLite and `export_runs` rather than bloating the user CSV.
+Every canonical event-map event appears exactly once. `Type` is generated from the current accepted project relation: channel identity for cell rows, `QC` for active post-QC rows, and `unknown` when the event has not yet been annotated. It is never copied from the source coordinate CSV. Unknown rows keep annotation-specific fields blank. Detailed protocol/model hashes, ambiguity alternatives, payloads, and audits remain in SQLite and `export_runs` rather than bloating the user CSV.
 
 ## Project-driven preprocessing
 

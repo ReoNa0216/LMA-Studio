@@ -119,4 +119,4 @@ Expected behavior:
 - Treat `export_runs` as provenance, not as new input.
 - Before experimenting, make an untouched full-directory backup.
 
-For Windows candidate behavior, use `README_CANDIDATE_v0.4.0-rc3.md` and `docs/HSC1_v0.4.0-rc3_UAT.md`.
+For Windows candidate behavior, use `README_CANDIDATE_v0.4.0-rc4.md` and `docs/HSC1_v0.4.0-rc4_UAT.md`.

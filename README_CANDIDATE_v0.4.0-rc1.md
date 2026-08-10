@@ -1,6 +1,6 @@
 # LMA Studio v0.4.0-rc1 Candidate (superseded)
 
-This earlier candidate is retained only as a historical record. Do not use it for current HSC1 acceptance. Use `README_CANDIDATE_v0.4.0-rc3.md` and `docs/HSC1_v0.4.0-rc3_UAT.md` instead.
+This earlier candidate is retained only as a historical record. Do not use it for current HSC1 acceptance. Use `README_CANDIDATE_v0.4.0-rc4.md` and `docs/HSC1_v0.4.0-rc4_UAT.md` instead.
 
 This is a user-acceptance candidate, not a formal Release.
 

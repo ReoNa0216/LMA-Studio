@@ -86,7 +86,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.0-rc3"
+APP_VERSION = "lma_studio_v0.4.0-rc4"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -123,6 +123,16 @@ def request_cached_read(owner: Any, key: str, loader: Callable[[], Any]) -> Any:
     if cache_key not in values:
         values[cache_key] = loader()
     return values[cache_key]
+
+
+def invalidate_request_cached_reads(owner: Any, *keys: str) -> None:
+    """Drop request-local snapshots after a write without leaking across requests."""
+
+    values = getattr(_REQUEST_READ_SNAPSHOT, "values", None)
+    if values is None:
+        return
+    for key in keys:
+        values.pop((id(owner), str(key)), None)
 
 DEFAULT_WINDOW_MIN = 2.5
 MAX_TRACE_POINTS_PER_SERIES = 2200
@@ -3579,6 +3589,21 @@ class AnnotationStore:
         )
 
     def get(self, annotation_id: str) -> dict[str, Any] | None:
+        values = getattr(_REQUEST_READ_SNAPSHOT, "values", None)
+        if values is not None:
+            index = request_cached_read(
+                self,
+                "annotation_record_index",
+                lambda: {
+                    str(row.get("annotation_id") or ""): row
+                    for row in self.records()
+                },
+            )
+            row = index.get(str(annotation_id))
+            return copy.deepcopy(row) if row is not None else None
+        return self._get_uncached(annotation_id)
+
+    def _get_uncached(self, annotation_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM annotations WHERE annotation_id = ?", (annotation_id,)).fetchone()
             return self._decode_annotation_row(row) if row else None
@@ -3689,7 +3714,12 @@ class AnnotationStore:
                 )
             conn.execute("DELETE FROM annotations WHERE annotation_id = ?", (annotation_id,))
             conn.execute("DELETE FROM audit_events WHERE annotation_id = ?", (annotation_id,))
-            return {"annotation_id": annotation_id, "deleted": True, "source": "manual_created"}
+        invalidate_request_cached_reads(
+            self,
+            "annotation_records",
+            "annotation_record_index",
+        )
+        return {"annotation_id": annotation_id, "deleted": True, "source": "manual_created"}
 
     def upsert_review(
         self,
@@ -3751,6 +3781,11 @@ class AnnotationStore:
                 notes=notes,
             )
             self._insert_audit_row(conn, audit)
+        invalidate_request_cached_reads(
+            self,
+            "annotation_records",
+            "annotation_record_index",
+        )
         return current or {
             "annotation_id": annotation_id,
             "source": source,
@@ -6997,9 +7032,15 @@ class AppData:
             raise BadRequest("当前项目没有单细胞 event map")
         frozen = self.frozen_time_model()
         config = self.project_config()
+        annotations = [
+            row
+            for row in self.store.records()
+            if self.annotation_review_stage(row) != "qc_survey"
+            or self.qc_survey_matches_current_strategy(row, config=config)
+        ]
         state = project_annotation_state(
             self.cell_event_map,
-            self.store.records(),
+            annotations,
             active_time_model_version=(
                 str(frozen.get("time_model_version") or "") if frozen else None
             ),
@@ -7188,6 +7229,7 @@ class AppData:
             "review_status": "accepted",
             "exportable": True,
             "include_stages": ["qc_survey", "cell_annotation"],
+            "include_unannotated_event_map_rows_as_unknown": self.cell_event_map is not None,
             "calibration_evidence_policy": "sqlite_audit_only",
             "current_time_model_only_for_post_qc_and_cell": True,
             "active_time_model_version": active_version,
@@ -7244,6 +7286,36 @@ class AppData:
                 )
                 continue
             rows.append(self.export_row(row, stage=stage, export_id=export_id, exported_at=timestamp))
+        if self.cell_event_map is not None:
+            projected = self.projected_cell_event_map_state()
+            exported_event_ids = {
+                str(row.get("MS_event_id") or "")
+                for row in rows
+                if row.get("MS_event_id")
+            }
+            for point in projected.get("points", []):
+                event_id = str(point.get("ms_event_id") or "")
+                if not event_id or event_id in exported_event_ids:
+                    continue
+                classification = str(point.get("classification") or "unknown")
+                if classification == "conflict":
+                    raise BadRequest(
+                        "主 CSV 不能为同一 MS event 输出多个分类；请先解决 UMAP 中的标注冲突: "
+                        + event_id
+                    )
+                if classification != "unknown":
+                    raise BadRequest(
+                        "UMAP 中存在当前有效标注，但主 CSV 无法生成对应行，请重新打开项目后再导出: "
+                        + event_id
+                    )
+                rows.append(
+                    self.export_unknown_event_row(
+                        point,
+                        export_id=export_id,
+                        exported_at=timestamp,
+                    )
+                )
+                exported_event_ids.add(event_id)
         missing_cell_numbers = [
             str(row.get("annotation_id") or "")
             for row in rows
@@ -7263,6 +7335,7 @@ class AppData:
                 "同一 MS event 不能在主 CSV 中重复分类；请先仲裁这些 CellNumber: "
                 + ", ".join(duplicate_cell_numbers[:10])
             )
+        rows.sort(key=lambda row: str(row.get("CellNumber") or ""))
         columns = self.export_columns()
         buffer = io.StringIO()
         writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
@@ -7295,6 +7368,42 @@ class AppData:
             "skipped": skipped,
             "csv_text": csv_text,
         }
+
+    def export_unknown_event_row(
+        self,
+        point: dict[str, Any],
+        *,
+        export_id: str,
+        exported_at: str,
+    ) -> dict[str, Any]:
+        """Emit one compact roster row for an event without an accepted relation."""
+
+        row = self.export_row(
+            {
+                "annotation_id": None,
+                "source": None,
+                "review_status": None,
+                "candidate_type": "unannotated_event",
+                "ms_event_id": point.get("ms_event_id"),
+                "scan_id": point.get("scan_id"),
+                "ms_time_min": point.get("scan_start_time"),
+            },
+            stage="cell_annotation",
+            export_id=export_id,
+            exported_at=exported_at,
+        )
+        row.update(
+            {
+                "Type": "unknown",
+                "annotation_kind": None,
+                "review_stage": None,
+                "LIF_channel": None,
+                "LIF_peak_id": None,
+                "residual_sec": None,
+                "annotation_id": None,
+            }
+        )
+        return row
 
     def export_row(self, row: dict[str, Any], *, stage: str, export_id: str, exported_at: str) -> dict[str, Any]:
         candidate_type = self.infer_candidate_type(row)
@@ -8157,6 +8266,15 @@ class AppData:
         raise BadRequest(
             f"参考段边界尚未全部确认，不能{action}。"
             "请先查看原始峰形，再到“配置”确认每个参考段边界。"
+        )
+
+    def invalidate_qc_model_request_reads(self) -> None:
+        """Expose a QC-model invalidation immediately inside the current request."""
+
+        invalidate_request_cached_reads(
+            self,
+            "project_config",
+            "active_time_model",
         )
 
     def reset_to_automatic_qc_alignment(self) -> None:
@@ -9341,6 +9459,27 @@ class AppData:
         clear_qc_alignment_model: bool = False,
         defer_alignment_reset: bool = False,
     ) -> dict[str, Any]:
+        with request_read_snapshot():
+            return self._review_auto_candidate_from_request_snapshot(
+                annotation_id,
+                review_status,
+                window_start_min=window_start_min,
+                window_end_min=window_end_min,
+                time_mode=time_mode,
+                clear_qc_alignment_model=clear_qc_alignment_model,
+                defer_alignment_reset=defer_alignment_reset,
+            )
+
+    def _review_auto_candidate_from_request_snapshot(
+        self,
+        annotation_id: str,
+        review_status: str,
+        window_start_min: float | None = None,
+        window_end_min: float | None = None,
+        time_mode: str | None = None,
+        clear_qc_alignment_model: bool = False,
+        defer_alignment_reset: bool = False,
+    ) -> dict[str, Any]:
         payload = self.payload_from_auto_candidate_id(
             annotation_id,
             window_start_min=window_start_min,
@@ -9371,11 +9510,32 @@ class AppData:
             time_mode=time_mode,
             invalidate_qc_alignment_model=invalidate_qc_alignment,
         )
+        if invalidate_qc_alignment:
+            self.invalidate_qc_model_request_reads()
         if invalidate_qc_alignment and not defer_alignment_reset:
             self.reset_to_automatic_qc_alignment()
         return row
 
     def review_annotation(
+        self,
+        annotation_id: str,
+        review_status: str,
+        window_start_min: float | None = None,
+        window_end_min: float | None = None,
+        time_mode: str | None = None,
+        clear_qc_alignment_model: bool = False,
+    ) -> dict[str, Any]:
+        with request_read_snapshot():
+            return self._review_annotation_from_request_snapshot(
+                annotation_id,
+                review_status,
+                window_start_min=window_start_min,
+                window_end_min=window_end_min,
+                time_mode=time_mode,
+                clear_qc_alignment_model=clear_qc_alignment_model,
+            )
+
+    def _review_annotation_from_request_snapshot(
         self,
         annotation_id: str,
         review_status: str,
@@ -9424,6 +9584,7 @@ class AppData:
                 invalidate_qc_alignment_model=invalidate_qc_alignment,
             )
             if invalidate_qc_alignment:
+                self.invalidate_qc_model_request_reads()
                 self.reset_to_automatic_qc_alignment()
             return row
         return self.review_auto_candidate(
@@ -9671,6 +9832,7 @@ class AppData:
             invalidate_qc_alignment_model=invalidate_qc_alignment,
         )
         if invalidate_qc_alignment:
+            self.invalidate_qc_model_request_reads()
             self.reset_to_automatic_qc_alignment()
         return row
 
@@ -9778,6 +9940,7 @@ class AppData:
             invalidate_qc_alignment_model=invalidate_qc_alignment,
         )
         if invalidate_qc_alignment:
+            self.invalidate_qc_model_request_reads()
             self.reset_to_automatic_qc_alignment()
         return result
 
@@ -10151,6 +10314,7 @@ class AppData:
                 accepted.append(row)
         finally:
             if invalidate_qc_alignment and not self.store.qc_alignment_model():
+                self.invalidate_qc_model_request_reads()
                 self.reset_to_automatic_qc_alignment()
         return {
             "accepted_count": len(accepted),
@@ -10229,8 +10393,13 @@ class AppData:
         )
         return "qc_survey" if ms_time_float >= annotation_start else "qc_calibration"
 
-    def qc_survey_matches_current_strategy(self, row: dict[str, Any]) -> bool:
-        config = self.project_config()
+    def qc_survey_matches_current_strategy(
+        self,
+        row: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+    ) -> bool:
+        config = config or self.project_config()
         strategy = normalize_post_qc_strategy(
             config.get("post_qc_strategy"), self.acquisition_layout
         )
@@ -11125,15 +11294,24 @@ HTML = r"""<!doctype html>
     }
     .row-actions {
       display: flex;
+      flex-wrap: wrap;
       gap: 6px;
       margin-top: 6px;
+      min-width: 0;
     }
     .row-actions button, .small-button {
       height: 28px;
       min-width: 0;
+      max-width: 100%;
       padding: 0 8px;
       font-size: 12px;
       font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .row-actions button {
+      flex: 1 1 64px;
+      white-space: normal;
+      line-height: 1.15;
     }
     .small-button {
       white-space: nowrap;
@@ -11964,7 +12142,7 @@ HTML = r"""<!doctype html>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
       <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
-      <span id="exportHint" class="header-export-hint">主 CSV 仅含细胞与后段质控；前段参考记录留在项目审计库</span>
+      <span id="exportHint" class="header-export-hint">全部事件均导出；未标注为 unknown，前段 QC anchor 留在审计库</span>
       <button id="exportAcceptedCsv" class="header-export-button">导出细胞/质控主 CSV</button>
     </div>
   </header>
@@ -12038,6 +12216,10 @@ HTML = r"""<!doctype html>
         <label class="checkbox-row">
           <input id="showRejected" type="checkbox" />
           显示已拒绝候选
+        </label>
+        <label id="crossChannelConflictControl" class="checkbox-row" style="display:none;">
+          <input id="showCrossChannelConflicts" type="checkbox" />
+          <span id="crossChannelConflictHint">Show conflicts</span>
         </label>
         <button id="acceptWindow" class="small-button" style="width:100%; margin:8px 0 2px;">接受本窗口待审自动候选</button>
         <div id="acceptWindowHint" class="empty" style="margin:0 0 6px;">将接受 0 条</div>
@@ -12336,6 +12518,7 @@ HTML = r"""<!doctype html>
       current: null,
       selectedCandidateId: null,
       showRejected: false,
+      showCrossChannelConflicts: false,
       showWeakLifPeaks: false,
       manualMode: false,
       stage: 'qc_calibration',
@@ -12742,6 +12925,8 @@ HTML = r"""<!doctype html>
       state.stage = 'qc_calibration';
       state.eventFilter = 'all';
       state.manualAnnotationKind = 'qc';
+      state.showCrossChannelConflicts = false;
+      el('showCrossChannelConflicts').checked = false;
       state.showWeakLifPeaks = false;
       const weakToggle = el('showWeakLifPeaks');
       const detector = state.meta?.lif_peak_detection || {};
@@ -13371,7 +13556,7 @@ HTML = r"""<!doctype html>
     }
 
     function updateExportHint() {
-      el('exportHint').textContent = '主 CSV 仅含细胞与后段质控；前段参考记录留在项目审计库';
+      el('exportHint').textContent = '全部事件均导出；未标注为 unknown，前段 QC anchor 留在审计库';
     }
 
     function postQcModeLabel(mode) {
@@ -13499,12 +13684,18 @@ HTML = r"""<!doctype html>
       if (state.stage === 'event_annotation') {
         const qc = state.current.post_qc_counts || {};
         const cell = state.current.cell_counts || {};
+        const conflictPending = (state.current.cell_candidates || [])
+          .filter(isPendingCrossChannelConflict).length;
+        const visibleCell = {
+          ...cell,
+          pending: Math.max(0, Number(cell.pending || 0) - conflictPending),
+        };
         if (state.eventFilter === 'qc') return qc;
-        if (state.eventFilter === 'cell') return cell;
+        if (state.eventFilter === 'cell') return visibleCell;
         return {
-          pending: Number(qc.pending || 0) + Number(cell.pending || 0),
-          accepted: Number(qc.accepted || 0) + Number(cell.accepted || 0),
-          rejected: Number(qc.rejected || 0) + Number(cell.rejected || 0),
+          pending: Number(qc.pending || 0) + Number(visibleCell.pending || 0),
+          accepted: Number(qc.accepted || 0) + Number(visibleCell.accepted || 0),
+          rejected: Number(qc.rejected || 0) + Number(visibleCell.rejected || 0),
         };
       }
       return state.current.annotation_counts || {};
@@ -13567,6 +13758,52 @@ HTML = r"""<!doctype html>
       return points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xScale(p.x).toFixed(2)},${yScale(p.y).toFixed(2)}`).join(' ');
     }
 
+    function isPendingCrossChannelConflict(row) {
+      return row?.cross_channel_candidate_conflict === true
+        && String(row?.review_status || 'pending') === 'pending';
+    }
+
+    function pendingCrossChannelConflictGroups() {
+      if (state.stage !== 'event_annotation' || state.eventFilter === 'qc') return [];
+      const groups = new Map();
+      (state.current?.cell_candidates || [])
+        .filter(row => row?.cross_channel_candidate_conflict === true)
+        .forEach(row => {
+          const key = String(row.ms_event_id || '');
+          if (!key) return;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(row);
+        });
+      return Array.from(groups.entries())
+        .filter(([, rows]) => rows.some(isPendingCrossChannelConflict))
+        .map(([msEventId, rows]) => ({
+          ms_event_id: msEventId,
+          rows: rows.sort((a, b) => (
+            Number(a.abs_residual_sec || 0) - Number(b.abs_residual_sec || 0)
+            || String(a.lif_channel || '').localeCompare(String(b.lif_channel || ''))
+          )),
+        }))
+        .sort((a, b) => Number(a.rows[0]?.ms_plot_time_min || 0) - Number(b.rows[0]?.ms_plot_time_min || 0));
+    }
+
+    function visibleCellCandidates() {
+      return (state.current?.cell_candidates || []).filter(row => (
+        !isPendingCrossChannelConflict(row) || state.showCrossChannelConflicts
+      ));
+    }
+
+    function renderCrossChannelConflictControl() {
+      const groups = pendingCrossChannelConflictGroups();
+      const control = el('crossChannelConflictControl');
+      const visible = groups.length > 0;
+      control.style.display = visible ? 'flex' : 'none';
+      if (!visible) return;
+      const n = groups.length;
+      el('crossChannelConflictHint').textContent = state.showCrossChannelConflicts
+        ? `Show conflicts (${n})`
+        : `${n} ambiguous event${n === 1 ? '' : 's'} hidden`;
+    }
+
     function candidateRows() {
       let rows = [];
       if (state.stage === 'local_calibration') {
@@ -13574,7 +13811,7 @@ HTML = r"""<!doctype html>
       } else if (state.stage === 'event_annotation') {
         rows = [
           ...(state.current?.post_qc_candidates || []),
-          ...(state.current?.cell_candidates || []),
+          ...visibleCellCandidates().filter(row => !isPendingCrossChannelConflict(row)),
         ].filter(eventRowMatchesFilter);
       } else {
         rows = [...(state.current?.alignment_groups || [])];
@@ -14339,11 +14576,15 @@ HTML = r"""<!doctype html>
     function renderCandidateList() {
       const box = el('candidateList');
       const rows = candidateRows();
-      if (!rows.length) {
+      const conflictGroups = state.showCrossChannelConflicts
+        ? pendingCrossChannelConflictGroups()
+        : [];
+      renderCrossChannelConflictControl();
+      if (!rows.length && !conflictGroups.length) {
         box.innerHTML = '<div class="empty">当前窗口没有可显示候选。</div>';
         return;
       }
-      box.innerHTML = rows.map(row => {
+      const regularRowsHtml = rows.map(row => {
         const id = row.annotation_id || row.candidate_id;
         const selected = id === state.selectedCandidateId ? ' selected' : '';
         const rejected = row.review_status === 'rejected' ? ' rejected' : '';
@@ -14354,13 +14595,9 @@ HTML = r"""<!doctype html>
         const deviation = decisionDeviationSec(row);
         const canReview = row.review_enabled !== false && row.source !== 'preview';
         const displayStatus = row.review_enabled === false && row.review_status === 'pending' ? 'preview' : row.review_status;
-        const arbitrationNote = row.cross_channel_candidate_conflict
-          ? ` · 跨通道冲突：${(row.cross_channel_alternatives || []).map(item => channelDisplayLabel(item.lif_channel)).join(' / ')}，请选择唯一关系`
-          : '';
         const reviewNote = candidateNeedsIndividualReview(row) ? ' · 需逐条审核' : '';
-        const acceptLabel = row.cross_channel_candidate_conflict ? '选择此通道' : '接受';
         const actions = canReview ? `
-              <button data-action="accepted" data-id="${escapeText(id)}">${escapeText(acceptLabel)}</button>
+              <button data-action="accepted" data-id="${escapeText(id)}">接受</button>
               <button data-action="rejected" data-id="${escapeText(id)}">拒绝</button>
               ${row.source === 'auto_candidate' ? `<button data-action="pending" data-id="${escapeText(id)}">待审</button>` : ''}
               ${row.source === 'manual_created' ? `<button data-action="clear_manual" data-id="${escapeText(id)}">清除</button>` : ''}
@@ -14368,14 +14605,33 @@ HTML = r"""<!doctype html>
         return `
           <div class="candidate-row${selected}${rejected}" data-candidate-id="${escapeText(id)}">
             <div class="row-title"><span>${escapeText(sourceText(row.source))} #${escapeText(row.rank ?? '')}</span><span>${escapeText(statusText(displayStatus))}</span></div>
-            <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}${escapeText(arbitrationNote)}</div>
+            <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}</div>
             <div class="row-actions">${actions}</div>
           </div>
         `;
       }).join('');
+      const conflictRowsHtml = conflictGroups.map(group => {
+        const selected = group.rows.some(row => rowId(row) === state.selectedCandidateId) ? ' selected' : '';
+        const first = group.rows[0] || {};
+        const alternatives = group.rows.map(row => (
+          `${channelDisplayLabel(row.lif_channel)} Δ${fmt(decisionDeviationSec(row), 3)}s`
+        )).join(' · ');
+        const actions = group.rows.map(row => `
+          <button data-conflict-candidate-id="${escapeText(rowId(row))}">Use ${escapeText(row.lif_channel)}</button>
+        `).join('');
+        return `
+          <div class="candidate-row conflict-group${selected}" data-conflict-event-id="${escapeText(group.ms_event_id)}">
+            <div class="row-title"><span>Ambiguous event</span><span>Review only</span></div>
+            <div class="row-sub">MS760 ${escapeText(fmt(first.ms_time_min, 3))} min<br>${escapeText(alternatives)}</div>
+            <div class="row-actions">${actions}<button data-hide-conflicts="true">Hide</button></div>
+          </div>
+        `;
+      }).join('');
+      box.innerHTML = regularRowsHtml + conflictRowsHtml;
       box.querySelectorAll('.candidate-row').forEach(node => {
         node.addEventListener('click', (ev) => {
           if (ev.target && ev.target.dataset && ev.target.dataset.action) return;
+          if (!node.dataset.candidateId) return;
           state.selectedCandidateId = node.dataset.candidateId;
           renderCandidateList();
           draw();
@@ -14389,6 +14645,21 @@ HTML = r"""<!doctype html>
           } else {
             await reviewCandidate(button.dataset.id, button.dataset.action);
           }
+        });
+      });
+      box.querySelectorAll('button[data-conflict-candidate-id]').forEach(button => {
+        button.addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          await reviewCandidate(button.dataset.conflictCandidateId, 'accepted');
+        });
+      });
+      box.querySelectorAll('button[data-hide-conflicts]').forEach(button => {
+        button.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          state.showCrossChannelConflicts = false;
+          el('showCrossChannelConflicts').checked = false;
+          state.selectedCandidateId = null;
+          renderCurrentState();
         });
       });
     }
@@ -14414,6 +14685,11 @@ HTML = r"""<!doctype html>
       const invalidation = confirmQcEvidenceInvalidation(currentRow?.review_status || 'pending', reviewStatus);
       if (invalidation === null) return;
       state.actionBusy = true;
+      showInteractionHint(
+        reviewStatus === 'accepted' ? 'Accepting…'
+          : reviewStatus === 'rejected' ? 'Rejecting…'
+            : 'Updating…'
+      );
       try {
         await postJson('/api/review', {
           annotation_id: annotationId,
@@ -14425,6 +14701,11 @@ HTML = r"""<!doctype html>
         });
         state.qcRefitPreview = null;
         await loadWindow();
+        showInteractionHint(
+          reviewStatus === 'accepted' ? 'Accepted'
+            : reviewStatus === 'rejected' ? 'Rejected'
+              : 'Updated'
+        );
         notifyStateChannel();
       } catch (err) {
         alert(`审核写入失败: ${err.message}`);
@@ -14464,7 +14745,7 @@ HTML = r"""<!doctype html>
       try {
         const result = await postCsv('/api/export-accepted-csv', {});
         downloadTextFile(result.filename, result.text, 'text/csv;charset=utf-8');
-        hint.textContent = '主 CSV 已导出；前段参考记录仍保留在项目审计库';
+        hint.textContent = '主 CSV 已导出；未标注事件为 unknown，前段 QC anchor 留在审计库';
       } catch (err) {
         hint.textContent = '导出失败';
         alert(`导出失败: ${err.message}`);
@@ -14912,7 +15193,7 @@ HTML = r"""<!doctype html>
         rows.push(...(state.current?.post_qc_candidates || []));
         rows.push(...(state.current?.cell_qc_anchors || []));
       }
-      if (state.eventFilter !== 'qc') rows.push(...(state.current?.cell_candidates || []));
+      if (state.eventFilter !== 'qc') rows.push(...visibleCellCandidates());
       (state.current?.annotations || [])
         .filter(row => allowedEventIds.has(String(row.ms_event_id || '')))
         .filter(row => eventRowMatchesFilter(row))
@@ -15352,14 +15633,14 @@ HTML = r"""<!doctype html>
 
     function drawCellCandidates(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
-      (state.current.cell_candidates || []).forEach(row => {
+      visibleCellCandidates().forEach(row => {
         if (row.review_status === 'rejected') return;
         const lif = markerPositions[`lif:${row.lif_peak_id}`];
         const ms = markerPositions[`ms760:${row.ms_event_id}`];
         if (!lif || !ms) return;
         const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
-        const baseColor = row.cross_channel_candidate_conflict ? '#d97706' : colorForChannel(row.lif_channel);
         const accepted = row.review_status === 'accepted';
+        const baseColor = row.cross_channel_candidate_conflict && !accepted ? '#d97706' : colorForChannel(row.lif_channel);
         const line = svgEl('line', {
           x1: lif.x.toFixed(2),
           y1: lif.y.toFixed(2),
@@ -15728,6 +16009,8 @@ HTML = r"""<!doctype html>
       button.addEventListener('click', async () => {
         hideLineContextMenu();
         state.stage = button.dataset.stage;
+        state.showCrossChannelConflicts = false;
+        el('showCrossChannelConflicts').checked = false;
         resetManualSelection();
         state.manualMode = false;
         applyStageWindowWidth();
@@ -15758,6 +16041,12 @@ HTML = r"""<!doctype html>
       state.showRejected = el('showRejected').checked;
       renderCandidateList();
       draw();
+    });
+    el('showCrossChannelConflicts').addEventListener('change', () => {
+      hideLineContextMenu();
+      state.showCrossChannelConflicts = el('showCrossChannelConflicts').checked;
+      state.selectedCandidateId = null;
+      renderCurrentState();
     });
     el('showWeakLifPeaks').addEventListener('change', async () => {
       hideLineContextMenu();

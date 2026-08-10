@@ -1,4 +1,6 @@
-# LMA Studio v0.4.0-rc3 Candidate
+# LMA Studio v0.4.0-rc3 Candidate (superseded by rc4)
+
+Use `README_CANDIDATE_v0.4.0-rc4.md` for the current candidate. This file preserves rc3 evidence only.
 
 This is a Windows user-acceptance candidate, not a formal Release.
 

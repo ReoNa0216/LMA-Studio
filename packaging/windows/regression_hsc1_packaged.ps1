@@ -23,7 +23,7 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc3"
+    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_rc4"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
 $CopyProject = Join-Path $CopyRoot "HSC1"
@@ -323,6 +323,37 @@ try {
     if ($ActualHeader -cne $ExpectedHeader) {
         throw "HSC1 compact CSV header mismatch.`nExpected: $ExpectedHeader`nActual:   $ActualHeader"
     }
+    $CsvRows = @($Response.Content.TrimStart([char]0xFEFF) | ConvertFrom-Csv)
+    $ExpectedCsvRows = [int]$Manifest.cell_event_map.row_count
+    if ($CsvRows.Count -ne $ExpectedCsvRows) {
+        throw "HSC1 CSV is not a complete event roster: expected $ExpectedCsvRows rows, found $($CsvRows.Count)."
+    }
+    $CsvCellNumbers = @($CsvRows | ForEach-Object { [string]$_.CellNumber })
+    if (@($CsvCellNumbers | Where-Object { !$_ }).Count -ne 0) {
+        throw "HSC1 CSV contains a blank CellNumber."
+    }
+    if (@($CsvCellNumbers | Sort-Object -Unique).Count -ne $CsvRows.Count) {
+        throw "HSC1 CSV contains duplicate CellNumber values."
+    }
+    $UnknownRows = @($CsvRows | Where-Object { [string]$_.Type -eq "unknown" })
+    $InvalidUnknownRows = @(
+        $UnknownRows |
+            Where-Object {
+                [string]$_.annotation_kind -or
+                [string]$_.review_stage -or
+                [string]$_.LIF_channel -or
+                [string]$_.LIF_peak_id -or
+                [string]$_.residual_sec -or
+                [string]$_.annotation_id
+            }
+    )
+    if ($InvalidUnknownRows.Count -ne 0) {
+        throw "HSC1 unknown CSV rows must leave annotation-specific fields blank."
+    }
+    $QcRows = @($CsvRows | Where-Object { [string]$_.Type -eq "QC" })
+    if ($QcRows.Count -ne 0) {
+        throw "HSC1 post-QC is Off, but the current CSV still contains QC rows."
+    }
 
     # This smoke intentionally launches with a hidden window. A hidden pywebview
     # process has no MainWindowHandle for CloseMainWindow(), so terminate only the
@@ -371,6 +402,9 @@ try {
         Window50CellCandidates = @($Window50.cell_candidates).Count
         DeltaStatus = [string]$Delta.recommendation_status
         CsvHeaderColumns = ($ActualHeader -split ",").Count
+        CsvRosterRows = $CsvRows.Count
+        CsvUnknownRows = $UnknownRows.Count
+        CsvQcRows = $QcRows.Count
         ProjectStable = !$CopyWriteExercised
         CopyWriteIsolated = $CopyWriteExercised
         OriginalProjectStable = $true
