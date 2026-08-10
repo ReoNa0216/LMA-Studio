@@ -1617,6 +1617,38 @@ def qc_group_plot_times(group: dict[str, Any]) -> list[float]:
     return [float(value) for value in values if isinstance(value, (int, float))]
 
 
+def front_qc_group_belongs_to_window(
+    group: dict[str, Any],
+    window_start_min: float,
+    window_end_min: float,
+    *,
+    context_margin_min: float = WINDOW_CONTEXT_MARGIN_MIN,
+) -> bool:
+    """Assign a front-QC relation to the window containing its MS event.
+
+    A calibrated LIF peak and its MS event can legitimately straddle a display
+    boundary by a fraction of a second.  The MS event provides a stable,
+    one-dimensional owner for the review window; all related points must still
+    be inside the context that the UI actually loaded and displayed.
+    """
+
+    start = float(window_start_min)
+    end = float(window_end_min)
+    ms_plot_time = group.get("ms_plot_time_min")
+    if not isinstance(ms_plot_time, (int, float)):
+        ms_plot_time = group.get("ms_time_min")
+    if not isinstance(ms_plot_time, (int, float)):
+        return False
+    if not start <= float(ms_plot_time) <= end:
+        return False
+    plot_times = qc_group_plot_times(group)
+    if not plot_times:
+        return False
+    context_start = start - max(0.0, float(context_margin_min))
+    context_end = end + max(0.0, float(context_margin_min))
+    return all(context_start <= value <= context_end for value in plot_times)
+
+
 def qc_group_auto_accept_block_reason(group: dict[str, Any]) -> str | None:
     if group.get("axis_coherent") is False:
         return "axis_incoherent"
@@ -3732,6 +3764,11 @@ def user_facing_error_message(error: Any) -> str:
         ):
             return "开始时间、窗口宽度和预览 MS 时间差必须填写为数字。"
         return "时间参数必须填写为数字。"
+    if (
+        ("candidate_id" in lowered or any(prefix in lowered for prefix in ("auto_qc:", "post_qc:", "cell:")))
+        and any(token in lowered for token in ("unknown", "inactive", "active window"))
+    ):
+        return "该候选关系不属于当前图窗或已经过期，请刷新图窗后重新选择。"
     if re.search(r"(?i)\bv(?:0\.3|1|2)(?:\.\d+)*\b", message):
         return (
             "该项目的设置格式无法由当前软件安全读取。请保留原项目不变，"
@@ -8867,9 +8904,10 @@ class AppData:
             group = self.auto_group_by_id(annotation_id)
             active_start = float(window_start_min)
             active_end = float(window_end_min)
-            plot_times = qc_group_plot_times(group)
-            if not plot_times or not all(
-                active_start <= value <= active_end for value in plot_times
+            if not front_qc_group_belongs_to_window(
+                group,
+                active_start,
+                active_end,
             ):
                 raise BadRequest(
                     f"Unknown or inactive front-QC candidate_id in active window: {annotation_id}"
@@ -10375,8 +10413,12 @@ class AppData:
                 qc_review_rows,
             )
             for group, stored_review in reconciled_groups:
-                plot_times = qc_group_plot_times(group)
-                if plot_times and all(start_min <= t <= end_min for t in plot_times):
+                if front_qc_group_belongs_to_window(
+                    group,
+                    start_min,
+                    end_min,
+                    context_margin_min=WINDOW_CONTEXT_MARGIN_MIN,
+                ):
                     candidate = self.enrich_qc_candidate(
                         group,
                         post_qc=False,

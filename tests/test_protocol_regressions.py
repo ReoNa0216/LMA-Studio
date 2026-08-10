@@ -13,13 +13,16 @@ from annotation_app.app import (
     BadRequest,
     ProjectPaths,
     acquisition_layout_hash,
+    build_segmented_calibration_groups,
     calibration_protocol_from_manifest,
     calibration_protocol_hash,
+    candidate_id_for_group,
     normalize_acquisition_layout,
     normalize_calibration_protocol,
     normalize_post_qc_strategy,
     post_qc_strategy_hash,
     raw_file_fingerprint,
+    user_facing_error_message,
 )
 from scripts.v3.lif_peak_detection import (
     adaptive_lif_peak_detection,
@@ -239,6 +242,132 @@ def create_hsc_app(root: Path) -> AppData:
 
 
 class ProtocolRegressionTest(unittest.TestCase):
+    def test_front_qc_relation_straddling_window_start_belongs_to_ms_window(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = create_hsc_app(Path(tmp))
+            peak = lif_peak("G1", "g1_cross_boundary", 59.9)
+            peak.update(
+                {
+                    "peak_tier": "core",
+                    "height": 1.0,
+                    "raw": 1.0,
+                    "detector_version": 2,
+                    "detector_config_hash": "synthetic-current-standard",
+                }
+            )
+            lif_peaks = pd.DataFrame([peak])
+            ms_events = pd.DataFrame([ms_event("ms_cross_boundary", 36.1)])
+            qc_groups = build_segmented_calibration_groups(
+                lif_peaks,
+                ms_events,
+                calibration_protocol=app.calibration_protocol,
+                channel_time_axes={"G1": "green_axis", "G2": "green_axis"},
+                axis_shifts_sec={"green_axis": -24.0},
+            )
+            self.assertEqual(len(qc_groups["groups"]), 1)
+            group = qc_groups["groups"][0]
+            candidate_id = candidate_id_for_group(group)
+
+            alignment = copy.deepcopy(app.alignment)
+            alignment.update(
+                {
+                    "green_to_ms_shift_sec": -24.0,
+                    "axis_shifts_sec": {"green_axis": -24.0},
+                    "qc_groups": qc_groups,
+                }
+            )
+            object.__setattr__(app, "alignment", alignment)
+            object.__setattr__(app, "lif_peaks", lif_peaks)
+            object.__setattr__(app, "ms_events", ms_events)
+            object.__setattr__(
+                app,
+                "lif_traces",
+                pd.DataFrame(
+                    [
+                        {
+                            "channel": channel,
+                            "label": label,
+                            "detector": "green",
+                            "time_min": time_min,
+                            "raw": 0.0,
+                            "signal": 0.0,
+                        }
+                        for channel, label in (("G1", "LSK"), ("G2", "Lin-"))
+                        for time_min in (0.0, 2.0)
+                    ]
+                ),
+            )
+            object.__setattr__(
+                app,
+                "ms_scan",
+                pd.DataFrame(
+                    [
+                        {
+                            "scan_start_time_min": time_min,
+                            "pc34_760_max_intensity": 0.0,
+                            "qc_782_max_intensity": 0.0,
+                        }
+                        for time_min in (0.0, 2.0)
+                    ]
+                ),
+            )
+
+            # The aligned LIF point is 0.5983 min and the MS event is
+            # 0.6017 min.  The MS event owns the 0.60-1.60 review window;
+            # the LIF point is still visible in the loaded boundary context.
+            window = app.window(0.60, 1.0, "aligned")
+            self.assertEqual(
+                [row["candidate_id"] for row in window["alignment_groups"]],
+                [candidate_id],
+            )
+            self.assertFalse(window["alignment_groups"][0]["batch_accept_eligible"])
+            self.assertEqual(
+                window["alignment_groups"][0]["batch_accept_block_reason"],
+                "outside_main_window",
+            )
+            resolved = app.payload_from_auto_candidate_id(
+                candidate_id,
+                window_start_min=0.60,
+                window_end_min=1.60,
+            )
+            self.assertEqual(resolved["ms_event_id"], "ms_cross_boundary")
+
+            saved = app.create_manual_triplet(
+                None,
+                None,
+                "ms_cross_boundary",
+                stage="qc_calibration",
+                lif_anchor_peak_ids={"G1": "g1_cross_boundary"},
+                calibration_segment_id="lsk_reference",
+                window_start_min=0.60,
+                window_end_min=1.60,
+                time_mode="aligned",
+            )
+            self.assertEqual(saved["annotation_id"], candidate_id)
+            self.assertEqual(saved["review_status"], "accepted")
+
+            with self.assertRaisesRegex(BadRequest, "window|inactive"):
+                app.payload_from_auto_candidate_id(
+                    candidate_id,
+                    window_start_min=0.61,
+                    window_end_min=1.61,
+                )
+
+    def test_candidate_id_error_is_not_misreported_as_project_format_damage(self):
+        public = user_facing_error_message(
+            BadRequest(
+                "Unknown or inactive front-QC candidate_id in active window: "
+                "auto_qc:v2:deadbeef"
+            )
+        )
+
+        self.assertEqual(
+            public,
+            "该候选关系不属于当前图窗或已经过期，请刷新图窗后重新选择。",
+        )
+        self.assertNotIn("v2", public.lower())
+        self.assertNotIn("格式", public)
+
     def test_legacy_and_explicit_post_qc_matchers_have_distinct_hashes(self):
         layout = normalize_acquisition_layout(
             {
