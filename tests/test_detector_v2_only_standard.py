@@ -222,7 +222,7 @@ class DetectorV2OnlyPreprocessingContractTest(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps(protocol_payload(detector=None)), encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "lif_peak_detection|V3|v2"):
+            with self.assertRaisesRegex(ValueError, "缺少当前峰识别设置|新目录重建"):
                 project_protocol.load_project_protocol(root)
 
     def test_protocol_with_detector_v1_is_rejected(self):
@@ -235,7 +235,7 @@ class DetectorV2OnlyPreprocessingContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "旧峰识别|自适应双层|重新"):
+            with self.assertRaisesRegex(ValueError, "峰识别设置无效|重新创建"):
                 project_protocol.load_project_protocol(root)
 
     def test_low_level_default_is_adaptive_v2_not_v1(self):
@@ -269,7 +269,7 @@ class DetectorV2OnlyPreprocessingContractTest(unittest.TestCase):
                     ignore_cleanup_errors=True
                 ) as tmp:
                     root = Path(tmp)
-                    with self.assertRaisesRegex(ValueError, "protocol|V3|v2"):
+                    with self.assertRaisesRegex(ValueError, "缺少预处理设置|新的空目录"):
                         runner(root)
                     self.assertEqual(list(root.iterdir()), [])
         finally:
@@ -318,7 +318,7 @@ class DetectorV2OnlyPreprocessingContractTest(unittest.TestCase):
 
 class DetectorV2OnlyUiContractTest(unittest.TestCase):
     def test_candidate_version_and_new_project_ui_expose_one_standard(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.0")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.1-rc1")
         visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
         self.assertNotIn('id="importLifPeakDetectorVersion"', HTML)
         self.assertNotRegex(HTML, r"detector_version\s*:\s*1")

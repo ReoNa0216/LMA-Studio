@@ -273,6 +273,7 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
             ],
         )
         self.assertEqual(result["lif_detector_tiers"], ["core", "weak"])
+        self.assertEqual(result["project_storage_layout"], "portable_project")
 
     def test_windows_builder_prioritizes_selected_python_environment_dlls(self):
         script = (
@@ -292,6 +293,7 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("scripts/v3/lif_peak_detection.py", spec.replace("\\", "/"))
+        self.assertIn("scripts/v3/project_storage.py", spec.replace("\\", "/"))
 
         macos_spec = (
             Path(__file__).resolve().parents[1]
@@ -299,6 +301,10 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(
             "scripts/v3/lif_peak_detection.py",
+            macos_spec.replace("\\", "/"),
+        )
+        self.assertIn(
+            "scripts/v3/project_storage.py",
             macos_spec.replace("\\", "/"),
         )
 

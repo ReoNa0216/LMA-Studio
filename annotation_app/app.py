@@ -60,6 +60,21 @@ from scripts.v3.lif_peak_detection import (
     normalize_lif_peak_detection,
     require_active_lif_peak_detection,
 )
+from scripts.v3.project_storage import (
+    CANONICAL_ANNOTATION_DB_PATH,
+    CANONICAL_CELL_EVENT_MAP_PATH,
+    CANONICAL_EXPORTS_DIR,
+    CANONICAL_INPUT_MANIFEST_PATH,
+    CANONICAL_LIF_DIAGNOSTICS_DIR,
+    CANONICAL_MS_DIAGNOSTICS_DIR,
+    CANONICAL_PREPROCESSING_LOG_PATH,
+    CANONICAL_PREPROCESSING_REPORT_PATH,
+    CANONICAL_PROJECT_README_PATH,
+    CANONICAL_PROJECT_PROTOCOL_PATH,
+    CANONICAL_TABLE_PATHS,
+    canonical_storage_layout_manifest_entry,
+    manifest_uses_canonical_storage,
+)
 
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -86,7 +101,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.0"
+APP_VERSION = "lma_studio_v0.4.1-rc1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -219,6 +234,7 @@ REQUIRED_INTERMEDIATE_TABLES = {
     "ms_events": "data/interim/v3/02_ms_event_calling/v3_02_ms_events.parquet",
     "ms_scan_summary": "data/interim/v3/02_ms_event_calling/v3_02_ms_scan_summary.parquet",
 }
+REQUIRED_INTERMEDIATE_TABLE_KEYS = tuple(REQUIRED_INTERMEDIATE_TABLES)
 PROJECT_TABLE_BINDING_KEY = "project_table_binding"
 
 
@@ -312,6 +328,26 @@ class ProjectPaths:
             lif_peaks_path=pdir / REQUIRED_INTERMEDIATE_TABLES["lif_peaks"],
             ms_events_path=pdir / REQUIRED_INTERMEDIATE_TABLES["ms_events"],
             ms_scan_path=pdir / REQUIRED_INTERMEDIATE_TABLES["ms_scan_summary"],
+        )
+
+    @classmethod
+    def for_new_project(cls, project_dir: str | Path) -> "ProjectPaths":
+        """Construct paths for the current portable project layout.
+
+        Existing projects must continue through :meth:`from_args` and their
+        manifest.  Keeping this constructor explicit prevents opening an old
+        project from ever becoming an implicit migration.
+        """
+
+        pdir = Path(project_dir).expanduser().resolve()
+        return cls(
+            project_dir=pdir,
+            raw_data_dir=pdir / "raw_inputs",
+            annotation_db_path=pdir / CANONICAL_ANNOTATION_DB_PATH,
+            lif_traces_path=pdir / CANONICAL_TABLE_PATHS["lif_traces"],
+            lif_peaks_path=pdir / CANONICAL_TABLE_PATHS["lif_peaks"],
+            ms_events_path=pdir / CANONICAL_TABLE_PATHS["ms_events"],
+            ms_scan_path=pdir / CANONICAL_TABLE_PATHS["ms_scan_summary"],
         )
 
 
@@ -1367,8 +1403,17 @@ def write_project_manifest(
     post_qc_strategy: dict[str, Any] | None = None,
     annotation_config: dict[str, Any] | None = None,
     lif_peak_detection: dict[str, Any] | None = None,
+    annotation_db_path: str = "annotation_app/annotations/annotation.sqlite",
+    storage_layout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     binding = project_table_binding(intermediate_tables) if intermediate_tables else {}
+    resolved_annotation_db = manifest_entry_path(
+        project_dir,
+        {"path": annotation_db_path},
+    )
+    annotation_db_relative = resolved_annotation_db.relative_to(
+        project_dir.resolve()
+    ).as_posix()
     layout = normalize_acquisition_layout(acquisition_layout, identities=channel_identity_prior)
     if calibration_protocol is None:
         legacy_channels = list(layout.get("qc_anchor_channels") or [])
@@ -1459,12 +1504,14 @@ def write_project_manifest(
         "intermediate_tables": intermediate_tables or {},
         "project_table_binding": binding,
         "annotation_db": {
-            "path": "annotation_app/annotations/annotation.sqlite",
+            "path": annotation_db_relative,
             "schema_version": PROJECT_SCHEMA_VERSION,
         },
         "channel_identity_prior": prior_values,
         "updated_at": now_iso(),
     }
+    if storage_layout is not None:
+        manifest["storage_layout"] = copy.deepcopy(storage_layout)
     if cell_event_map is not None:
         manifest["cell_event_map"] = copy.deepcopy(cell_event_map)
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -1559,11 +1606,15 @@ def build_raw_input_project_records(
                 "encoding_or_format": "ASCII mzML-like text export" if key == "ms" else "UTF-16 LE tab-delimited text",
             }
         )
-        manifest_inputs[key] = {
+        manifest_entry = {
             "path": path_value,
             "path_mode": mode,
-            "original_source_path": str(source_path.resolve()),
         }
+        if mode == RAW_INPUT_MODE_EXTERNAL:
+            manifest_entry["original_source_path"] = str(source_path.resolve())
+        else:
+            manifest_entry["original_source_name"] = source_path.name
+        manifest_inputs[key] = manifest_entry
     return rows, manifest_inputs, layout
 
 
@@ -2176,6 +2227,18 @@ def validate_distinct_lif_input_files(lif_inputs: list[dict[str, Any]]) -> dict[
     for index, item in enumerate(lif_inputs, start=1):
         key = str(item.get("key") or f"lif_{index}").strip()
         channel = str(item.get("channel") or f"LIF {index}").strip().upper()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", key):
+            raise BadRequest(
+                f"{channel} 的输入标识无效；只能使用字母、数字、点、下划线或连字符"
+            )
+        reserved_stem = key.split(".", 1)[0].upper()
+        windows_reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+        if key.casefold() == "ms" or key.endswith(".") or reserved_stem in windows_reserved:
+            raise BadRequest(f"{channel} 的输入标识与系统保留名称冲突，请重新添加该 LIF 输入")
         key_identity = key.casefold()
         previous_key_channel = seen_keys.get(key_identity)
         if previous_key_channel is not None:
@@ -2217,7 +2280,15 @@ def manifest_entry_path(project_dir: Path, entry: dict[str, Any]) -> Path:
     if not raw_path:
         raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} contains an entry without path")
     path = Path(raw_path).expanduser()
-    return path.resolve() if path.is_absolute() else (project_dir / path).resolve()
+    if path.is_absolute() or path.drive or any(":" in part for part in path.parts):
+        raise BadRequest("项目运行文件必须使用项目内相对路径，不能引用项目外文件")
+    root = project_dir.resolve()
+    resolved = (root / path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise BadRequest("项目运行文件路径越出项目目录") from exc
+    return resolved
 
 
 def assert_matching_fingerprint(path: Path, expected: dict[str, Any], label: str, *, require_sha256: bool = False) -> None:
@@ -2232,9 +2303,60 @@ def assert_matching_fingerprint(path: Path, expected: dict[str, Any], label: str
             raise BadRequest(f"{label} 与 {PROJECT_MANIFEST_FILENAME} 记录不一致: {key}")
 
 
+def validate_project_runtime_paths(
+    project_dir: Path,
+    manifest: dict[str, Any] | None,
+) -> None:
+    """Preflight every mutable/runtime artifact before any table I/O."""
+
+    if not manifest:
+        return
+    raw_storage_layout = manifest.get("storage_layout")
+    canonical_layout = False
+    if raw_storage_layout is not None:
+        try:
+            canonical_layout = manifest_uses_canonical_storage(manifest)
+        except (TypeError, ValueError):
+            canonical_layout = False
+        if not canonical_layout:
+            raise BadRequest("项目目录布局声明无效或不受当前软件支持")
+    tables = manifest.get("intermediate_tables")
+    if not isinstance(tables, dict):
+        raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} intermediate_tables 必须是对象")
+    for key in REQUIRED_INTERMEDIATE_TABLE_KEYS:
+        entry = tables.get(key)
+        if not isinstance(entry, dict):
+            raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} intermediate_tables.{key} 必须是对象")
+        if canonical_layout:
+            declared = str(entry.get("path") or "").replace("\\", "/")
+            if declared != str(CANONICAL_TABLE_PATHS[key]).replace("\\", "/"):
+                raise BadRequest("项目目录布局声明与数据文件路径不一致")
+        manifest_entry_path(project_dir, entry)
+    annotation_db = manifest.get("annotation_db")
+    if not isinstance(annotation_db, dict) or not annotation_db.get("path"):
+        raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} annotation_db 路径缺失")
+    if canonical_layout and str(annotation_db["path"]).replace("\\", "/") != str(
+        CANONICAL_ANNOTATION_DB_PATH
+    ).replace("\\", "/"):
+        raise BadRequest("项目目录布局声明与标注数据库路径不一致")
+    manifest_entry_path(project_dir, {"path": annotation_db["path"]})
+    event_map = manifest.get("cell_event_map")
+    if canonical_layout and not isinstance(event_map, dict):
+        raise BadRequest("项目目录布局声明缺少事件坐标表")
+    if event_map is not None:
+        if not isinstance(event_map, dict):
+            raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} cell_event_map 必须是对象")
+        if canonical_layout and str(event_map.get("path") or "").replace(
+            "\\", "/"
+        ) != str(CANONICAL_CELL_EVENT_MAP_PATH).replace("\\", "/"):
+            raise BadRequest("项目目录布局声明与事件坐标表路径不一致")
+        manifest_entry_path(project_dir, event_map)
+
+
 def validate_project_manifest_against_files(project_dir: Path, manifest: dict[str, Any] | None) -> None:
     if not manifest:
         return
+    validate_project_runtime_paths(project_dir, manifest)
     if int(manifest.get("project_schema_version", PROJECT_SCHEMA_VERSION)) > PROJECT_SCHEMA_VERSION:
         raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} schema 版本高于当前软件支持版本")
     intermediate_tables = manifest.get("intermediate_tables", {})
@@ -2261,8 +2383,10 @@ def project_with_manifest_paths(project: ProjectPaths, manifest: dict[str, Any] 
     annotation_db_path = project.annotation_db_path
     annotation_db = manifest.get("annotation_db", {})
     if isinstance(annotation_db, dict) and annotation_db.get("path"):
-        raw_db_path = Path(str(annotation_db["path"])).expanduser()
-        annotation_db_path = raw_db_path.resolve() if raw_db_path.is_absolute() else (project.project_dir / raw_db_path).resolve()
+        annotation_db_path = manifest_entry_path(
+            project.project_dir,
+            {"path": annotation_db["path"]},
+        )
     return replace(
         project,
         annotation_db_path=annotation_db_path,
@@ -2573,6 +2697,9 @@ def assert_no_legacy_annotation_state(db_path: Path) -> None:
 def assert_new_project_target_is_clean(project_dir: Path, existing_outputs: list[Path]) -> None:
     blocked_paths = [
         project_manifest_path(project_dir),
+        project_dir / CANONICAL_ANNOTATION_DB_PATH,
+        project_dir / CANONICAL_INPUT_MANIFEST_PATH,
+        project_dir / CANONICAL_PROJECT_PROTOCOL_PATH,
         project_dir / "annotation_app/annotations/annotation.sqlite",
         project_dir / "annotation_app/annotations/annotation_state.json",
         project_dir / "results/tables/v3/00_allowed_inputs.csv",
@@ -2718,13 +2845,21 @@ class AnnotationStore:
         self._init_db()
         self._migrate_legacy_json_if_needed()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -3137,7 +3272,12 @@ class AnnotationStore:
             {**row, "payload_json": payload_json, "event_json": event_json},
         )
 
-    def record_input_manifest(self, paths: dict[str, Path]) -> None:
+    def record_input_manifest(
+        self,
+        paths: dict[str, Path],
+        *,
+        project_dir: Path | None = None,
+    ) -> None:
         timestamp = now_iso()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -3159,7 +3299,11 @@ class AnnotationStore:
                     """,
                     (
                         key,
-                        display_path(path),
+                        (
+                            project_relative_or_absolute(path, project_dir).replace("\\", "/")
+                            if project_dir is not None
+                            else display_path(path)
+                        ),
                         int(stat.st_size),
                         int(stat.st_mtime_ns),
                         timestamp,
@@ -6948,7 +7092,8 @@ class AppData:
                     "lif_peaks": project.lif_peaks_path,
                     "ms_events": project.ms_events_path,
                     "ms_scan_summary": project.ms_scan_path,
-                }
+                },
+                project_dir=project.project_dir,
             )
         return cls(
             project=project,
@@ -7209,7 +7354,11 @@ class AppData:
         manifest = copy.deepcopy(self.manifest or read_project_manifest(self.project.project_dir))
         if not manifest:
             raise BadRequest("旧项目必须先建立 lifms_project.json 才能附加 event map")
-        destination = self.project.project_dir / CELL_EVENT_MAP_RELATIVE_PATH
+        destination = self.project.project_dir / (
+            CANONICAL_CELL_EVENT_MAP_PATH
+            if manifest_uses_canonical_storage(manifest)
+            else CELL_EVENT_MAP_RELATIVE_PATH
+        )
         if destination.exists():
             raise BadRequest("项目中已存在未登记的 canonical event map，拒绝覆盖")
         try:
@@ -7813,7 +7962,7 @@ class AppData:
             source_raw_paths[key] = Path(item["path"]).expanduser().resolve()
         if not IS_FROZEN and project_dir == ROOT:
             raise BadRequest("项目保存路径不能使用当前代码仓库根目录；请新建独立项目目录")
-        raw_file_fingerprint(source_raw_paths["ms"])
+        source_ms_fingerprint = raw_file_fingerprint(source_raw_paths["ms"])
         if not _staging_build:
             if cell_event_map_path is None:
                 raise BadRequest(
@@ -7822,11 +7971,11 @@ class AppData:
             cell_event_map_path = cell_event_map_path.expanduser().resolve()
             raw_file_fingerprint(cell_event_map_path, full_hash_limit_bytes=None)
             existing_outputs = [
-                project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_traces"],
-                project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_peaks"],
-                project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_events"],
-                project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_scan_summary"],
-                project_dir / CELL_EVENT_MAP_RELATIVE_PATH,
+                project_dir / CANONICAL_TABLE_PATHS["lif_traces"],
+                project_dir / CANONICAL_TABLE_PATHS["lif_peaks"],
+                project_dir / CANONICAL_TABLE_PATHS["ms_events"],
+                project_dir / CANONICAL_TABLE_PATHS["ms_scan_summary"],
+                project_dir / CANONICAL_CELL_EVENT_MAP_PATH,
             ]
             assert_new_project_target_is_clean(project_dir, existing_outputs)
             target_preexisted = project_dir.exists()
@@ -7835,6 +7984,7 @@ class AppData:
             intended_parent = project_dir.parent
             intended_parent.mkdir(parents=True, exist_ok=True)
             staging_dir = intended_parent / f".{project_dir.name}.lma-building-{uuid.uuid4().hex}"
+            published = False
             try:
                 cls.create_project_from_raw_inputs(
                     project_dir=staging_dir,
@@ -7855,29 +8005,30 @@ class AppData:
                     project_dir,
                     target_preexisted=target_preexisted,
                 )
+                published = True
+                return cls.load(ProjectPaths.for_new_project(project_dir))
             except Exception:
                 if staging_dir.exists():
                     remove_staging_project(staging_dir, intended_parent)
+                if published and project_dir.exists():
+                    rollback_dir = intended_parent / (
+                        f".{project_dir.name}.lma-building-rollback-{uuid.uuid4().hex}"
+                    )
+                    os.replace(project_dir, rollback_dir)
+                    remove_staging_project(rollback_dir, intended_parent)
+                    if target_preexisted:
+                        project_dir.mkdir(parents=False, exist_ok=False)
                 raise
-            return cls.load(
-                ProjectPaths.from_args(
-                    project_dir=str(project_dir),
-                    raw_data_dir=str(project_dir / "raw_inputs"),
-                    annotation_db=str(
-                        project_dir / "annotation_app/annotations/annotation.sqlite"
-                    ),
-                )
-            )
         existing_outputs = [
-            project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_traces"],
-            project_dir / REQUIRED_INTERMEDIATE_TABLES["lif_peaks"],
-            project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_events"],
-            project_dir / REQUIRED_INTERMEDIATE_TABLES["ms_scan_summary"],
+            project_dir / CANONICAL_TABLE_PATHS["lif_traces"],
+            project_dir / CANONICAL_TABLE_PATHS["lif_peaks"],
+            project_dir / CANONICAL_TABLE_PATHS["ms_events"],
+            project_dir / CANONICAL_TABLE_PATHS["ms_scan_summary"],
         ]
         assert_new_project_target_is_clean(project_dir, existing_outputs)
 
         project_dir.mkdir(parents=True, exist_ok=True)
-        lock_dir = project_dir / "results/tables/v3"
+        lock_dir = (project_dir / CANONICAL_INPUT_MANIFEST_PATH).parent
         lock_dir.mkdir(parents=True, exist_ok=True)
         identities = {
             str(item.get("channel") or "").strip().upper(): str(item.get("identity_prior") or "")
@@ -7984,17 +8135,20 @@ class AppData:
                     + ", ".join(changed_during_copy)
                 )
         locked_rows = []
+        effective_ms_path: Path | None = None
+        effective_ms_fingerprint: dict[str, Any] | None = None
         input_id_to_key = {str(row["input_id"]): key for key, row in zip([str(item.get("key")) for item in lif_inputs], rows) if row["input_class"] == "raw_lif_trace"}
         input_id_to_key["ms_raw_txt"] = "ms"
         for row in rows:
             raw_path = Path(row["path"])
             full_path = raw_path if raw_path.is_absolute() else project_dir / raw_path
             path_key = os.path.normcase(str(full_path.resolve()))
-            fp = (
-                effective_lif_fingerprints[path_key]
-                if row["input_class"] == "raw_lif_trace"
-                else raw_file_fingerprint(full_path)
-            )
+            if row["input_class"] == "raw_lif_trace":
+                fp = effective_lif_fingerprints[path_key]
+            else:
+                fp = raw_file_fingerprint(full_path)
+                effective_ms_path = full_path
+                effective_ms_fingerprint = fp
             manifest_raw_inputs[input_id_to_key[str(row["input_id"])]].update(fp)
             locked_rows.append(
                 {
@@ -8004,13 +8158,30 @@ class AppData:
                 }
             )
         allowed = pd.DataFrame(locked_rows)
-        # V3-01/V3-02 currently check this exact historical stage string.
-        script_allowed = allowed.copy()
-        script_allowed["allowed_stage"] = "V3-01~V3-06 main workflow"
-        script_allowed.to_csv(lock_dir / "00_allowed_inputs.csv", index=False)
-        allowed.to_csv(lock_dir / "00_imported_raw_inputs.csv", index=False)
+        if mode == RAW_INPUT_MODE_COPY:
+            if effective_ms_fingerprint is None:
+                raise BadRequest("项目输入清单缺少复制后的 MS 原始文件")
+            copy_stability_keys = (
+                "size_bytes",
+                "mtime_iso",
+                "head_sha256_1mb",
+                "tail_sha256_1mb",
+                "sha256",
+            )
+            if any(
+                source_ms_fingerprint.get(key) not in (None, "")
+                and effective_ms_fingerprint.get(key)
+                != source_ms_fingerprint.get(key)
+                for key in copy_stability_keys
+            ):
+                raise BadRequest(
+                    "MS 原始文件在复制期间发生变化；请确认采集或导出已经结束，"
+                    "再在新的空目录中创建项目"
+                )
+        allowed.to_csv(project_dir / CANONICAL_INPUT_MANIFEST_PATH, index=False)
         preprocessing_protocol = {
             "schema_version": PROJECT_SCHEMA_VERSION,
+            "storage_layout": canonical_storage_layout_manifest_entry(),
             "calibration_protocol": effective_protocol,
             "post_qc_strategy": effective_post_qc_strategy,
             "lif_peak_detection": effective_lif_peak_detection,
@@ -8020,12 +8191,11 @@ class AppData:
                 "local_delta_seed_window_min": float(local_delta_seed_window_min),
             },
         }
-        (lock_dir / "00_project_protocol.json").write_text(
+        (project_dir / CANONICAL_PROJECT_PROTOCOL_PATH).write_text(
             json.dumps(preprocessing_protocol, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        (project_dir / "reports").mkdir(parents=True, exist_ok=True)
-        (project_dir / "reports/import_project.md").write_text(
+        (project_dir / CANONICAL_PREPROCESSING_REPORT_PATH).write_text(
             "\n".join(
                 [
                     "# 标注项目导入记录",
@@ -8033,7 +8203,7 @@ class AppData:
                     f"导入时间：`{now_iso()}`",
                     "",
                     f"- 本导入只锁定 {len(lif_inputs)} 个用户配置的 LIF 原始文件和 1 个 MS 原始文件。",
-                    "- 不读取作者 CSV、h5ad、manual、V2/archive 输入。",
+                    "- 不读取作者标签、人工结果或任何下游注释作为峰识别依据。",
                     "- 生成的中间表用于浏览器人工标注；后续时间校正和 annotation 由软件内人工审核完成。",
                     f"- 前段校准参考通道：`{' + '.join(effective_protocol['reference_channels'])}`。",
                     (
@@ -8044,11 +8214,16 @@ class AppData:
                             else "当前为项目级待确认草稿，只可用于峰形浏览，尚未用于时间对齐。"
                         )
                     ),
-                    f"- 后段 QC 策略：`{effective_post_qc_strategy['mode']}`。",
+                    "- 后段 QC 策略：`"
+                    + {
+                        "disabled": "Off",
+                        "signature": "QC signature",
+                        "scheduled_windows": "Scheduled windows",
+                    }.get(effective_post_qc_strategy["mode"], "按项目设置")
+                    + "`。",
                     (
                         "- LIF 峰检测："
-                        f"`v{effective_lif_peak_detection['detector_version']} "
-                        f"{effective_lif_peak_detection['profile']}`；"
+                        "使用当前自适应双层峰识别标准；"
                         "weak 峰仅供人工复核，不参与自动匹配或时间模型训练。"
                     ),
                     f"- 事件标注起点：`{effective_annotation_start_min:g} min`。",
@@ -8063,21 +8238,78 @@ class AppData:
             + "\n",
             encoding="utf-8",
         )
+        (project_dir / CANONICAL_PROJECT_README_PATH).write_text(
+            "\n".join(
+                [
+                    "# LMA Studio 项目",
+                    "",
+                    "这个文件夹包含可直接打开的标注项目。分享时请压缩并发送整个文件夹；",
+                    "项目文件夹可以整体重命名或移动，打开时选择新的项目根目录即可。",
+                    "复制、重命名或压缩项目前，请先关闭 LMA Studio，避免数据库仍在写入。",
+                    (
+                        "当前项目已复制原始输入，可在 `raw_inputs/` 中保留重跑所需文件。"
+                        if mode == RAW_INPUT_MODE_COPY
+                        else "当前项目不包含原始 LIF/MS 文件；接收方可以打开、查看、继续标注和导出，"
+                        "若要从原始数据重跑前处理，需另行提供原始 LIF/MS 文件。"
+                    ),
+                    "",
+                    "## 目录说明",
+                    "",
+                    "- `data/`：软件显示与匹配所需的 LIF、MS 和事件坐标数据。",
+                    "- `annotations/`：人工标注、时间模型和导出结果。",
+                    "- `provenance/`：原始输入清单、项目参数和前处理记录，用于复现与审计。",
+                    "- `diagnostics/`：峰识别与 MS event 识别的质量检查图表；不代表细胞或 QC 身份。",
+                    "- `raw_inputs/`：仅在创建项目时选择“复制原始文件”才会出现。",
+                    "- `lifms_project.json`：项目索引与完整性绑定。",
+                    "",
+                    "## 请勿这样做",
+                    "",
+                    "不要单独移动、重命名、替换或编辑上述目录内的文件；这会破坏项目完整性绑定。",
+                    "若只想更改项目名称，请重命名最外层的整个项目文件夹。",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for diagnostics_dir in (
+            CANONICAL_LIF_DIAGNOSTICS_DIR,
+            CANONICAL_MS_DIAGNOSTICS_DIR,
+        ):
+            (project_dir / diagnostics_dir).mkdir(parents=True, exist_ok=True)
 
         scripts = [
-            "run_v3_01_lif_trace_physical_qc.py",
-            "run_v3_02_ms_event_calling.py",
+            ("run_v3_01_lif_trace_physical_qc.py", "LIF 峰识别与质量检查"),
+            ("run_v3_02_ms_event_calling.py", "MS event 识别与质量检查"),
         ]
         log_lines = []
-        for script in scripts:
+        for script, display_name in scripts:
             try:
                 script_output = run_preprocessing_script(script, project_dir)
-                log_lines.append(f"$ in-process {script} --project-dir {project_dir}\n{script_output}")
+                log_lines.append(f"## {display_name}\n{script_output}")
             except Exception as exc:
-                log_lines.append(f"$ in-process {script} --project-dir {project_dir}\n{type(exc).__name__}: {exc}")
-                (project_dir / "reports/import_preprocess.log").write_text("\n\n".join(log_lines), encoding="utf-8")
-                raise BadRequest(f"前处理失败：{script}\n{str(exc)[-4000:]}") from exc
-        (project_dir / "reports/import_preprocess.log").write_text("\n\n".join(log_lines), encoding="utf-8")
+                log_lines.append(f"## {display_name}\n{type(exc).__name__}: {exc}")
+                (project_dir / CANONICAL_PREPROCESSING_LOG_PATH).write_text("\n\n".join(log_lines), encoding="utf-8")
+                raise BadRequest(f"{display_name}失败：\n{str(exc)[-4000:]}") from exc
+        (project_dir / CANONICAL_PREPROCESSING_LOG_PATH).write_text("\n\n".join(log_lines), encoding="utf-8")
+        if effective_ms_path is None or effective_ms_fingerprint is None:
+            raise BadRequest("项目输入清单缺少可验证的 MS 原始文件")
+        final_ms_fingerprint = raw_file_fingerprint(effective_ms_path)
+        ms_stability_keys = (
+            "size_bytes",
+            "mtime_iso",
+            "head_sha256_1mb",
+            "tail_sha256_1mb",
+            "sha256",
+        )
+        if any(
+            effective_ms_fingerprint.get(key) not in (None, "")
+            and final_ms_fingerprint.get(key) != effective_ms_fingerprint.get(key)
+            for key in ms_stability_keys
+        ):
+            raise BadRequest(
+                "MS 原始文件在前处理期间发生变化；请确认采集或导出已经结束，"
+                "再在新的空目录中创建项目"
+            )
         final_fingerprints = validate_distinct_lif_input_files(effective_lif_inputs)
         changed_channels = [
             str(item["channel"])
@@ -8104,7 +8336,7 @@ class AppData:
                 pd.read_parquet(existing_outputs[2]),
                 tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
             )
-            canonical_path = project_dir / CELL_EVENT_MAP_RELATIVE_PATH
+            canonical_path = project_dir / CANONICAL_CELL_EVENT_MAP_PATH
             write_canonical_map(canonical_map, canonical_path)
             map_manifest_entry = cell_event_map_manifest_entry(
                 canonical_path=canonical_path,
@@ -8128,15 +8360,24 @@ class AppData:
                 "annotation_start_min": effective_annotation_start_min,
                 "local_delta_seed_window_min": float(local_delta_seed_window_min),
             },
+            annotation_db_path=CANONICAL_ANNOTATION_DB_PATH,
+            storage_layout=canonical_storage_layout_manifest_entry(),
         )
 
-        project = ProjectPaths.from_args(
-            project_dir=str(project_dir),
-            raw_data_dir=str(raw_data_dir),
-            annotation_db=str(project_dir / "annotation_app/annotations/annotation.sqlite"),
-        )
+        project = ProjectPaths.for_new_project(project_dir)
         if _staging_build:
-            return validate_staged_project_artifacts(project)
+            resolved = validate_staged_project_artifacts(project)
+            staged_app = cls.load(resolved)
+            expected_binding = project_table_binding(
+                intermediate_table_fingerprints(staged_app.project)
+            )
+            stored_binding = read_sqlite_project_binding(
+                staged_app.project.annotation_db_path
+            )
+            if stored_binding != expected_binding:
+                raise BadRequest("staging annotation.sqlite 未完成中间表绑定")
+            (project_dir / CANONICAL_EXPORTS_DIR).mkdir(parents=True, exist_ok=True)
+            return staged_app.project
         return cls.load(project)
 
     def channel_shift_sec(self, channel: str, time_mode: str) -> float:
@@ -12377,8 +12618,8 @@ HTML = r"""<!doctype html>
       <details id="importProjectTemplates" class="project-template-options">
         <summary>可选：实验配置模板</summary>
         <div class="project-template-body">
-          <button id="applyHsc1Preset" type="button" class="small-button secondary">应用 HSC1 模板</button>
-          <span>HSC1：G1/LSK → G2/Lin−，两者自动共享绿色信号时间轴；事件起点 24 min；不进行后段质控巡检。参考窗口仍须由你确认。</span>
+          <button id="applyLinLskExample" type="button" class="small-button secondary">应用 Lin− / LSK 示例</button>
+          <span>Lin− / LSK 示例配置：G1/LSK → G2/Lin−，两者自动共享绿色信号时间轴；事件起点 24 min；不进行后段质控巡检。参考窗口仍须由你确认。</span>
         </div>
       </details>
       <div class="import-grid">
@@ -13706,7 +13947,7 @@ HTML = r"""<!doctype html>
       if (mode === 'scheduled_windows') {
         return 'QC 时间已知：仅在填写的时间窗口内寻找，减少误匹配。';
       }
-      return '后段没有再次注入 QC 时使用；HSC1 选择 Off。';
+      return '后段没有再次注入 QC 时使用；Lin− / LSK 示例选择 Off。';
     }
 
     function physicalAxisName(axis) {
@@ -16406,7 +16647,7 @@ HTML = r"""<!doctype html>
       const field = event.target.dataset.cfgScheduledField;
       if (field) windowRow[field] = event.target.value;
     });
-    el('applyHsc1Preset').addEventListener('click', () => {
+    el('applyLinLskExample').addEventListener('click', () => {
       state.importSuggestionRevision += 1;
       state.importRows = [
         newImportLifRow({ channel: 'G1', identity_prior: 'LSK', detector: 'green', use_for_cell_annotation: true }),
@@ -16425,7 +16666,7 @@ HTML = r"""<!doctype html>
       renderImportSegments();
       renderImportPostQcControls();
       el('importSuggestionStatus').textContent = '选择 G1/G2 原始文件后，可点击“分析已选 LIF 并建议窗口”；建议不会自动确认。';
-      el('importHint').textContent = '已应用 HSC1 科学角色；G1/G2 将自动共享绿色信号时间轴。请选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
+      el('importHint').textContent = '已应用 Lin− / LSK 示例角色；G1/G2 将自动共享绿色信号时间轴。请选择原始文件，并根据本项目峰形核对、确认两个参考段边界。';
     });
     document.querySelectorAll('[data-event-filter]').forEach(button => {
       button.addEventListener('click', () => {

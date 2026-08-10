@@ -44,9 +44,11 @@ UMAP_HTML = r"""<!doctype html>
     .spacer { flex: 1; }
     .time-search {
       display: inline-flex;
+      flex-wrap: wrap;
       align-items: center;
       gap: 5px;
       min-width: 0;
+      max-width: 100%;
       white-space: nowrap;
     }
     .time-search label { font-size: 12px; font-weight: 650; }
@@ -60,8 +62,8 @@ UMAP_HTML = r"""<!doctype html>
       font: inherit;
     }
     .time-search input:focus { outline: 2px solid rgba(47,111,237,.18); border-color: #2f6fed; }
-    .time-value { width: 94px; }
-    .time-tolerance { width: 72px; }
+    .time-value { width: 9rem; min-width: 12ch; }
+    .time-tolerance { width: 5.5rem; min-width: 8ch; }
     .time-status { min-width: 0; max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 11px; }
     .compact-button { width: auto; padding: 0 9px; font-size: 12px; font-weight: 650; white-space: nowrap; }
     .legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 12px; font-size: 12px; }
@@ -124,12 +126,14 @@ UMAP_HTML = r"""<!doctype html>
     }
     .tooltip strong { display: block; margin-bottom: 2px; }
     .tooltip .muted { color: var(--muted); overflow-wrap: anywhere; }
+    @media (max-width: 980px) {
+      .time-search { order: 2; width: 100%; flex-wrap: wrap; }
+      .time-status { max-width: none; }
+    }
     @media (max-width: 760px) {
       .toolbar { align-items: flex-start; flex-wrap: wrap; }
       .legend { order: 3; width: 100%; justify-content: flex-start; }
       .identity { max-width: 45vw; }
-      .time-search { order: 2; width: 100%; flex-wrap: wrap; }
-      .time-status { max-width: none; }
     }
   </style>
 </head>

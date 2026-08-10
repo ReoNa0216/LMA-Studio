@@ -342,6 +342,14 @@ def check_scientific_runtime() -> dict[str, Any]:
     # touching a project or the filesystem.
     import numpy as np
     import pandas as pd
+    from scripts.v3.project_storage import (
+        CANONICAL_STORAGE_LAYOUT_NAME,
+        canonical_storage_layout_manifest_entry,
+    )
+
+    storage_layout = canonical_storage_layout_manifest_entry()
+    if storage_layout.get("name") != CANONICAL_STORAGE_LAYOUT_NAME:
+        raise RuntimeError("Bundled project storage contract is unavailable")
 
     lif_module = loaded_scripts["run_v3_01_lif_trace_physical_qc.py"]
     time_sec = np.linspace(0.0, 1.0, 1001)
@@ -392,6 +400,7 @@ def check_scientific_runtime() -> dict[str, Any]:
         "sqlite_version": str(sqlite3.sqlite_version),
         "preprocessing_scripts": script_names,
         "lif_detector_tiers": detector_tiers,
+        "project_storage_layout": str(storage_layout["name"]),
     }
 
 

@@ -174,7 +174,7 @@ class DetectorV2ManifestContractTest(unittest.TestCase):
             root = Path(tmp)
             before = sorted(path.relative_to(root) for path in root.rglob("*"))
 
-            with self.assertRaisesRegex(ValueError, "protocol|V3|v1|v2"):
+            with self.assertRaisesRegex(ValueError, "缺少预处理设置|新的空目录"):
                 project_protocol.load_project_protocol(root)
 
             after = sorted(path.relative_to(root) for path in root.rglob("*"))

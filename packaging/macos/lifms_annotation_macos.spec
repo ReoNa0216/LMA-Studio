@@ -24,6 +24,7 @@ def production_submodule(name):
 datas = [
     (str(repo_root / "scripts/v3/lif_peak_detection.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/project_protocol.py"), "scripts/v3"),
+    (str(repo_root / "scripts/v3/project_storage.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_01_lif_trace_physical_qc.py"), "scripts/v3"),
     (str(repo_root / "scripts/v3/run_v3_02_ms_event_calling.py"), "scripts/v3"),
 ]

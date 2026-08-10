@@ -23,10 +23,10 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_HSC1_v040"
+    Join-Path $TempBase "LMAStudioProjectRegression_Lin_LSK_v041rc1"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
-$CopyProject = Join-Path $CopyRoot "HSC1"
+$CopyProject = Join-Path $CopyRoot "Lin-_LSK"
 
 function Test-SafeRegressionRoot([string]$Path) {
     $FullPath = [IO.Path]::GetFullPath($Path)

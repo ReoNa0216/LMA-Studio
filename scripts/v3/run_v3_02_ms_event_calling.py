@@ -31,6 +31,19 @@ except ModuleNotFoundError:  # Direct execution from scripts/v3.
         phase_role_from_labels,
     )
 
+try:
+    from scripts.v3.project_storage import (
+        CANONICAL_INPUT_MANIFEST_PATH,
+        CANONICAL_MS_DIAGNOSTICS_DIR,
+        project_uses_canonical_storage,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from project_storage import (  # type: ignore[no-redef]
+        CANONICAL_INPUT_MANIFEST_PATH,
+        CANONICAL_MS_DIAGNOSTICS_DIR,
+        project_uses_canonical_storage,
+    )
+
 
 ROOT = Path.cwd()
 STEP = "02_ms_event_calling"
@@ -41,6 +54,8 @@ OUT_TABLE = ROOT / "results/tables/v3" / STEP
 OUT_FIG = ROOT / "results/figures/v3" / STEP
 OUT_QC = ROOT / "results/qc/v3" / STEP
 OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
+CANONICAL_STORAGE = False
+EXPECTED_ALLOWED_STAGE = "V3-01~V3-06 main workflow"
 
 TOLERANCE_PPM = 10.0
 PSEUDOCOUNT = 1.0
@@ -77,19 +92,78 @@ def configure_project_root(
     *,
     allow_unbound_module_default: bool = False,
 ) -> Path:
-    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT, PROJECT_PHASE_POLICY
+    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT
+    global PROJECT_PHASE_POLICY, CANONICAL_STORAGE, EXPECTED_ALLOWED_STAGE
     ROOT = Path(project_dir).expanduser().resolve()
-    INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
-    OUT_DATA = ROOT / "data/interim/v3" / STEP
-    OUT_TABLE = ROOT / "results/tables/v3" / STEP
-    OUT_FIG = ROOT / "results/figures/v3" / STEP
-    OUT_QC = ROOT / "results/qc/v3" / STEP
-    OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
+    CANONICAL_STORAGE = project_uses_canonical_storage(ROOT)
+    if CANONICAL_STORAGE:
+        INPUT_LOCK = ROOT / CANONICAL_INPUT_MANIFEST_PATH
+        OUT_DATA = ROOT / "data"
+        OUT_TABLE = ROOT / CANONICAL_MS_DIAGNOSTICS_DIR
+        OUT_FIG = OUT_TABLE
+        OUT_QC = OUT_TABLE
+        OUT_REPORT = OUT_TABLE / "report.md"
+        EXPECTED_ALLOWED_STAGE = "main annotation preprocessing"
+    else:
+        INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
+        OUT_DATA = ROOT / "data/interim/v3" / STEP
+        OUT_TABLE = ROOT / "results/tables/v3" / STEP
+        OUT_FIG = ROOT / "results/figures/v3" / STEP
+        OUT_QC = ROOT / "results/qc/v3" / STEP
+        OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
+        EXPECTED_ALLOWED_STAGE = "V3-01~V3-06 main workflow"
     PROJECT_PHASE_POLICY = load_project_protocol(
         ROOT,
         allow_unbound_module_default=allow_unbound_module_default,
     )
     return ROOT
+
+
+def output_name(legacy_name: str, portable_name: str) -> str:
+    return portable_name if CANONICAL_STORAGE else legacy_name
+
+
+def project_output_label(path: Path) -> str:
+    return path.relative_to(ROOT).as_posix()
+
+
+def portable_diagnostic_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a user-facing diagnostic copy without historical pipeline terms.
+
+    The caller's internal variable names remain untouched so the scientific
+    algorithm and legacy output schema stay stable.  Only the new portable
+    project's optional diagnostic CSV/report vocabulary is simplified.
+    """
+
+    def friendly_text(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        return (
+            value.replace("main V3-02 MS event caller", "primary MS event caller")
+            .replace("quiet platform", "background estimation")
+            .replace("quiet_", "background_")
+            .replace("V3-02", "MS event recognition")
+            .replace("V3-01", "LIF peak recognition")
+            .replace("V2", "retired workflow")
+        )
+
+    renamed = {}
+    for column in frame.columns:
+        if column == "selected_as_quiet_platform":
+            renamed[column] = "selected_for_background_estimation"
+        else:
+            renamed[column] = str(friendly_text(str(column)))
+    result = frame.copy(deep=True).rename(columns=renamed)
+    for column in result.columns:
+        if pd.api.types.is_object_dtype(result[column]) or isinstance(
+            result[column].dtype, pd.StringDtype
+        ):
+            result[column] = result[column].map(friendly_text)
+    return result
+
+
+def diagnostic_output_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    return portable_diagnostic_frame(frame) if CANONICAL_STORAGE else frame
 
 RE_INDEX = re.compile(r"^\s*index:\s*(\d+)")
 RE_SCAN_ID = re.compile(r"id:\s*scanId=(\d+)")
@@ -157,7 +231,7 @@ def assert_first_principles_path(path: Path) -> None:
     text = str(path)
     for part in FORBIDDEN_PATH_PARTS:
         if part in text:
-            raise ValueError(f"V3-02 forbidden input path detected: {path}")
+            raise ValueError(f"MS 前处理检测到禁止使用的输入路径: {path}")
 
 
 def resolve_project_input_path(value: str) -> Path:
@@ -174,14 +248,14 @@ def project_display_path(path: Path) -> str:
 
 def load_ms_path() -> Path:
     if not INPUT_LOCK.exists():
-        raise FileNotFoundError(f"Run V3-00 first; missing {INPUT_LOCK}")
+        raise FileNotFoundError(f"项目缺少 input manifest: {INPUT_LOCK}")
     allowed = pd.read_csv(INPUT_LOCK)
     ms = allowed[allowed["input_class"].eq("raw_ms_spectra")].copy()
     if len(ms) != 1:
-        raise ValueError(f"Expected exactly 1 raw MS input from V3-00, found {len(ms)}")
+        raise ValueError(f"项目必须且只能包含 1 个原始 MS 输入，实际为 {len(ms)}")
     row = ms.iloc[0]
-    if str(row["allowed_stage"]) != "V3-01~V3-06 main workflow":
-        raise ValueError(f"V3-02 received non-main-workflow MS input: {row['allowed_stage']}")
+    if str(row["allowed_stage"]) != EXPECTED_ALLOWED_STAGE:
+        raise ValueError(f"MS 输入不属于当前工作流: {row['allowed_stage']}")
     path = resolve_project_input_path(str(row["path"]))
     assert_first_principles_path(path)
     current = file_fingerprint(path)
@@ -192,9 +266,9 @@ def load_ms_path() -> Path:
         current_value = current[col]
         if col == "size_bytes":
             if int(current_value) != int(locked):
-                raise ValueError(f"V3-02 input fingerprint mismatch for {path}: {col}")
+                raise ValueError(f"MS 输入指纹不一致 {path}: {col}")
         elif str(locked) and str(current_value) != str(locked):
-            raise ValueError(f"V3-02 input fingerprint mismatch for {path}: {col}")
+            raise ValueError(f"MS 输入指纹不一致 {path}: {col}")
     return path
 
 
@@ -757,7 +831,7 @@ def build_strategy_comparison(pc34_events: pd.DataFrame, tic_events: pd.DataFram
                 "support_count_within_0p75sec": "",
                 "support_fraction": "",
                 "median_abs_support_delta_sec": "",
-                "role": "main V3-02 MS event caller",
+                "role": "primary MS event caller",
             },
             {
                 "strategy": "TIC-only",
@@ -944,8 +1018,19 @@ def plot_ms_overview(scan: pd.DataFrame, events: pd.DataFrame, quiet_bins: pd.Da
         draw_project_phase_boundaries(ax)
         for _, row in quiet_bins.iterrows():
             ax.axvspan(row["start_min"], row["end_min"], color="#d9f99d", alpha=0.18, lw=0)
-    fig.suptitle("V3-02 MS traces, PC34 events, and quiet platform", y=0.995)
-    save_png(fig, OUT_FIG / "v3_02_ms_trace_event_overview.png")
+    fig.suptitle(
+        "MS traces, PC34 events, and background-estimation bins"
+        if CANONICAL_STORAGE
+        else "V3-02 MS traces, PC34 events, and quiet platform",
+        y=0.995,
+    )
+    save_png(
+        fig,
+        OUT_FIG / output_name(
+            "v3_02_ms_trace_event_overview.png",
+            "trace_event_overview.png",
+        ),
+    )
 
 
 def plot_event_qc(events: pd.DataFrame) -> None:
@@ -961,8 +1046,17 @@ def plot_event_qc(events: pd.DataFrame) -> None:
     axes[2].axvline(COLLISION_GAP_SEC, color="black", lw=0.8, ls="--")
     axes[2].set_xlabel("nearest event gap (sec)")
     axes[2].set_ylabel("event count")
-    fig.suptitle("V3-02 compact MS event QC", y=1.03)
-    save_png(fig, OUT_FIG / "v3_02_ms_event_qc_distributions.png")
+    fig.suptitle(
+        "MS event QC" if CANONICAL_STORAGE else "V3-02 compact MS event QC",
+        y=1.03,
+    )
+    save_png(
+        fig,
+        OUT_FIG / output_name(
+            "v3_02_ms_event_qc_distributions.png",
+            "event_qc_distributions.png",
+        ),
+    )
 
 
 def write_report(
@@ -973,17 +1067,29 @@ def write_report(
     support_audit: pd.DataFrame,
     event_qc: pd.DataFrame,
 ) -> None:
+    title = "# MS 信号与 event 识别报告" if CANONICAL_STORAGE else "# V3-02 MS trace physical QC and event calling"
+    input_statement = (
+        "- 本步骤只读取项目 input manifest 锁定的原始 MS 文件；没有读取作者标签、人工补峰或下游注释。"
+        if CANONICAL_STORAGE
+        else "- 本步骤只读取 V3-00 锁定的 raw MS txt；没有读取作者 CSV、h5ad、人工补峰、LIF peak 或任何 V2 输出。"
+    )
+    marker_statement = (
+        "- PC34/760.5851 和 782.5616 是项目声明的预指定 marker 先验；它们不是作者标签，也不来自下游注释。"
+        if CANONICAL_STORAGE
+        else "- PC34/760.5851 和 782.5616 是 V3-00 中声明的预指定 marker 先验；它们不是作者标签，也不来自 h5ad/UMAP/downstream feature。"
+    )
+    background_score_column = "background_score" if CANONICAL_STORAGE else "quiet_score"
     lines = [
-        "# V3-02 MS trace physical QC and event calling",
+        title,
         "",
         "## 结论",
         "",
-        "- 本步骤只读取 V3-00 锁定的 raw MS txt；没有读取作者 CSV、h5ad、人工补峰、LIF peak 或任何 V2 输出。",
-        "- PC34/760.5851 和 782.5616 是 V3-00 中声明的预指定 marker 先验；它们不是作者标签，也不来自 h5ad/UMAP/downstream feature。",
+        input_statement,
+        marker_statement,
         f"- 阶段语义来自项目协议：`{phase_boundaries_min(PROJECT_PHASE_POLICY)}`；前段参考窗口、未分配间隙和 annotation region 被分别报告。",
         "- scan summary 从原始 MS 文本流式解析，提取 PC34/760、782/QC marker、TIC、array length、scan time 和 m/z 命中误差。",
         "- 主 event caller 使用 PC34/760 extracted trace；TIC-only 和 PC34+TIC 只作为 MS-only 对照，不参与身份标注。",
-        "- 阈值来自 MS 自身 quiet platform 的背景和峰状尖刺上沿，不使用作者 event list 调参。",
+        "- 阈值来自 MS 自身的局部低信号背景与峰状尖刺上沿，不使用作者 event list 调参。",
         "",
         "## scan summary",
         "",
@@ -993,9 +1099,21 @@ def write_report(
         "",
         md_table(params_table),
         "",
-        "## quiet platform bins",
+        "## 背景估计时间分箱",
         "",
-        md_table(quiet_bins[["start_min", "end_min", "positive_scan_fraction", "scan_p99", "localmax_p99", "quiet_score"]], max_rows=20),
+        md_table(
+            quiet_bins[
+                [
+                    "start_min",
+                    "end_min",
+                    "positive_scan_fraction",
+                    "scan_p99",
+                    "localmax_p99",
+                    background_score_column,
+                ]
+            ],
+            max_rows=20,
+        ),
         "",
         "## 策略对照",
         "",
@@ -1013,18 +1131,18 @@ def write_report(
         "",
         "## 输出文件",
         "",
-        "- `data/interim/v3/02_ms_event_calling/v3_02_ms_scan_summary.parquet`",
-        "- `data/interim/v3/02_ms_event_calling/v3_02_ms_events.parquet`",
-        "- `results/tables/v3/02_ms_event_calling/v3_02_event_calling_qc.csv`",
-        "- `results/tables/v3/02_ms_event_calling/v3_02_strategy_comparison.csv`",
-        "- `results/tables/v3/02_ms_event_calling/v3_02_pc34_support_audit.csv`",
-        "- `results/figures/v3/02_ms_event_calling/v3_02_ms_trace_event_overview.png`",
-        "- `results/figures/v3/02_ms_event_calling/v3_02_ms_event_qc_distributions.png`",
+        f"- `{project_output_label(OUT_DATA / output_name('v3_02_ms_scan_summary.parquet', 'ms_scan_summary.parquet'))}`",
+        f"- `{project_output_label(OUT_DATA / output_name('v3_02_ms_events.parquet', 'ms_events.parquet'))}`",
+        f"- `{project_output_label(OUT_TABLE / output_name('v3_02_event_calling_qc.csv', 'event_calling_qc.csv'))}`",
+        f"- `{project_output_label(OUT_TABLE / output_name('v3_02_strategy_comparison.csv', 'strategy_comparison.csv'))}`",
+        f"- `{project_output_label(OUT_TABLE / output_name('v3_02_pc34_support_audit.csv', 'pc34_support_audit.csv'))}`",
+        f"- `{project_output_label(OUT_FIG / output_name('v3_02_ms_trace_event_overview.png', 'trace_event_overview.png'))}`",
+        f"- `{project_output_label(OUT_FIG / output_name('v3_02_ms_event_qc_distributions.png', 'event_qc_distributions.png'))}`",
         "",
         "## 下一步 gate",
         "",
-        "- 如果 PC34 event calling 的 quiet platform、峰宽、collision/low-quality 风险可解释，则进入 V3-03 QC-only time model。",
-        "- 如果 V3-03 发现 QC anchor 与 MS event 不连续，应先回到本步骤检查 PC34/782/TIC 的 MS-only evidence，而不是读取作者标签。",
+        "- 如果 PC34 event 的背景估计、峰宽和碰撞/低质量风险可解释，则可进入软件内时间校正。",
+        "- 如果后续 QC anchor 与 MS event 不连续，应先回到本步骤检查 PC34/782/TIC 的 MS-only evidence，而不是读取作者标签。",
     ]
     OUT_REPORT.parent.mkdir(parents=True, exist_ok=True)
     OUT_REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1076,27 +1194,78 @@ def run(project_dir: str | Path | None = None) -> None:
     support_audit = build_pc34_support_audit(pc34_events, tic_events)
     event_qc = build_event_qc(pc34_events, strategy_comparison, pc34_params)
 
-    scan.to_parquet(OUT_DATA / "v3_02_ms_scan_summary.parquet", index=False)
-    pc34_events.to_parquet(OUT_DATA / "v3_02_ms_events.parquet", index=False)
-    tic_events.to_parquet(OUT_QC / "v3_02_tic_only_events.parquet", index=False)
-    scan_summary.to_csv(OUT_TABLE / "v3_02_scan_summary_qc.csv", index=False)
-    params_table.to_csv(OUT_TABLE / "v3_02_event_calling_parameters.csv", index=False)
-    quiet_bins.to_csv(OUT_TABLE / "v3_02_pc34_quiet_platform_bins.csv", index=False)
-    pc34_bin_summary.to_csv(OUT_QC / "v3_02_pc34_bin_summary.csv", index=False)
-    tic_quiet_bins.to_csv(OUT_QC / "v3_02_tic_quiet_platform_bins.csv", index=False)
-    tic_bin_summary.to_csv(OUT_QC / "v3_02_tic_bin_summary.csv", index=False)
-    strategy_comparison.to_csv(OUT_TABLE / "v3_02_strategy_comparison.csv", index=False)
-    support_audit.to_csv(OUT_TABLE / "v3_02_pc34_support_audit.csv", index=False)
-    event_qc.to_csv(OUT_TABLE / "v3_02_event_calling_qc.csv", index=False)
+    diagnostic_frames = {
+        "scan_summary": diagnostic_output_frame(scan_summary),
+        "params_table": diagnostic_output_frame(params_table),
+        "quiet_bins": diagnostic_output_frame(quiet_bins),
+        "pc34_bin_summary": diagnostic_output_frame(pc34_bin_summary),
+        "tic_quiet_bins": diagnostic_output_frame(tic_quiet_bins),
+        "tic_bin_summary": diagnostic_output_frame(tic_bin_summary),
+        "strategy_comparison": diagnostic_output_frame(strategy_comparison),
+        "support_audit": diagnostic_output_frame(support_audit),
+        "event_qc": diagnostic_output_frame(event_qc),
+    }
+
+    scan_path = OUT_DATA / output_name("v3_02_ms_scan_summary.parquet", "ms_scan_summary.parquet")
+    events_path = OUT_DATA / output_name("v3_02_ms_events.parquet", "ms_events.parquet")
+    scan.to_parquet(scan_path, index=False)
+    pc34_events.to_parquet(events_path, index=False)
+    tic_events.to_parquet(
+        OUT_QC / output_name("v3_02_tic_only_events.parquet", "tic_only_events.parquet"),
+        index=False,
+    )
+    diagnostic_frames["scan_summary"].to_csv(
+        OUT_TABLE / output_name("v3_02_scan_summary_qc.csv", "scan_summary.csv"),
+        index=False,
+    )
+    diagnostic_frames["params_table"].to_csv(
+        OUT_TABLE / output_name("v3_02_event_calling_parameters.csv", "event_calling_parameters.csv"),
+        index=False,
+    )
+    diagnostic_frames["quiet_bins"].to_csv(
+        OUT_TABLE / output_name("v3_02_pc34_quiet_platform_bins.csv", "background_estimation_bins.csv"),
+        index=False,
+    )
+    diagnostic_frames["pc34_bin_summary"].to_csv(
+        OUT_QC / output_name("v3_02_pc34_bin_summary.csv", "pc34_bin_summary.csv"),
+        index=False,
+    )
+    diagnostic_frames["tic_quiet_bins"].to_csv(
+        OUT_QC / output_name("v3_02_tic_quiet_platform_bins.csv", "tic_background_estimation_bins.csv"),
+        index=False,
+    )
+    diagnostic_frames["tic_bin_summary"].to_csv(
+        OUT_QC / output_name("v3_02_tic_bin_summary.csv", "tic_bin_summary.csv"),
+        index=False,
+    )
+    diagnostic_frames["strategy_comparison"].to_csv(
+        OUT_TABLE / output_name("v3_02_strategy_comparison.csv", "strategy_comparison.csv"),
+        index=False,
+    )
+    diagnostic_frames["support_audit"].to_csv(
+        OUT_TABLE / output_name("v3_02_pc34_support_audit.csv", "pc34_support_audit.csv"),
+        index=False,
+    )
+    diagnostic_frames["event_qc"].to_csv(
+        OUT_TABLE / output_name("v3_02_event_calling_qc.csv", "event_calling_qc.csv"),
+        index=False,
+    )
 
     plot_ms_overview(scan, pc34_events, quiet_bins, pc34_params)
     plot_event_qc(pc34_events)
-    write_report(scan_summary, params_table, quiet_bins, strategy_comparison, support_audit, event_qc)
+    write_report(
+        diagnostic_frames["scan_summary"],
+        diagnostic_frames["params_table"],
+        diagnostic_frames["quiet_bins"],
+        diagnostic_frames["strategy_comparison"],
+        diagnostic_frames["support_audit"],
+        diagnostic_frames["event_qc"],
+    )
 
-    print(f"Wrote {OUT_DATA / 'v3_02_ms_scan_summary.parquet'}")
-    print(f"Wrote {OUT_DATA / 'v3_02_ms_events.parquet'}")
-    print(f"Wrote {OUT_TABLE / 'v3_02_event_calling_qc.csv'}")
-    print(f"Wrote {OUT_REPORT}")
+    print(f"Wrote {project_output_label(scan_path)}")
+    print(f"Wrote {project_output_label(events_path)}")
+    print(f"Wrote {project_output_label(OUT_TABLE / output_name('v3_02_event_calling_qc.csv', 'event_calling_qc.csv'))}")
+    print(f"Wrote {project_output_label(OUT_REPORT)}")
 
 
 def parse_args() -> argparse.Namespace:

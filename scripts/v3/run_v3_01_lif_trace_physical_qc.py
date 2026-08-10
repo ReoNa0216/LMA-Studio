@@ -44,6 +44,19 @@ except ModuleNotFoundError:  # Direct execution from scripts/v3.
         phase_role_from_labels,
     )
 
+try:
+    from scripts.v3.project_storage import (
+        CANONICAL_INPUT_MANIFEST_PATH,
+        CANONICAL_LIF_DIAGNOSTICS_DIR,
+        project_uses_canonical_storage,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from project_storage import (  # type: ignore[no-redef]
+        CANONICAL_INPUT_MANIFEST_PATH,
+        CANONICAL_LIF_DIAGNOSTICS_DIR,
+        project_uses_canonical_storage,
+    )
+
 
 ROOT = Path.cwd()
 STEP = "01_lif_trace_physical_qc"
@@ -54,6 +67,8 @@ OUT_TABLE = ROOT / "results/tables/v3" / STEP
 OUT_FIG = ROOT / "results/figures/v3" / STEP
 OUT_QC = ROOT / "results/qc/v3" / STEP
 OUT_REPORT = ROOT / "reports/v3/01_lif_trace_physical_qc.md"
+CANONICAL_STORAGE = False
+EXPECTED_ALLOWED_STAGE = "V3-01~V3-06 main workflow"
 
 BASE_WINDOW_SEC = 60.0
 BASE_Q = 0.10
@@ -92,19 +107,39 @@ def configure_project_root(
     *,
     allow_unbound_module_default: bool = False,
 ) -> Path:
-    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT, PROJECT_PHASE_POLICY
+    global ROOT, INPUT_LOCK, OUT_DATA, OUT_TABLE, OUT_FIG, OUT_QC, OUT_REPORT
+    global PROJECT_PHASE_POLICY, CANONICAL_STORAGE, EXPECTED_ALLOWED_STAGE
     ROOT = Path(project_dir).expanduser().resolve()
-    INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
-    OUT_DATA = ROOT / "data/interim/v3" / STEP
-    OUT_TABLE = ROOT / "results/tables/v3" / STEP
-    OUT_FIG = ROOT / "results/figures/v3" / STEP
-    OUT_QC = ROOT / "results/qc/v3" / STEP
-    OUT_REPORT = ROOT / "reports/v3/01_lif_trace_physical_qc.md"
+    CANONICAL_STORAGE = project_uses_canonical_storage(ROOT)
+    if CANONICAL_STORAGE:
+        INPUT_LOCK = ROOT / CANONICAL_INPUT_MANIFEST_PATH
+        OUT_DATA = ROOT / "data"
+        OUT_TABLE = ROOT / CANONICAL_LIF_DIAGNOSTICS_DIR
+        OUT_FIG = OUT_TABLE
+        OUT_QC = OUT_TABLE
+        OUT_REPORT = OUT_TABLE / "report.md"
+        EXPECTED_ALLOWED_STAGE = "main annotation preprocessing"
+    else:
+        INPUT_LOCK = ROOT / "results/tables/v3/00_allowed_inputs.csv"
+        OUT_DATA = ROOT / "data/interim/v3" / STEP
+        OUT_TABLE = ROOT / "results/tables/v3" / STEP
+        OUT_FIG = ROOT / "results/figures/v3" / STEP
+        OUT_QC = ROOT / "results/qc/v3" / STEP
+        OUT_REPORT = ROOT / "reports/v3/01_lif_trace_physical_qc.md"
+        EXPECTED_ALLOWED_STAGE = "V3-01~V3-06 main workflow"
     PROJECT_PHASE_POLICY = load_project_protocol(
         ROOT,
         allow_unbound_module_default=allow_unbound_module_default,
     )
     return ROOT
+
+
+def output_name(legacy_name: str, portable_name: str) -> str:
+    return portable_name if CANONICAL_STORAGE else legacy_name
+
+
+def project_output_label(path: Path) -> str:
+    return path.relative_to(ROOT).as_posix()
 
 
 @dataclass(frozen=True)
@@ -160,7 +195,7 @@ def assert_first_principles_path(path: Path) -> None:
     text = str(path)
     for part in FORBIDDEN_PATH_PARTS:
         if part in text:
-            raise ValueError(f"V3-01 forbidden input path detected: {path}")
+            raise ValueError(f"LIF 前处理检测到禁止使用的输入路径: {path}")
 
 
 def resolve_project_input_path(value: str) -> Path:
@@ -170,16 +205,16 @@ def resolve_project_input_path(value: str) -> Path:
 
 def load_channel_specs() -> list[ChannelSpec]:
     if not INPUT_LOCK.exists():
-        raise FileNotFoundError(f"Run V3-00 first; missing {INPUT_LOCK}")
+        raise FileNotFoundError(f"项目缺少 input manifest: {INPUT_LOCK}")
     allowed = pd.read_csv(INPUT_LOCK)
     lif = allowed[allowed["input_class"].eq("raw_lif_trace")].copy()
     if not MIN_LIF_INPUTS <= len(lif) <= MAX_LIF_INPUTS:
         raise ValueError(
             f"Expected {MIN_LIF_INPUTS}-{MAX_LIF_INPUTS} raw LIF inputs from the input lock, found {len(lif)}"
         )
-    if not lif["allowed_stage"].eq("V3-01~V3-06 main workflow").all():
-        bad = lif.loc[~lif["allowed_stage"].eq("V3-01~V3-06 main workflow"), ["input_id", "allowed_stage"]]
-        raise ValueError(f"V3-01 received non-main-workflow inputs:\n{bad}")
+    if not lif["allowed_stage"].eq(EXPECTED_ALLOWED_STAGE).all():
+        bad = lif.loc[~lif["allowed_stage"].eq(EXPECTED_ALLOWED_STAGE), ["input_id", "allowed_stage"]]
+        raise ValueError(f"LIF 前处理收到不属于当前工作流的输入:\n{bad}")
 
     specs = []
     for _, row in lif.iterrows():
@@ -194,9 +229,9 @@ def load_channel_specs() -> list[ChannelSpec]:
             if col == "size_bytes":
                 locked_value = int(locked)
                 if int(current_value) != locked_value:
-                    raise ValueError(f"V3-01 input fingerprint mismatch for {path}: {col}")
+                    raise ValueError(f"LIF 输入指纹不一致 {path}: {col}")
             elif str(locked) and str(current_value) != str(locked):
-                raise ValueError(f"V3-01 input fingerprint mismatch for {path}: {col}")
+                raise ValueError(f"LIF 输入指纹不一致 {path}: {col}")
         specs.append(
             ChannelSpec(
                 channel=str(row["channel"]),
@@ -962,6 +997,18 @@ def red_detector_audit(merged_peaks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     return pd.DataFrame(rows), pd.DataFrame(offset_rows)
 
 
+def has_red_pair_diagnostics(trace_meta: pd.DataFrame) -> bool:
+    """A channel-pair audit is meaningful only with two physical red inputs."""
+
+    if not {"channel", "detector"}.issubset(trace_meta.columns):
+        return False
+    red_channels = trace_meta.loc[
+        trace_meta["detector"].astype(str).str.strip().str.lower().eq("red"),
+        "channel",
+    ]
+    return int(red_channels.astype(str).nunique()) >= 2
+
+
 def draw_project_phase_boundaries(ax: mpl.axes.Axes) -> None:
     for boundary in PROJECT_PHASE_POLICY["plot_boundaries"]:
         is_annotation = boundary["kind"] == "annotation_start"
@@ -993,13 +1040,33 @@ def plot_trace_overview(traces: pd.DataFrame, peaks: pd.DataFrame) -> None:
         draw_project_phase_boundaries(ax)
         ax.set_ylabel(f"{channel}\nsignal")
     axes[-1].set_xlabel("time (min)")
-    fig.suptitle("V3-01 LIF baseline-corrected traces and merged peaks", y=0.995)
-    save_png(fig, OUT_FIG / "v3_01_lif_trace_peak_overview.png")
+    fig.suptitle(
+        "LIF baseline-corrected traces and merged peaks"
+        if CANONICAL_STORAGE
+        else "V3-01 LIF baseline-corrected traces and merged peaks",
+        y=0.995,
+    )
+    save_png(
+        fig,
+        OUT_FIG / output_name(
+            "v3_01_lif_trace_peak_overview.png",
+            "trace_peak_overview.png",
+        ),
+    )
 
 
-def plot_peak_qc(peaks: pd.DataFrame, red_offsets: pd.DataFrame) -> None:
+def plot_peak_qc(
+    peaks: pd.DataFrame,
+    red_offsets: pd.DataFrame,
+    *,
+    include_red_audit: bool | None = None,
+) -> None:
     merged = peaks[peaks["peak_stage"].eq("merged")].copy()
-    fig, axes = plt.subplots(1, 3, figsize=(10, 3.0))
+    if include_red_audit is None:
+        include_red_audit = not CANONICAL_STORAGE or bool(len(red_offsets))
+    panel_count = 3 if include_red_audit else 2
+    fig, axes = plt.subplots(1, panel_count, figsize=(10 if panel_count == 3 else 7.2, 3.0))
+    axes = np.atleast_1d(axes)
     for channel, sub in merged.groupby("channel"):
         axes[0].hist(sub["width_sec"], bins=40, histtype="step", lw=1.2, label=channel)
         axes[1].hist(np.clip(sub["snr"], 0, 100), bins=40, histtype="step", lw=1.2, label=channel)
@@ -1007,15 +1074,27 @@ def plot_peak_qc(peaks: pd.DataFrame, red_offsets: pd.DataFrame) -> None:
     axes[0].set_ylabel("peak count")
     axes[1].set_xlabel("SNR, clipped at 100")
     axes[1].set_ylabel("peak count")
-    if len(red_offsets):
-        offset_col = "right_minus_left_sec" if "right_minus_left_sec" in red_offsets.columns else "r2_minus_r1_sec"
-        axes[2].hist(red_offsets[offset_col].dropna(), bins=np.arange(-30, 30.25, 0.5), color="#a855f7", alpha=0.8)
-    axes[2].axvline(0, color="black", lw=0.8)
-    axes[2].set_xlabel("same-detector channel offset (sec)")
-    axes[2].set_ylabel("pair count")
+    if include_red_audit:
+        if len(red_offsets):
+            offset_col = "right_minus_left_sec" if "right_minus_left_sec" in red_offsets.columns else "r2_minus_r1_sec"
+            axes[2].hist(red_offsets[offset_col].dropna(), bins=np.arange(-30, 30.25, 0.5), color="#a855f7", alpha=0.8)
+        axes[2].axvline(0, color="black", lw=0.8)
+        axes[2].set_xlabel("same-detector channel offset (sec)")
+        axes[2].set_ylabel("pair count")
     axes[0].legend()
-    fig.suptitle("V3-01 compact LIF QC distributions", y=1.03)
-    save_png(fig, OUT_FIG / "v3_01_lif_peak_qc_distributions.png")
+    fig.suptitle(
+        "LIF peak QC distributions"
+        if CANONICAL_STORAGE
+        else "V3-01 compact LIF QC distributions",
+        y=1.03,
+    )
+    save_png(
+        fig,
+        OUT_FIG / output_name(
+            "v3_01_lif_peak_qc_distributions.png",
+            "peak_qc_distributions.png",
+        ),
+    )
 
 
 def write_report(
@@ -1024,18 +1103,32 @@ def write_report(
     peak_summary: pd.DataFrame,
     peak_phase_summary: pd.DataFrame,
     red_audit: pd.DataFrame,
+    *,
+    include_red_audit: bool = True,
 ) -> None:
+    red_section = (
+        [
+            "## red detector 通道对审计",
+            "",
+            "说明：若项目含两个或更多 red detector 通道，这里逐对统计 ±30 sec 内 offset 模式、近 0 sec 计数和 sideband 背景；all-pair offset 会受峰密度影响，因此只作为串扰或同步结构风险提示，不作为标签证据。",
+            "",
+            md_table(red_audit),
+            "",
+        ]
+        if include_red_audit
+        else []
+    )
     lines = [
-        "# V3-01 LIF trace physical QC and peak calling",
+        "# LIF 信号与峰识别报告" if CANONICAL_STORAGE else "# V3-01 LIF trace physical QC and peak calling",
         "",
         "## 结论",
         "",
-        f"- 本步骤只读取输入锁和其中允许的 {len(trace_meta)} 个 raw LIF CSV；没有读取作者 CSV、h5ad、人工补峰或任何 V2 输出。",
-        "- 读取 raw LIF 前会校验 V3-00 记录的大小、首尾 1MB SHA256 和 full SHA256，避免锁定后文件变化或路径替换。",
+        f"- 本步骤只读取 input manifest 中允许的 {len(trace_meta)} 个原始 LIF 文件；没有读取作者标签、人工补峰或下游注释。",
+        "- 读取原始 LIF 前会校验记录的大小、首尾 1MB SHA256 和 full SHA256，避免锁定后文件变化或路径替换。",
         f"- 阶段语义来自项目协议：`{phase_boundaries_min(PROJECT_PHASE_POLICY)}`；参考段只用于 calibration 审计，未配置时段不会被猜成细胞或 QC。",
         "- 每个 channel 独立估计 baseline 和 noise，再用物理峰宽、prominence/SNR 和近邻风险生成 raw peak 与 merged peak。",
-        "- R1/R2 共用 red detector 的问题在本步骤只做时间轴/串扰候选审计，不把它转成标签判断。",
-        "- QC 图只保留两张：全程信号+峰概览、峰宽/SNR/红通道 offset 分布，便于人工快速审查。",
+        "- 同一检测器的多通道只做时间轴/串扰候选审计，不把它转成标签判断。",
+        "- QC 图只保留全程信号+峰概览与实际适用的峰宽/SNR/同检测器通道 offset 分布。",
         "",
         "## 参数",
         "",
@@ -1081,26 +1174,19 @@ def write_report(
         "",
         md_table(trace_phase_summary),
         "",
-        "## red detector 通道对审计",
-        "",
-        "说明：若项目含两个或更多 red detector 通道，这里逐对统计 ±30 sec 内 offset 模式、近 0 sec 计数和 sideband 背景；all-pair offset 会受峰密度影响，因此只作为串扰或同步结构风险提示，不作为标签证据。",
-        "",
-        md_table(red_audit),
-        "",
+        *red_section,
         "## 输出文件",
         "",
-        "- `data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_traces.parquet`",
-        "- `data/interim/v3/01_lif_trace_physical_qc/v3_01_lif_peaks.parquet`",
-        "- `results/tables/v3/01_lif_trace_physical_qc/v3_01_lif_peak_summary.csv`",
-        "- `results/tables/v3/01_lif_trace_physical_qc/v3_01_lif_peak_phase_summary.csv`",
-        "- `results/tables/v3/01_lif_trace_physical_qc/v3_01_red_detector_audit.csv`",
-        "- `results/qc/v3/01_lif_trace_physical_qc/v3_01_red_detector_pair_offsets.csv`",
-        "- `results/figures/v3/01_lif_trace_physical_qc/v3_01_lif_trace_peak_overview.png`",
-        "- `results/figures/v3/01_lif_trace_physical_qc/v3_01_lif_peak_qc_distributions.png`",
+        f"- `{project_output_label(OUT_DATA / output_name('v3_01_lif_traces.parquet', 'lif_traces.parquet'))}`",
+        f"- `{project_output_label(OUT_DATA / output_name('v3_01_lif_peaks.parquet', 'lif_peaks.parquet'))}`",
+        f"- `{project_output_label(OUT_TABLE / output_name('v3_01_lif_peak_summary.csv', 'peak_summary.csv'))}`",
+        f"- `{project_output_label(OUT_TABLE / output_name('v3_01_lif_peak_phase_summary.csv', 'peak_phase_summary.csv'))}`",
+        f"- `{project_output_label(OUT_FIG / output_name('v3_01_lif_trace_peak_overview.png', 'trace_peak_overview.png'))}`",
+        f"- `{project_output_label(OUT_FIG / output_name('v3_01_lif_peak_qc_distributions.png', 'peak_qc_distributions.png'))}`",
         "",
         "## 下一步 gate",
         "",
-        "- 如果峰数、峰宽、SNR 和 close/merge risk 可解释，则进入 V3-02 MS event calling。",
+        "- 如果峰数、峰宽、SNR 和 close/merge risk 可解释，则继续进行 MS event 识别。",
         "- 如果后续发现 calibration reference evidence 不足，应回到本步骤检查项目协议指定通道的 peak calling，但仍不能用作者 CSV 或 h5ad 调参。",
     ]
     OUT_REPORT.parent.mkdir(parents=True, exist_ok=True)
@@ -1124,7 +1210,8 @@ def run(project_dir: str | Path | None = None) -> None:
     traces = []
     peak_tables = []
     meta_rows = []
-    for spec in load_channel_specs():
+    channel_specs = load_channel_specs()
+    for spec in channel_specs:
         trace = read_lif_csv(spec)
         trace, meta = add_baseline_and_noise(
             trace, detection_config=detection_config
@@ -1145,24 +1232,58 @@ def run(project_dir: str | Path | None = None) -> None:
     trace_phase_summary = build_trace_phase_summary(trace_all)
     peak_summary, peak_phase_summary = build_peak_summary(peaks_all, trace_meta)
     red_audit, red_offsets = red_detector_audit(merged)
+    include_red_audit = has_red_pair_diagnostics(trace_meta)
 
-    trace_all.to_parquet(OUT_DATA / "v3_01_lif_traces.parquet", index=False)
-    peaks_all.to_parquet(OUT_DATA / "v3_01_lif_peaks.parquet", index=False)
-    trace_meta.to_csv(OUT_TABLE / "v3_01_lif_trace_meta.csv", index=False)
-    trace_phase_summary.to_csv(OUT_TABLE / "v3_01_lif_trace_phase_summary.csv", index=False)
-    peak_summary.to_csv(OUT_TABLE / "v3_01_lif_peak_summary.csv", index=False)
-    peak_phase_summary.to_csv(OUT_TABLE / "v3_01_lif_peak_phase_summary.csv", index=False)
-    red_audit.to_csv(OUT_TABLE / "v3_01_red_detector_audit.csv", index=False)
-    red_offsets.to_csv(OUT_QC / "v3_01_red_detector_pair_offsets.csv", index=False)
+    trace_path = OUT_DATA / output_name("v3_01_lif_traces.parquet", "lif_traces.parquet")
+    peaks_path = OUT_DATA / output_name("v3_01_lif_peaks.parquet", "lif_peaks.parquet")
+    trace_all.to_parquet(trace_path, index=False)
+    peaks_all.to_parquet(peaks_path, index=False)
+    trace_meta.to_csv(
+        OUT_TABLE / output_name("v3_01_lif_trace_meta.csv", "trace_metadata.csv"),
+        index=False,
+    )
+    trace_phase_summary.to_csv(
+        OUT_TABLE / output_name("v3_01_lif_trace_phase_summary.csv", "trace_phase_summary.csv"),
+        index=False,
+    )
+    peak_summary.to_csv(
+        OUT_TABLE / output_name("v3_01_lif_peak_summary.csv", "peak_summary.csv"),
+        index=False,
+    )
+    peak_phase_summary.to_csv(
+        OUT_TABLE / output_name("v3_01_lif_peak_phase_summary.csv", "peak_phase_summary.csv"),
+        index=False,
+    )
+    if not CANONICAL_STORAGE or include_red_audit:
+        red_audit.to_csv(
+            OUT_TABLE / output_name("v3_01_red_detector_audit.csv", "red_detector_audit.csv"),
+            index=False,
+        )
+    if not CANONICAL_STORAGE or include_red_audit:
+        red_offsets.to_csv(
+            OUT_QC / output_name("v3_01_red_detector_pair_offsets.csv", "red_detector_pair_offsets.csv"),
+            index=False,
+        )
 
     plot_trace_overview(trace_all, peaks_all)
-    plot_peak_qc(peaks_all, red_offsets)
-    write_report(trace_meta, trace_phase_summary, peak_summary, peak_phase_summary, red_audit)
+    plot_peak_qc(
+        peaks_all,
+        red_offsets,
+        include_red_audit=(include_red_audit if CANONICAL_STORAGE else True),
+    )
+    write_report(
+        trace_meta,
+        trace_phase_summary,
+        peak_summary,
+        peak_phase_summary,
+        red_audit,
+        include_red_audit=(include_red_audit if CANONICAL_STORAGE else True),
+    )
 
-    print(f"Wrote {OUT_DATA / 'v3_01_lif_traces.parquet'}")
-    print(f"Wrote {OUT_DATA / 'v3_01_lif_peaks.parquet'}")
-    print(f"Wrote {OUT_TABLE / 'v3_01_lif_peak_summary.csv'}")
-    print(f"Wrote {OUT_REPORT}")
+    print(f"Wrote {project_output_label(trace_path)}")
+    print(f"Wrote {project_output_label(peaks_path)}")
+    print(f"Wrote {project_output_label(OUT_TABLE / output_name('v3_01_lif_peak_summary.csv', 'peak_summary.csv'))}")
+    print(f"Wrote {project_output_label(OUT_REPORT)}")
 
 
 def parse_args() -> argparse.Namespace:

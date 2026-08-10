@@ -25,8 +25,8 @@ The project root must contain:
 - `lifms_project.json`
 - every intermediate parquet file named in `lifms_project.json.intermediate_tables`
 - the SQLite file named in `lifms_project.json.annotation_db.path`
-- `results/tables/v3/00_project_protocol.json`
-- `data/interim/lma/cell_event_umap.csv`
+- the event map named in `lifms_project.json.cell_event_map.path`
+- the project protocol: `provenance/project_protocol.json` in a newly created project, or the manifest-compatible historical protocol path in an existing v0.4.0 project
 
 The canonical event map is a project asset with exactly:
 
@@ -35,6 +35,16 @@ ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2
 ```
 
 It is not the original source coordinate CSV. The source CSV may have extra columns, but only `scan_start_time`, `UMAP1`, and `UMAP2` are imported.
+
+New projects also keep these with the project:
+
+- `provenance/input_manifest.csv`
+- `provenance/preprocessing.log`
+- `provenance/preprocessing_report.md`
+- `diagnostics/`
+- `annotations/exports/`
+
+Historical v0.4.0 projects may instead contain `results/`, `reports/`, and `annotation_app/annotations/exports/`. Do not reorganize them; their manifest paths remain valid.
 
 Keep these with the project when present:
 
@@ -66,12 +76,23 @@ From the project root:
 ```bash
 set -euo pipefail
 test -f lifms_project.json
-test -f results/tables/v3/00_project_protocol.json
-test -f data/interim/lma/cell_event_umap.csv
-test -f annotation_app/annotations/annotation.sqlite
-sqlite3 annotation_app/annotations/annotation.sqlite ".tables"
-sqlite3 annotation_app/annotations/annotation.sqlite \
-  "select review_status, count(*) from annotations group by review_status;"
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+manifest = json.loads((root / "lifms_project.json").read_text(encoding="utf-8"))
+paths = [
+    *(entry["path"] for entry in manifest["intermediate_tables"].values()),
+    manifest["annotation_db"]["path"],
+    manifest["cell_event_map"]["path"],
+]
+missing = [path for path in paths if not (root / path).is_file()]
+if missing:
+    raise SystemExit("Missing project files: " + ", ".join(missing))
+print("Project runtime files present")
+print("SQLite:", manifest["annotation_db"]["path"])
+PY
 ```
 
 Then verify that all parquet paths listed under `intermediate_tables` exist. Do not assume a hard-coded parquet directory if the manifest names another valid project-relative path.
@@ -119,4 +140,4 @@ Expected behavior:
 - Treat `export_runs` as provenance, not as new input.
 - Before experimenting, make an untouched full-directory backup.
 
-For Windows release behavior, use `README_RELEASE.md` and `docs/HSC1_v0.4.0_UAT.md`.
+For Windows candidate behavior, use `README_RELEASE.md` and `docs/Lin-_LSK_v0.4.1-rc1_UAT.md`.

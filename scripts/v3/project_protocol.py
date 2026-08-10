@@ -1,9 +1,8 @@
 """Project-owned preprocessing phase semantics.
 
-New projects write ``results/tables/v3/00_project_protocol.json`` before the
-raw preprocessing scripts run.  This module deliberately has no dependency on
-the annotation application, so the two preprocessing entry points can share
-the exact same phase classifier without importing UI or SQLite code.
+New projects write ``provenance/project_protocol.json`` before raw
+preprocessing starts. Historical v0.4 projects remain readable at their
+manifest-declared paths; this module never moves them.
 """
 from __future__ import annotations
 
@@ -25,8 +24,24 @@ except ModuleNotFoundError:  # Direct execution from scripts/v3.
         require_active_lif_peak_detection,
     )
 
+try:
+    from scripts.v3.project_storage import (
+        CANONICAL_PROJECT_PROTOCOL_PATH,
+        LEGACY_PROJECT_PROTOCOL_PATH,
+        project_protocol_path,
+    )
+except ModuleNotFoundError:  # Direct execution from scripts/v3.
+    from project_storage import (  # type: ignore[no-redef]
+        CANONICAL_PROJECT_PROTOCOL_PATH,
+        LEGACY_PROJECT_PROTOCOL_PATH,
+        project_protocol_path,
+    )
 
-PROTOCOL_RELATIVE_PATH = Path("results/tables/v3/00_project_protocol.json")
+
+# Public compatibility aliases. New callers should use
+# ``project_protocol_path(root)`` because an existing project owns its path.
+PROTOCOL_RELATIVE_PATH = Path(CANONICAL_PROJECT_PROTOCOL_PATH)
+LEGACY_PROTOCOL_RELATIVE_PATH = Path(LEGACY_PROJECT_PROTOCOL_PATH)
 
 
 def _finite_float(value: Any, label: str) -> float:
@@ -131,39 +146,37 @@ def load_project_protocol(
     allow_unbound_module_default: bool = False,
 ) -> dict[str, Any]:
     root = Path(project_root).expanduser().resolve()
-    path = root / PROTOCOL_RELATIVE_PATH
+    path = project_protocol_path(root)
     if not path.exists():
         if allow_unbound_module_default:
             return _with_derived_fields(_module_default_policy())
         raise ValueError(
-            "Project preprocessing protocol is missing. Old V3/v1 projects are "
-            "not adapted: create a new empty detector-v2 project, select the "
-            "original inputs again, and rerun preprocessing."
+            "项目缺少预处理设置；请在新的空目录中重新选择原始输入并创建项目"
         )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cannot read project preprocessing protocol: {path}: {exc}") from exc
+        raise ValueError("项目预处理设置无法读取或内容损坏") from exc
     if not isinstance(raw, dict):
-        raise ValueError("00_project_protocol.json must contain an object")
+        raise ValueError("项目预处理设置格式无效")
     calibration = raw.get("calibration_protocol")
     if not isinstance(calibration, dict):
-        raise ValueError("00_project_protocol.json is missing calibration_protocol")
+        raise ValueError("项目缺少前段参考设置")
     raw_segments = calibration.get("segments")
     if not isinstance(raw_segments, list) or not raw_segments:
-        raise ValueError("calibration_protocol must contain at least one segment")
+        raise ValueError("项目至少需要一个前段参考窗口")
     segments = [_normalize_segment(item, index) for index, item in enumerate(raw_segments, start=1)]
     ids = [segment["segment_id"] for segment in segments]
     if len(ids) != len(set(ids)):
-        raise ValueError("calibration segment_id values must be unique")
+        raise ValueError("前段参考窗口存在重复标识")
     previous_end: float | None = None
     for segment in segments:
         if previous_end is not None and segment["start_min"] < previous_end - 1e-9:
-            raise ValueError("calibration segments must be ordered and non-overlapping")
+            raise ValueError("前段参考窗口必须按时间排序且不能重叠")
         previous_end = float(segment["end_min"])
     annotation = raw.get("annotation_config")
     if not isinstance(annotation, dict):
-        raise ValueError("00_project_protocol.json is missing annotation_config")
+        raise ValueError("项目缺少事件标注时间设置")
     annotation_start = _finite_float(annotation.get("annotation_start_min"), "annotation_start_min")
     if annotation_start < 0:
         raise ValueError("annotation_start_min must be >= 0")
@@ -171,22 +184,18 @@ def load_project_protocol(
         raise ValueError("annotation_start_min cannot precede the final calibration segment")
     post_qc = raw.get("post_qc_strategy")
     if not isinstance(post_qc, dict):
-        raise ValueError("00_project_protocol.json is missing post_qc_strategy")
+        raise ValueError("项目缺少后段 QC 设置")
     peak_detection_raw = raw.get("lif_peak_detection")
     if peak_detection_raw is None:
-        raise ValueError(
-            "00_project_protocol.json is missing lif_peak_detection; old V3/v1 "
-            "protocols must be rebuilt as detector v2 in a new project."
-        )
+        raise ValueError("项目缺少当前峰识别设置；请从原始输入在新目录重建")
     try:
         peak_detection = require_active_lif_peak_detection(peak_detection_raw)
     except ValueError as exc:
-        raise ValueError(f"Unsupported LIF detector protocol: {exc}") from exc
-    if peak_detection_raw != peak_detection:
         raise ValueError(
-            "00_project_protocol.json lif_peak_detection must contain the full "
-            "canonical detector-v2 core+weak configuration"
-        )
+            "项目峰识别设置无效或不完整；请在新目录中从原始输入重新创建项目"
+        ) from exc
+    if peak_detection_raw != peak_detection:
+        raise ValueError("项目峰识别设置不完整；请从原始输入在新目录重建")
     policy = {
         "schema_version": int(raw.get("schema_version") or 0),
         "source": str(path),

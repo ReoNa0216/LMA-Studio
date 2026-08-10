@@ -1,4 +1,4 @@
-# Windows v0.4.0 Release Smoke Test
+# Windows v0.4.1-rc1 Candidate Smoke Test
 
 Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -7,7 +7,7 @@ Goal: verify that the packaged LMA Studio candidate can create and open current-
 - This is a candidate acceptance test, not a formal Release procedure.
 - Do not create or push a version tag before Windows user acceptance.
 - Open existing projects only through temporary copies. Never point a write test at `HSC1_data` or an existing user project.
-- HSC1 raw files may be selected only as read-only external references; save the generated project in a separate new directory.
+- `HSC1_data` raw files may be selected only as read-only external references; save the generated project in a separate new directory. The existing current-standard project is named `Lin-_LSK`.
 - Keep the entire `dist/LMAStudio` directory together.
 
 ## 1. Build
@@ -23,7 +23,7 @@ Expected:
 - The full automated suite passes.
 - PyInstaller creates `dist/LMAStudio/LMAStudio.exe`.
 - The normal packaged-runtime probe and simulated Internet-zone/MOTW probe both pass.
-- `dist/LMAStudio/_internal/scripts/v3` contains `lif_peak_detection.py`, `project_protocol.py`, `run_v3_01_lif_trace_physical_qc.py`, and `run_v3_02_ms_event_calling.py`.
+- `dist/LMAStudio/_internal/scripts/v3` contains `lif_peak_detection.py`, `project_protocol.py`, `project_storage.py`, `run_v3_01_lif_trace_physical_qc.py`, and `run_v3_02_ms_event_calling.py`.
 
 ## 2. First startup
 
@@ -39,7 +39,7 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4 project
+## 3. Create a v0.4.1 candidate project
 
 Create only in a new empty project directory. Configure:
 
@@ -66,12 +66,14 @@ After creation, verify:
 
 - `lifms_project.json` records project schema 3 and acquisition layout 4.
 - The manifest contains `lif_peak_detection` plus its scientific hash, `calibration_protocol`, `post_qc_strategy`, channel detector/time-axis roles, and project-specific annotation settings.
-- `results/tables/v3/00_project_protocol.json` records draft windows explicitly as `calibration_draft:*`; after every segment is confirmed it records the confirmed boundaries used by both preprocessing stages.
-- `data/interim/lma/cell_event_umap.csv` contains exactly `ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`.
+- `provenance/project_protocol.json` records draft windows explicitly; after every segment is confirmed it records the confirmed boundaries used by both preprocessing stages.
+- `data/cell_event_map.csv` contains exactly `ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2`.
 - Source `Type`, `leiden`, `CellNumber`, h5ad labels, and author/manual CSV content do not enter candidate generation.
-- Intermediate parquet tables and `annotation_app/annotations/annotation.sqlite` are created only under the new project.
+- The four runtime parquet tables are created directly under `data/`; `annotations/annotation.sqlite` and `annotations/exports/` are created only under the new project.
+- `provenance/` contains the input manifest, protocol, log, and import report; `diagnostics/lif` and `diagnostics/ms` contain optional review outputs.
+- The new project tree contains no pipeline-version directory and includes a root `README.md` explaining portability and sharing.
 
-For the HSC1 regression, follow `docs/HSC1_v0.4.0_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+For the renamed real-project regression, follow `docs/Lin-_LSK_v0.4.1-rc1_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 
@@ -182,7 +184,7 @@ Verify:
 - Source CSV `Type`, `leiden`, or author `CellNumber` values are never copied into the export.
 - Core MS/LIF values and identifiers are readable without decoding JSON payloads.
 - Protocol/model hashes, ambiguity alternatives, payloads, and audit metadata remain in SQLite.
-- The downloaded file and project-local copy under `annotation_app/annotations/exports` match.
+- The downloaded file and project-local copy under the manifest-selected export directory match (`annotations/exports` for new projects; the historical path remains valid for existing v0.4.0 projects).
 
 ## 10. Existing-project copy regression
 
@@ -202,11 +204,11 @@ Expected:
 - The result reports `CopyStable=True`, `OriginalStable=True`, `BootstrapPreserved=True`, and `ProcessExited=True`.
 - The temporary regression root is removed even after failure.
 
-After a real HSC1 candidate project has been created outside `HSC1_data`, run the optional packaged smoke on another temporary copy:
+Run the optional packaged smoke only on another temporary copy of the current `Lin-_LSK` project:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging/windows/regression_hsc1_packaged.ps1 `
-  -ProjectDir "E:\path\to\HSC1_v0.4.0_release_copy" `
+  -ProjectDir "E:\path\to\Lin-_LSK" `
   -HscDataDir "E:\path\to\HSC1_data"
 ```
 

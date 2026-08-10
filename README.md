@@ -7,7 +7,7 @@ It opens its own native desktop window, lets users create or open project direct
 ## Current Scope
 
 - Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a single-cell event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`; unrelated source columns are allowed and ignored.
-- Open an existing project containing preprocessing parquet tables and `annotation_app/annotations/annotation.sqlite`.
+- Open an existing project containing the manifest-bound preprocessing parquet tables and annotation SQLite path; both the compact current layout and unchanged v0.4.0 paths are supported.
 - Configure each channel's signal color, sample label, and cell-annotation role. A channel may simultaneously serve as a front `QC anchor` and an Events-stage `Cell pair` source; the two uses are independent. Shared acquisition-time groups are assigned automatically, so users never type internal axis names.
 - Use one project-wide adaptive two-tier LIF peak standard. High-confidence peaks are the only evidence used by automatic calibration, time-difference estimation, QC, candidate generation, and model fitting. Weak candidate peaks are optional display evidence for manual cell pairing only.
 - Configure ordered front reference windows using green-only, red-only, or combined red/green evidence. A read-only raw-peak scan can suggest boundaries but never confirms them. Unconfirmed windows can be opened as a raw-track draft while calibration and downstream stages remain locked.
@@ -18,13 +18,14 @@ It opens its own native desktop window, lets users create or open project direct
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
 - Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations.
 - Export a compact 16-column full event roster intended for downstream cell labeling. Unannotated events use `Type=unknown`; internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
+- Create new projects with a compact manifest-bound layout: `data/`, `annotations/`, `provenance/`, and `diagnostics/`, without exposing internal pipeline-version directories. Existing v0.4.0 projects retain their original manifest paths and are never auto-migrated.
 - Use external raw input references to avoid copying large MS files into every project.
 - Reject projects created with the retired peak-recognition standard before any project write. The original project remains unchanged; use a new empty directory and the original LIF/MS/coordinate inputs to rebuild under the current standard.
 - Invalidate dependent time models and third-stage results explicitly when a frozen-model input changes, while preserving manual annotation history.
 
 ## Desktop Releases
 
-The current release line is v0.4.0.
+The current formal release is v0.4.0. The directory-layout iteration is being validated as v0.4.1-rc1; it is a candidate, not a formal Release.
 
 Windows x64:
 
@@ -46,11 +47,13 @@ The macOS ARM64 build uses the native Cocoa/WebKit backend. It remains unsigned 
 
 ## Project Data Policy
 
-LMA Studio projects are directory-based. A project contains generated intermediate parquet tables, a project manifest, and the annotation SQLite database. Raw inputs can be referenced externally, which is recommended for large MS text files.
+LMA Studio projects are directory-based. New projects put runtime tables in `data/`, annotation state and exports in `annotations/`, reproducibility records in `provenance/`, and optional review material in `diagnostics/`. Raw inputs can be referenced externally, which is recommended for large MS text files.
 
 The application package does not include user raw data, project SQLite databases, canonical/source UMAP CSV files, parquet tables, exported CSV files, author CSV files, or h5ad files.
 
-For an existing project, the runtime-critical files are `lifms_project.json`, the annotation SQLite database, the four manifest-bound parquet tables under `data/interim/v3`, and the canonical event map under `data/interim/lma`. Files under `reports` and most of `results` are small, reproducible audit artifacts rather than runtime inputs. Keep them with the project for provenance; `quiet_platform` files describe automatically selected background-estimation bins and are not a QC population or an event class.
+Runtime paths always come from `lifms_project.json`; code must not infer them from a folder name. Existing v0.4.0 projects can therefore keep their historical paths unchanged, while newly created projects use the compact layout. Never move a table or SQLite file independently: its path and digest are part of the project binding. Close LMA Studio before copying or archiving a project, and share the complete root directory. The root directory itself may be renamed.
+
+Detailed layout and compatibility boundary: [docs/project_directory_layout.md](docs/project_directory_layout.md).
 
 ## Developer Build
 
@@ -75,9 +78,9 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.0 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.1-rc1 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload non-publishing test artifacts. Formal GitHub Release publication is tag-triggered after all release gates pass.
 
-Release notes: [README_RELEASE.md](README_RELEASE.md). HSC1 walkthrough: [docs/HSC1_v0.4.0_UAT.md](docs/HSC1_v0.4.0_UAT.md).
+Release notes: [README_RELEASE.md](README_RELEASE.md). Current renamed-project walkthrough: [docs/Lin-_LSK_v0.4.1-rc1_UAT.md](docs/Lin-_LSK_v0.4.1-rc1_UAT.md).

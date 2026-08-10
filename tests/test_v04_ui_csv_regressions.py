@@ -79,10 +79,12 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertIn("按信号颜色自动设置", HTML)
         self.assertNotIn('data-import-field="time_axis"', HTML)
 
-    def test_hsc1_is_an_optional_collapsed_template_not_the_default_action(self):
+    def test_lin_lsk_example_is_optional_and_uses_the_current_project_name(self):
         self.assertIn('<details id="importProjectTemplates"', HTML)
         self.assertRegex(HTML, r"<summary>[^<]*可选[^<]*实验[^<]*模板[^<]*</summary>")
-        self.assertIn('id="applyHsc1Preset"', HTML)
+        self.assertIn('id="applyLinLskExample"', HTML)
+        self.assertIn("Lin− / LSK 示例配置", HTML)
+        self.assertNotIn("HSC1", HTML)
         self.assertNotIn('<div class="preset-box">', HTML)
 
     def test_event_coordinate_picker_explains_required_columns_and_ignored_extras(self):

@@ -1171,12 +1171,12 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
             "boundaries_confirmed",
             "importAnnotationStart",
             "importPostQcMode",
-            "applyHsc1Preset",
+            "applyLinLskExample",
             "suggestImportWindows",
             "/api/suggest-calibration-windows",
             "segment.boundaries_confirmed = false",
             "可选：实验配置模板",
-            "HSC1：G1/LSK → G2/Lin−",
+            "Lin− / LSK 示例配置",
             "后段 QC 策略",
         ]
         for token in required_tokens:
