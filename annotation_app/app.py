@@ -11022,6 +11022,9 @@ HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 700;
     }
+    .small-button {
+      white-space: nowrap;
+    }
     .small-button.secondary {
       background: #f8fafc;
       color: #344054;
@@ -11890,7 +11893,7 @@ HTML = r"""<!doctype html>
         <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用参考峰时间校正</button>
       </div>
       <div id="localDeltaPanel" class="manual-box" style="display:none; margin-top:8px;">
-        <button id="estimateDelta" class="small-button" style="width:100%;">用无需身份标签的峰估计 MS 时间差</button>
+        <button id="estimateDelta" class="small-button" style="width:100%;" title="Estimate the MS time offset from unlabeled peak timing">Estimate MS Δt</button>
         <div id="deltaBaseSummary" class="empty" style="margin-top:6px;">基础时间平移：-</div>
         <div class="metric"><span>当前 MS 时间差</span><strong id="deltaReadout">0.00 sec</strong></div>
         <input id="deltaSlider" class="delta-slider" type="range" min="-20" max="20" step="0.25" value="0" />
@@ -13823,7 +13826,7 @@ HTML = r"""<!doctype html>
       const anchors = qcAnchorChannels();
       el('manualHelp').textContent = eventAnnotation
         ? (cellMode
-            ? '细胞二元组：选择一个用于细胞标注的 LIF 峰和一个事件坐标表内的 MS760 事件。'
+            ? 'Cell pair：选 1 个 LIF 峰 + 1 个事件坐标 CSV 内的 MS760；灰色 MS 仅供查看。'
             : `质控参考关系：必须选择 MS760；并从 ${anchors.join('/')} 中至少选择一个 LIF 峰，缺失通道会明确记为空值。`)
         : `前段时间校正：选择 ${anchors.join('/')} 中能够覆盖全部信号时间轴的峰，以及对应的 MS760 峰。`;
     }
@@ -14652,7 +14655,7 @@ HTML = r"""<!doctype html>
         return;
       }
       if (!state.manualMode) {
-        if (weakPeak) showInteractionHint('请先点击 Select peaks');
+        showInteractionHint('请先点击 Select peaks');
         return;
       }
       const cellMode = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
@@ -14860,6 +14863,20 @@ HTML = r"""<!doctype html>
       const markerPositions = {};
       const thirdStagePeakIds = visibleThirdStageLifPeakIds();
       const restrictThirdStageHits = thirdStagePeakIds !== null;
+      const cellAnnotationChannels = new Set(
+        (state.meta?.acquisition_layout?.lif_channels || [])
+          .filter(item => item.use_for_cell_annotation !== false)
+          .map(item => String(item.channel))
+      );
+      const manualCellSelectionActive = state.stage === 'event_annotation'
+        && state.manualAnnotationKind === 'cell'
+        && state.manualMode;
+      const peakInsideMainWindow = p => {
+        const time = Number(p.plot_time_min);
+        return Number.isFinite(time) && time >= start && time <= end;
+      };
+      const peakCellRoleEnabled = p => cellAnnotationChannels.size === 0
+        || cellAnnotationChannels.has(String(p.channel));
       updatePeakLabelPolicyText();
 
       const bg = svgEl('rect', { x: 0, y: 0, width, height, fill: '#fff' });
@@ -14938,8 +14955,11 @@ HTML = r"""<!doctype html>
             if (weakPeak) {
               return state.showWeakLifPeaks
                 && state.stage === 'event_annotation'
-                && state.manualAnnotationKind === 'cell';
+                && state.manualAnnotationKind === 'cell'
+                && peakInsideMainWindow(p)
+                && peakCellRoleEnabled(p);
             }
+            if (manualCellSelectionActive && peakInsideMainWindow(p) && peakCellRoleEnabled(p)) return true;
             return !restrictThirdStageHits
               || thirdStagePeakIds.has(String(p.peak_id));
           };
@@ -15069,7 +15089,26 @@ HTML = r"""<!doctype html>
               }
             } else {
               c.setAttribute('opacity', '.38');
-              c.setAttribute('pointer-events', 'none');
+              c.setAttribute('tabindex', '0');
+              c.setAttribute('cursor', 'help');
+              c.__detail = {
+                kind: track.trace === 'pc34_760_linear' ? 'ms760_peak' : 'ms782_peak',
+                type: track.trace === 'pc34_760_linear'
+                  ? 'MS 760（未在事件坐标 CSV）'
+                  : 'MS 782（未在事件坐标 CSV）',
+                data: e
+              };
+              attachHover(c);
+              if (track.trace === 'pc34_760_linear') {
+                const explainUnmappedMs = () => showInteractionHint('不在事件坐标 CSV，不能用于 Cell pair');
+                c.addEventListener('click', explainUnmappedMs);
+                c.addEventListener('keydown', (ev) => {
+                  if (ev.key === 'Enter' || ev.key === ' ') {
+                    ev.preventDefault();
+                    explainUnmappedMs();
+                  }
+                });
+              }
             }
             svg.appendChild(c);
             if (interactive && track.trace === 'pc34_760_linear') {
@@ -15600,6 +15639,7 @@ HTML = r"""<!doctype html>
       hideLineContextMenu();
       state.manualMode = !state.manualMode;
       renderManualSelection();
+      draw();
     });
     el('clearManual').addEventListener('click', () => {
       resetManualSelection();

@@ -234,6 +234,44 @@ class V04UiRegressionTest(unittest.TestCase):
         ):
             self.assertNotIn(verbose, visible_markup)
 
+    def test_local_delta_estimator_uses_a_compact_non_wrapping_label(self):
+        button = re.search(r'<button[^>]*id="estimateDelta"(?P<attrs>[^>]*)>(?P<label>[^<]+)</button>', HTML)
+        self.assertIsNotNone(button)
+        self.assertEqual(button.group("label").strip(), "Estimate MS Δt")
+        self.assertRegex(button.group("attrs"), r'title="[^"]+"')
+        self.assertNotIn("用无需身份标签的峰估计 MS 时间差", HTML)
+
+        self.assertRegex(
+            HTML,
+            r"\.small-button\s*\{[^}]*white-space\s*:\s*nowrap",
+        )
+
+    def test_manual_cell_selection_unlocks_all_main_window_core_lif_peaks(self):
+        draw = javascript_function_body("draw", "trackShiftSec")
+        self.assertIn("manualCellSelectionActive", draw)
+        self.assertIn("peakInsideMainWindow", draw)
+        self.assertRegex(
+            draw,
+            r"manualCellSelectionActive[\s\S]{0,700}peakInsideMainWindow\(p\)[\s\S]{0,700}thirdStagePeakIds\.has",
+            "Manual Cell-pair mode must not be limited to peaks already present in automatic candidates",
+        )
+
+        manual_mode_handler = HTML.rsplit("el('manualMode').addEventListener", 1)[1].split(
+            "el('clearManual')", 1
+        )[0]
+        self.assertIn("draw();", manual_mode_handler)
+
+    def test_unmapped_ms_peaks_remain_explainable_but_not_selectable(self):
+        draw = javascript_function_body("draw", "trackShiftSec")
+        self.assertIn("MS 760（未在事件坐标 CSV）", draw)
+        self.assertIn("不在事件坐标 CSV，不能用于 Cell pair", draw)
+        self.assertRegex(
+            draw,
+            r"in_cell_event_map[\s\S]{0,1800}attachHover\(c\)",
+            "A pale MS marker must still explain why it cannot be selected",
+        )
+        self.assertNotIn("MS weak", draw)
+
     def test_post_qc_modes_explain_when_each_mode_is_appropriate(self):
         visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
         for label in ("Off", "QC signature", "Scheduled windows"):
