@@ -10088,7 +10088,16 @@ class AppData:
             "stage": stage,
         }
 
-    def window_annotations(self, context_start_min: float, context_end_min: float) -> list[dict[str, Any]]:
+    def window_annotations(
+        self,
+        window_start_min: float,
+        window_end_min: float,
+        *,
+        context_start_min: float | None = None,
+        context_end_min: float | None = None,
+    ) -> list[dict[str, Any]]:
+        context_start = float(window_start_min) if context_start_min is None else float(context_start_min)
+        context_end = float(window_end_min) if context_end_min is None else float(context_end_min)
         rows = []
         for row in self.store.records():
             status = str(row.get("review_status", "pending"))
@@ -10110,7 +10119,12 @@ class AppData:
             else:
                 plot_times.extend([row.get("g2_plot_time_min"), row.get("r1_plot_time_min")])
             visible_times = [float(t) for t in plot_times if isinstance(t, (int, float))]
-            if visible_times and all(context_start_min <= t <= context_end_min for t in visible_times):
+            ms_plot_time = row.get("ms_plot_time_min")
+            if isinstance(ms_plot_time, (int, float)) and not (
+                float(window_start_min) <= float(ms_plot_time) <= float(window_end_min)
+            ):
+                continue
+            if visible_times and all(context_start <= t <= context_end for t in visible_times):
                 rows.append(row)
         rows.sort(key=lambda item: float(item.get("ms_plot_time_min", 0.0)))
         return rows
@@ -10468,7 +10482,12 @@ class AppData:
         }
         annotations = [
             row
-            for row in self.window_annotations(start_min, end_min)
+            for row in self.window_annotations(
+                start_min,
+                end_min,
+                context_start_min=context_start_min,
+                context_end_min=context_end_min,
+            )
             if str(row.get("annotation_id")) not in represented_manual_ids
         ]
         annotation_counts = {status: 0 for status in REVIEW_STATUSES}
@@ -14685,6 +14704,21 @@ HTML = r"""<!doctype html>
       draw();
     }
 
+    function focusSavedCellRelation(row) {
+      const msPlotTime = Number(row?.ms_plot_time_min);
+      const start = Number(state.current?.start_min);
+      const end = Number(state.current?.end_min);
+      if (![msPlotTime, start, end].every(Number.isFinite) || (msPlotTime >= start && msPlotTime <= end)) {
+        return false;
+      }
+      const msRawTime = Number(row?.ms_time_min);
+      if (!Number.isFinite(msRawTime)) return false;
+      state.start = eventGridWindowStart(msRawTime);
+      el('start').value = state.start.toFixed(2);
+      showInteractionHint('已保存；已转到包含完整关系的窗口');
+      return true;
+    }
+
     async function createManualTriplet() {
       if (state.actionBusy) return;
       const cell = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
@@ -14696,7 +14730,7 @@ HTML = r"""<!doctype html>
         }
         state.actionBusy = true;
         try {
-          await postJson('/api/manual-cell-pair', {
+          const response = await postJson('/api/manual-cell-pair', {
             lif_channel: state.manual.LIF.channel,
             lif_peak_id: state.manual.LIF.id,
             ms_event_id: state.manual.MS760.id,
@@ -14706,6 +14740,7 @@ HTML = r"""<!doctype html>
           });
           resetManualSelection();
           state.manualMode = false;
+          focusSavedCellRelation(response.annotation);
           await loadWindow();
           notifyStateChannel();
         } catch (err) {

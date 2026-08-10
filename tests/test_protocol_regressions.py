@@ -353,6 +353,49 @@ class ProtocolRegressionTest(unittest.TestCase):
                     window_end_min=1.61,
                 )
 
+    def test_saved_cell_relation_straddling_boundary_belongs_to_ms_window_with_context(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = create_hsc_app(Path(tmp))
+            active = app.active_time_model()
+            frozen = app.store.upsert_time_model(
+                {**active, "status": "frozen", "ms_local_delta_sec": -1.0},
+                action="test_freeze_boundary_cell_relation",
+            )
+            annotation = app.store.upsert_review(
+                annotation_id="manual_cell:boundary",
+                source="manual_created",
+                review_status="accepted",
+                action="test_boundary_cell_relation",
+                payload={
+                    "candidate_type": "manual_cell_pair",
+                    "review_stage": "cell_annotation",
+                    "lif_channel": "G1",
+                    "lif_peak_id": "g1_boundary_cell",
+                    "lif_raw_time_min": 26.9021666666665,
+                    "lif_plot_time_min": 26.50255013020842,
+                    "ms_event_id": "ms_boundary_cell",
+                    "ms_time_min": 26.512916666667,
+                    "ms_plot_time_min": 26.496250000000334,
+                    "time_model_version": frozen["time_model_version"],
+                },
+            )
+
+            owner_rows = app.window_annotations(
+                24.0,
+                26.5,
+                context_start_min=23.92,
+                context_end_min=26.58,
+            )
+            next_rows = app.window_annotations(
+                26.5,
+                29.0,
+                context_start_min=26.42,
+                context_end_min=29.08,
+            )
+
+            self.assertEqual([row["annotation_id"] for row in owner_rows], [annotation["annotation_id"]])
+            self.assertEqual(next_rows, [])
+
     def test_candidate_id_error_is_not_misreported_as_project_format_damage(self):
         public = user_facing_error_message(
             BadRequest(

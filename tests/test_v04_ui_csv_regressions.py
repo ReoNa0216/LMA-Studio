@@ -272,6 +272,19 @@ class V04UiRegressionTest(unittest.TestCase):
         )
         self.assertNotIn("MS weak", draw)
 
+    def test_saved_boundary_cell_pair_moves_to_its_ms_owner_window(self):
+        create_pair = javascript_function_body("createManualTriplet", "setAttrs")
+        self.assertRegex(
+            create_pair,
+            r"const\s+response\s*=\s*await\s+postJson\('/api/manual-cell-pair'",
+        )
+        self.assertIn("focusSavedCellRelation(response.annotation)", create_pair)
+
+        focus = javascript_function_body("focusSavedCellRelation", "createManualTriplet")
+        self.assertIn("ms_plot_time_min", focus)
+        self.assertIn("eventGridWindowStart", focus)
+        self.assertIn("已保存；已转到包含完整关系的窗口", focus)
+
     def test_post_qc_modes_explain_when_each_mode_is_appropriate(self):
         visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
         for label in ("Off", "QC signature", "Scheduled windows"):
