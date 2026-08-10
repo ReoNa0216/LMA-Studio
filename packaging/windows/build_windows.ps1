@@ -126,7 +126,8 @@ foreach ($DllName in $CoreRuntimeDlls) {
     }
 }
 
-& $Python (Join-Path $RepoRoot "packaging\windows\validate_bundle_runtime.py")
+& $Python (Join-Path $RepoRoot "packaging\windows\validate_bundle_runtime.py") `
+    --python-prefix $PythonPrefix
 if ($LASTEXITCODE -ne 0) {
     throw "The packaged Windows binary provenance/ABI audit failed (exit code $LASTEXITCODE)."
 }

@@ -13,7 +13,7 @@ from typing import Any, Iterable
 import pefile
 
 
-CORE_CONDA_DLLS = (
+CORE_RUNTIME_DLLS = (
     "libcrypto-3-x64.dll",
     "libssl-3-x64.dll",
     "liblzma.dll",
@@ -61,6 +61,14 @@ def pe_machine(path: Path) -> int:
     return int(pefile.PE(str(path), fast_load=True).FILE_HEADER.Machine)
 
 
+def imported_dll_names(path: Path) -> set[str]:
+    pe = pefile.PE(str(path), fast_load=False)
+    return {
+        row.dll.decode(errors="replace").casefold()
+        for row in getattr(pe, "DIRECTORY_ENTRY_IMPORT", ())
+    }
+
+
 def expat_abi(path: Path, *, extension: bool) -> dict[str, Any]:
     pe = pefile.PE(str(path), fast_load=False)
     if extension:
@@ -90,7 +98,23 @@ def expat_abi(path: Path, *, extension: bool) -> dict[str, Any]:
     }
 
 
-def audit_bundle(analysis_toc: Path, bundle_internal: Path) -> dict[str, Any]:
+def preferred_runtime_dll(prefix: Path, name: str) -> Path | None:
+    for candidate in (
+        prefix / "Library" / "bin" / name,
+        prefix / "DLLs" / name,
+        prefix / name,
+    ):
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def audit_bundle(
+    analysis_toc: Path,
+    bundle_internal: Path,
+    *,
+    python_prefix: Path | None = None,
+) -> dict[str, Any]:
     toc = ast.literal_eval(analysis_toc.read_text(encoding="utf-8"))
     rows = list(dict.fromkeys(iter_toc_rows(toc)))
     by_destination: dict[str, Path] = {}
@@ -100,34 +124,38 @@ def audit_bundle(analysis_toc: Path, bundle_internal: Path) -> dict[str, Any]:
 
     errors: list[str] = []
     pyexpat_source = by_destination.get("pyexpat.pyd")
+    selected_prefix = python_prefix.resolve() if python_prefix is not None else None
     if pyexpat_source is None:
         errors.append("Analysis TOC does not contain pyexpat.pyd")
-        selected_prefix = None
-    else:
+    elif selected_prefix is None:
         selected_prefix = pyexpat_source.parent.parent.resolve()
+    elif not is_within(pyexpat_source, selected_prefix):
+        errors.append(
+            f"pyexpat.pyd: foreign source {pyexpat_source}; "
+            f"expected a file below {selected_prefix}"
+        )
 
     dependencies: dict[str, Any] = {}
     if selected_prefix is not None:
-        selected_library_bin = selected_prefix / "Library" / "bin"
-        for name in CORE_CONDA_DLLS:
+        for name in CORE_RUNTIME_DLLS:
             source = by_destination.get(name.casefold())
             bundled = bundle_internal / name
-            expected = selected_library_bin / name
+            expected = preferred_runtime_dll(selected_prefix, name)
             item: dict[str, Any] = {
                 "source": str(source) if source else None,
                 "bundled": str(bundled),
-                "expected": str(expected),
-                "expected_exists": expected.is_file(),
+                "expected": str(expected) if expected else None,
+                "expected_exists": expected is not None,
             }
             if source is not None and source.is_file():
                 item["source_sha256"] = sha256_file(source)
             if bundled.is_file():
                 item["bundled_sha256"] = sha256_file(bundled)
-            if expected.is_file():
+            if expected is not None:
                 item["expected_sha256"] = sha256_file(expected)
             dependencies[name] = item
 
-            if expected.is_file():
+            if expected is not None:
                 if source is None:
                     errors.append(f"{name}: expected selected-environment DLL was not collected")
                 elif normalized(source) != normalized(expected):
@@ -140,6 +168,8 @@ def audit_bundle(analysis_toc: Path, bundle_internal: Path) -> dict[str, Any]:
                     errors.append(
                         f"{name}: bundled hash differs from selected environment"
                     )
+            elif source is not None and not is_within(source, selected_prefix):
+                errors.append(f"{name}: foreign source {source}")
 
     scientific_binary_count = 0
     scientific_foreign_sources: list[str] = []
@@ -179,35 +209,65 @@ def audit_bundle(analysis_toc: Path, bundle_internal: Path) -> dict[str, Any]:
     bundled_pyexpat = bundle_internal / "pyexpat.pyd"
     bundled_expat = bundle_internal / "libexpat.dll"
     abi: dict[str, Any] = {}
-    if bundled_pyexpat.is_file() and bundled_expat.is_file():
-        extension_abi = expat_abi(bundled_pyexpat, extension=True)
-        library_abi = expat_abi(bundled_expat, extension=False)
-        missing_ordinals = sorted(
-            set(extension_abi["ordinals"]) - set(library_abi["ordinals"])
-        )
-        missing_names = sorted(
-            set(extension_abi["names"]) - set(library_abi["names"])
-        )
-        abi = {
-            "pyexpat_machine": hex(pe_machine(bundled_pyexpat)),
-            "libexpat_machine": hex(pe_machine(bundled_expat)),
-            "missing_ordinals": missing_ordinals,
-            "missing_names": missing_names,
-        }
-        if pe_machine(bundled_pyexpat) != pe_machine(bundled_expat):
-            errors.append("pyexpat.pyd and libexpat.dll have different PE machines")
-        if missing_ordinals:
-            errors.append(
-                "libexpat.dll is missing pyexpat ordinals: "
-                + ", ".join(map(str, missing_ordinals))
-            )
-        if missing_names:
-            errors.append(
-                "libexpat.dll is missing pyexpat exports: "
-                + ", ".join(missing_names)
-            )
+    if not bundled_pyexpat.is_file():
+        errors.append("Bundle is missing pyexpat.pyd")
     else:
-        errors.append("Bundle is missing pyexpat.pyd or libexpat.dll")
+        if pyexpat_source is not None:
+            if not pyexpat_source.is_file():
+                errors.append(f"pyexpat.pyd source is missing: {pyexpat_source}")
+            elif sha256_file(bundled_pyexpat) != sha256_file(pyexpat_source):
+                errors.append("Bundled pyexpat.pyd differs from the selected source")
+        imported_dlls = imported_dll_names(bundled_pyexpat)
+        requires_external_expat = "libexpat.dll" in imported_dlls
+        if not requires_external_expat:
+            # The official python.org Windows build statically links its bundled
+            # Expat sources into pyexpat.pyd.  There is no external ABI pair to
+            # compare; the packaged --check-runtime probe imports and executes
+            # xml.parsers.expat after this provenance audit.
+            abi = {
+                "mode": "embedded",
+                "pyexpat_machine": hex(pe_machine(bundled_pyexpat)),
+                "imported_dlls": sorted(imported_dlls),
+                "external_libexpat_present": bundled_expat.is_file(),
+            }
+        elif not bundled_expat.is_file():
+            abi = {
+                "mode": "external",
+                "pyexpat_machine": hex(pe_machine(bundled_pyexpat)),
+                "imported_dlls": sorted(imported_dlls),
+            }
+            errors.append(
+                "pyexpat.pyd imports libexpat.dll but the bundle is missing libexpat.dll"
+            )
+        else:
+            extension_abi = expat_abi(bundled_pyexpat, extension=True)
+            library_abi = expat_abi(bundled_expat, extension=False)
+            missing_ordinals = sorted(
+                set(extension_abi["ordinals"]) - set(library_abi["ordinals"])
+            )
+            missing_names = sorted(
+                set(extension_abi["names"]) - set(library_abi["names"])
+            )
+            abi = {
+                "mode": "external",
+                "pyexpat_machine": hex(pe_machine(bundled_pyexpat)),
+                "libexpat_machine": hex(pe_machine(bundled_expat)),
+                "imported_dlls": sorted(imported_dlls),
+                "missing_ordinals": missing_ordinals,
+                "missing_names": missing_names,
+            }
+            if pe_machine(bundled_pyexpat) != pe_machine(bundled_expat):
+                errors.append("pyexpat.pyd and libexpat.dll have different PE machines")
+            if missing_ordinals:
+                errors.append(
+                    "libexpat.dll is missing pyexpat ordinals: "
+                    + ", ".join(map(str, missing_ordinals))
+                )
+            if missing_names:
+                errors.append(
+                    "libexpat.dll is missing pyexpat exports: "
+                    + ", ".join(missing_names)
+                )
 
     return {
         "analysis_toc": str(analysis_toc.resolve()),
@@ -239,12 +299,22 @@ def main() -> int:
         type=Path,
         default=repository / "dist/LMAStudio/_internal",
     )
+    parser.add_argument(
+        "--python-prefix",
+        type=Path,
+        default=Path(sys.prefix),
+        help="Prefix of the exact interpreter used to build the bundle",
+    )
     args = parser.parse_args()
     if not args.analysis_toc.is_file():
         parser.error(f"Analysis TOC not found: {args.analysis_toc}")
     if not args.bundle_internal.is_dir():
         parser.error(f"Bundle directory not found: {args.bundle_internal}")
-    result = audit_bundle(args.analysis_toc, args.bundle_internal)
+    result = audit_bundle(
+        args.analysis_toc,
+        args.bundle_internal,
+        python_prefix=args.python_prefix,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1
 
