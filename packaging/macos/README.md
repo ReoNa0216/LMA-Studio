@@ -11,15 +11,15 @@ The macOS package is a native Cocoa/WebKit window around the same local LMA Stud
 Build from the repository root:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.2-rc1 bash packaging/macos/build_macos.sh
 ```
 
 Output:
 
 ```text
-release/LMA-Studio-v0.4.1-macos-arm64.zip
+release/LMA-Studio-v0.4.2-rc1-macos-arm64.zip
 ```
 
 The public package is ad-hoc signed because this project does not currently have an Apple Developer ID certificate or notarization credentials. Gatekeeper may therefore require Control-clicking the app and choosing **Open** on first launch.
 
-The desktop runtime is pinned to pywebview 6.2.1. LMA Studio creates one hidden Cocoa UMAP child before the native main loop starts. On macOS, the toolbar action runs the native show/focus operation on Cocoa's main loop and returns only after the child is visibly on screen. The build runs the packaged `--check-umap-window` probe, which opens, hides, and reopens that independent window while confirming that the main annotation window stays visible. Final candidate acceptance should still include a mouse-level check of the same lifecycle.
+The desktop runtime is pinned to pywebview 6.2.1. LMA Studio starts with only the main Cocoa window. The UMAP toolbar action calls the Python bridge with the full same-server `/umap` URL, and Python uses `webview.create_window` during the running GUI loop to create a true second native window. The bridge rejects external URLs and reuses an open UMAP window; after the user closes it, the next click creates a new one. The packaged `--check-umap-window` probe exercises create, reuse, close, and recreate. Final candidate acceptance should still include a mouse-level check of the same lifecycle.

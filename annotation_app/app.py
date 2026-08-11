@@ -101,7 +101,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.1"
+APP_VERSION = "lma_studio_v0.4.2"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -9471,7 +9471,14 @@ class AppData:
             return self.payload_from_post_qc_group(group)
         return self.payload_from_auto_group(group)
 
-    def payload_from_cell_ids(self, lif_channel: str, lif_peak_id: str, ms_event_id: str) -> dict[str, Any]:
+    def payload_from_cell_ids(
+        self,
+        lif_channel: str,
+        lif_peak_id: str,
+        ms_event_id: str,
+        *,
+        enforce_acceptance_conflicts: bool = True,
+    ) -> dict[str, Any]:
         lif_channel = str(lif_channel).strip().upper()
         if lif_channel not in self.cell_annotation_channels():
             raise BadRequest(f"LIF 通道 {lif_channel} 未配置为细胞标注通道")
@@ -9486,7 +9493,10 @@ class AppData:
         if not is_primary_pc34_event(ms_row):
             raise BadRequest("Cell annotation requires an MS760 PC34 primary event")
         self.require_third_stage_event_in_map(ms_event_id)
-        if str(ms_event_id) in self.accepted_qc_survey_ms_event_ids():
+        if (
+            enforce_acceptance_conflicts
+            and str(ms_event_id) in self.accepted_qc_survey_ms_event_ids()
+        ):
             raise BadRequest("This MS760 event has already been accepted as QC in QC survey")
         if str(lif_row["channel"]) != lif_channel:
             raise BadRequest(f"Cell candidate channel mismatch: {lif_channel} vs {lif_row['channel']}")
@@ -10312,6 +10322,7 @@ class AppData:
         window_start_min: float | None = None,
         window_end_min: float | None = None,
         time_mode: str | None = None,
+        review_status: str = "accepted",
     ) -> dict[str, Any]:
         with request_read_snapshot():
             return self._create_manual_cell_pair_from_request_snapshot(
@@ -10321,6 +10332,7 @@ class AppData:
                 window_start_min=window_start_min,
                 window_end_min=window_end_min,
                 time_mode=time_mode,
+                review_status=review_status,
             )
 
     def _create_manual_cell_pair_from_request_snapshot(
@@ -10331,20 +10343,36 @@ class AppData:
         window_start_min: float | None = None,
         window_end_min: float | None = None,
         time_mode: str | None = None,
+        review_status: str = "accepted",
     ) -> dict[str, Any]:
         lif_channel = str(lif_channel).strip()
         lif_peak_id = optional_peak_id(lif_peak_id) or ""
         ms_event_id = optional_peak_id(ms_event_id) or ""
+        review_status = str(review_status or "accepted").strip().lower()
+        if review_status not in {"accepted", "pending"}:
+            raise BadRequest("人工 Cell pair 只能保存为已接受或待审")
         if lif_channel not in set(self.cell_annotation_channels()):
             raise BadRequest(f"Manual cell pair requires one configured LIF peak from {', '.join(self.cell_annotation_channels())}")
         if not lif_peak_id or not ms_event_id:
             raise BadRequest("Manual cell pair requires one LIF peak and one MS760 event")
         if not self.frozen_time_model():
             raise BadRequest("Freeze local time model before creating cell annotations")
-        if ms_event_id in self.accepted_qc_survey_ms_event_ids():
+        if (
+            review_status == "accepted"
+            and ms_event_id in self.accepted_qc_survey_ms_event_ids()
+        ):
             raise BadRequest("This MS760 event has already been accepted as QC in QC survey; clear that QC annotation before creating a cell pair")
-        payload = self.payload_from_cell_ids(lif_channel, lif_peak_id, ms_event_id)
-        if window_start_min is not None and window_end_min is not None:
+        payload = self.payload_from_cell_ids(
+            lif_channel,
+            lif_peak_id,
+            ms_event_id,
+            enforce_acceptance_conflicts=review_status == "accepted",
+        )
+        if (
+            review_status == "accepted"
+            and window_start_min is not None
+            and window_end_min is not None
+        ):
             for row in self.build_cell_candidates(
                 float(window_start_min) - WINDOW_CONTEXT_MARGIN_MIN,
                 float(window_end_min) + WINDOW_CONTEXT_MARGIN_MIN,
@@ -10371,16 +10399,21 @@ class AppData:
             "selection_reason": "manual_lif_ms760_pair",
         }
         annotation_id = manual_cell_annotation_id(lif_channel, lif_peak_id, ms_event_id)
-        self.ensure_third_stage_acceptance_allowed(
-            payload,
-            annotation_id=annotation_id,
-        )
+        if review_status == "accepted":
+            self.ensure_third_stage_acceptance_allowed(
+                payload,
+                annotation_id=annotation_id,
+            )
         return self.store.upsert_review(
             annotation_id=annotation_id,
             source="manual_created",
-            review_status="accepted",
+            review_status=review_status,
             payload=payload,
-            action="manual_cell_pair_create_accept",
+            action=(
+                "manual_cell_pair_create_accept"
+                if review_status == "accepted"
+                else "manual_cell_pair_create_pending"
+            ),
             window_start_min=window_start_min,
             window_end_min=window_end_min,
             time_mode=time_mode,
@@ -10673,6 +10706,28 @@ class AppData:
             for row in rows
             if allowed_ids is None or str(row.get("ms_event_id")) in allowed_ids
         ]
+        active_version = str(frozen.get("time_model_version") or "")
+        manual_relation_keys = {
+            (
+                str(review.get("lif_channel") or "").strip().upper(),
+                str(review.get("lif_peak_id") or ""),
+                str(review.get("ms_event_id") or ""),
+            )
+            for review in self.store.records()
+            if str(review.get("source") or "") == "manual_created"
+            and self.manual_annotation_stage(review) == "cell_annotation"
+            and str(review.get("time_model_version") or "") == active_version
+        }
+        rows = [
+            row
+            for row in rows
+            if (
+                str(row.get("lif_channel") or "").strip().upper(),
+                str(row.get("lif_peak_id") or ""),
+                str(row.get("ms_event_id") or ""),
+            )
+            not in manual_relation_keys
+        ]
         rows_by_ms: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             rows_by_ms.setdefault(str(row.get("ms_event_id") or ""), []).append(row)
@@ -10808,9 +10863,12 @@ class AppData:
         rows = []
         for row in self.store.records():
             status = str(row.get("review_status", "pending"))
-            if status == "pending":
-                continue
             stage = self.manual_annotation_stage(row)
+            if status == "pending" and not (
+                str(row.get("source") or "") == "manual_created"
+                and stage == "cell_annotation"
+            ):
+                continue
             if stage in {"qc_survey", "cell_annotation"}:
                 frozen = self.frozen_time_model()
                 active_version = str(frozen.get("time_model_version", "")) if frozen else ""
@@ -11807,6 +11865,14 @@ HTML = r"""<!doctype html>
       color: #475467;
       font-size: 12px;
     }
+    .manual-save-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .manual-save-actions .small-button {
+      width: 100%;
+    }
     .config-grid {
       display: grid;
       grid-template-columns: 1fr 74px;
@@ -12758,7 +12824,10 @@ HTML = r"""<!doctype html>
             <div id="manualAnchorRows"></div>
             <div>MS760: <strong id="manualMS">-</strong></div>
           </div>
-          <button id="createManual" class="small-button">Save pair</button>
+          <div class="manual-save-actions">
+            <button id="createManual" class="small-button">Save pair</button>
+            <button id="createManualPending" class="small-button secondary" style="display:none;">Save pending</button>
+          </div>
         <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的 LIF 参考峰和对应的 MS760 峰。</div>
         </div>
       </div>
@@ -14028,11 +14097,12 @@ HTML = r"""<!doctype html>
       button.setAttribute('aria-busy', 'true');
       button.textContent = '正在打开 UMAP…';
       try {
-        if (window.pywebview?.api?.open_umap_window) {
+        const umapUrl = `${window.location.origin}/umap`;
+        if (window.pywebview?.api?.open_umap) {
           let timeoutId = null;
           try {
             const result = await Promise.race([
-              window.pywebview.api.open_umap_window(),
+              window.pywebview.api.open_umap(umapUrl),
               new Promise((resolve, reject) => {
                 timeoutId = window.setTimeout(
                   () => reject(new Error('独立 UMAP 窗口启动超时，请重试')),
@@ -14040,15 +14110,19 @@ HTML = r"""<!doctype html>
                 );
               }),
             ]);
-            if (!result?.ok || result.visible === false) {
-              throw new Error('独立 UMAP 窗口没有成功显示，请重试');
-            }
+            if (!result?.ok) throw new Error('独立 UMAP 窗口没有成功创建，请重试');
           } finally {
             if (timeoutId !== null) window.clearTimeout(timeoutId);
           }
         } else {
-          const popup = window.open('/umap', 'lma-umap');
-          if (!popup) throw new Error('浏览器阻止了独立 UMAP 窗口，请允许弹出窗口后重试');
+          const link = document.createElement('a');
+          link.href = umapUrl;
+          link.target = 'lma-umap';
+          link.rel = 'noopener';
+          link.style.display = 'none';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
         }
       } catch (err) {
         alert(`无法打开 UMAP 窗口: ${err.message || err}`);
@@ -14766,6 +14840,7 @@ HTML = r"""<!doctype html>
       el('manualLifRow').style.display = cellMode ? 'block' : 'none';
       el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动参考峰关系';
       el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
+      el('createManualPending').style.display = cellMode ? 'block' : 'none';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
@@ -14792,7 +14867,7 @@ HTML = r"""<!doctype html>
       const anchors = qcAnchorChannels();
       el('manualHelp').textContent = eventAnnotation
         ? (cellMode
-            ? 'Cell pair：选 1 个 LIF 峰 + 1 个事件坐标 CSV 内的 MS760；灰色 MS 仅供查看。'
+            ? 'Cell pair：选 1 个 LIF 峰 + 1 个 MS760。Save pending 暂不进入 CSV 或 UMAP。'
             : `质控参考关系：必须选择 MS760；并从 ${anchors.join('/')} 中至少选择一个 LIF 峰，缺失通道会明确记为空值。`)
         : `前段时间校正：选择 ${anchors.join('/')} 中能够覆盖全部信号时间轴的峰，以及对应的 MS760 峰。`;
     }
@@ -15722,8 +15797,9 @@ HTML = r"""<!doctype html>
       return true;
     }
 
-    async function createManualTriplet() {
+    async function createManualTriplet(reviewStatus = 'accepted') {
       if (state.actionBusy) return;
+      reviewStatus = reviewStatus === 'pending' ? 'pending' : 'accepted';
       const cell = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
       const qcSurvey = state.stage === 'event_annotation';
       if (cell) {
@@ -15739,12 +15815,14 @@ HTML = r"""<!doctype html>
             ms_event_id: state.manual.MS760.id,
             window_start_min: state.current.start_min,
             window_end_min: state.current.end_min,
-            time_mode: state.current.time_mode
+            time_mode: state.current.time_mode,
+            review_status: reviewStatus
           });
           resetManualSelection();
           state.manualMode = false;
           focusSavedCellRelation(response.annotation);
           await loadWindow();
+          showInteractionHint(reviewStatus === 'pending' ? 'Saved as pending' : 'Pair saved');
           notifyStateChannel();
         } catch (err) {
           alert(`手动细胞二元组写入失败: ${err.message}`);
@@ -16335,7 +16413,7 @@ HTML = r"""<!doctype html>
             y1: lif.y.toFixed(2),
             x2: ms.x.toFixed(2),
             y2: ms.y.toFixed(2),
-            stroke: baseColor,
+            stroke: row.review_status === 'pending' ? '#d97706' : baseColor,
             'stroke-width': selected ? 1.65 : style.width,
             'stroke-dasharray': style.dash,
             opacity: row.review_status === 'accepted' ? 0.42 : style.opacity,
@@ -16691,7 +16769,8 @@ HTML = r"""<!doctype html>
       resetManualSelection();
       renderManualSelection();
     });
-    el('createManual').addEventListener('click', createManualTriplet);
+    el('createManual').addEventListener('click', () => createManualTriplet('accepted'));
+    el('createManualPending').addEventListener('click', () => createManualTriplet('pending'));
     el('exportAcceptedCsv').addEventListener('click', exportAcceptedCsv);
     el('openImportProject').addEventListener('click', () => setImportModal(true));
     el('openExistingProject').addEventListener('click', () => setOpenProjectModal(true));
@@ -17287,6 +17366,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     window_start_min=clean_value(payload.get("window_start_min")),
                     window_end_min=clean_value(payload.get("window_end_min")),
                     time_mode=str(payload.get("time_mode", "")) or None,
+                    review_status=str(payload.get("review_status") or "accepted"),
                 )
                 self.send_json({"ok": True, "annotation": row, "summary": self.data.store.summary()})
                 return

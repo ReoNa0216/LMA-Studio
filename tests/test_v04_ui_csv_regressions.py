@@ -34,10 +34,11 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertIn("正在打开 UMAP", body)
         self.assertRegex(body, r"button\.disabled\s*=\s*true")
         self.assertIn("aria-busy", body)
-        self.assertIn("window.pywebview.api.open_umap_window", body)
-        self.assertIn("window.open('/umap', 'lma-umap')", body)
+        self.assertIn("window.pywebview.api.open_umap(umapUrl)", body)
+        self.assertIn("window.location.origin", body)
+        self.assertIn("link.target = 'lma-umap'", body)
+        self.assertNotIn("window.open(", body)
         self.assertIn("finally", body)
-        self.assertNotIn("window.location", body)
         self.assertNotIn("location.href", body)
 
     def test_legacy_protocol_editor_is_explicitly_read_only(self):

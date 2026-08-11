@@ -78,7 +78,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.2-rc1 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload non-publishing test artifacts. Formal GitHub Release publication is tag-triggered after all release gates pass.
