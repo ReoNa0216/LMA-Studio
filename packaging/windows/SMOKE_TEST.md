@@ -1,11 +1,11 @@
-# Windows v0.4.2-rc1 Candidate Smoke Test
+# Windows v0.4.2 Release Smoke Test
 
-Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
+Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
 ## Safety and release boundary
 
-- This is a candidate acceptance test, not a formal Release procedure.
-- Do not create or push a version tag before Windows user acceptance.
+- Run this smoke test against the exact commit intended for the formal Release.
+- Formal publication remains tag-triggered and must follow the automated release gates.
 - Open existing projects only through temporary copies. Never point a write test at `HSC1_data` or an existing user project.
 - `HSC1_data` raw files may be selected only as read-only external references; save the generated project in a separate new directory. The existing current-standard project is named `Lin-_LSK`.
 - Keep the entire `dist/LMAStudio` directory together.
@@ -73,7 +73,7 @@ After creation, verify:
 - `provenance/` contains the input manifest, protocol, log, and import report; `diagnostics/lif` and `diagnostics/ms` contain optional review outputs.
 - The new project tree contains no pipeline-version directory and includes a root `README.md` explaining portability and sharing.
 
-For this candidate, follow `docs/Lin-_LSK_v0.4.2-rc1_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+Follow `docs/Lin-_LSK_v0.4.2_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 

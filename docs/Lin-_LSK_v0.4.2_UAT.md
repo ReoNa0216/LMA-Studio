@@ -1,16 +1,16 @@
-# LMA Studio v0.4.2-rc1 候选验收
+# LMA Studio v0.4.2 正式版验收
 
-本候选只增加两项用户功能：人工 Cell pair 可保存为待审，以及 macOS UMAP 改由 Python 创建独立原生窗口。项目 schema、峰表、时间模型和主 CSV 结构均不改变。
+v0.4.2 增加两项用户功能：人工 Cell pair 可保存为待审，以及 macOS UMAP 改由 Python 创建独立原生窗口。项目 schema、峰表、时间模型和主 CSV 结构均不改变。
 
 ## 安全边界
 
 1. 关闭正在运行的 LMA Studio。
 2. 完整复制 `Lin-_LSK` 项目目录，在副本上验收；不要修改原项目或 `HSC1_data`。
-3. Windows v0.4.1 正式包可以保留。本候选解压到另一个目录，不要覆盖旧包。
+3. Windows v0.4.1 正式包可以保留。将 v0.4.2 解压到另一个目录，不要覆盖旧包。
 
 ## Windows 回归
 
-1. 用候选打开项目副本，确认既有标注、冻结时间模型、Track、UMAP 和导出均正常。
+1. 用 v0.4.2 打开项目副本，确认既有标注、冻结时间模型、Track、UMAP 和导出均正常。
 2. 在 Events / Cell pair 中选择一个 LIF 峰和一个 MS760，点击 `Save pending`。
 3. 关系应以待审样式保留；重新打开相同窗口后仍可见。
 4. 待审关系不应出现在主 CSV 或 UMAP 分类中，也不应阻止该 MS event 的其他候选。
@@ -28,4 +28,4 @@
 - 没有项目迁移、标注丢失或 CSV 列变化。
 - `Save pending` 的待审与接受语义正确。
 - macOS 首次、复用和关闭后重开 UMAP 均有响应。
-- 本候选通过后再决定是否创建 v0.4.2 正式 tag/Release。
+- Windows 与 macOS 正式包均来自同一 `v0.4.2` 标签并通过自动化构建门禁。
