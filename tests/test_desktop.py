@@ -341,8 +341,9 @@ class DesktopApiTest(unittest.TestCase):
         precreated = FakeAuxWindow()
         api._bind_umap_window(precreated)
 
-        self.assertFalse(api.open_umap_window()["created"])
-        self.assertFalse(api.open_umap_window()["created"])
+        with mock.patch.object(desktop_module.sys, "platform", "win32"):
+            self.assertFalse(api.open_umap_window()["created"])
+            self.assertFalse(api.open_umap_window()["created"])
         self.assertEqual(precreated.restore_count, 2)
         self.assertEqual(precreated.show_count, 2)
         self.assertEqual(len(webview.windows), 0)
