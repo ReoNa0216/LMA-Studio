@@ -40,6 +40,8 @@ WEBVIEW2_CLIENT_IDS = (
     "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}",
     "{65C35B14-6C2D-412B-AC46-7148CC9D6497}",
 )
+UMAP_NATIVE_READY_TIMEOUT_SEC = 10.0
+UMAP_WINDOW_OPEN_TIMEOUT_SEC = 5.0
 
 
 def user_state_dir() -> Path:
@@ -226,6 +228,133 @@ class DesktopServer:
         LOGGER.info("Local application server stopped")
 
 
+def _load_cocoa_runtime() -> tuple[Any, Any, Any]:
+    """Import Cocoa objects only inside a packaged macOS process."""
+
+    import AppKit
+    import Foundation
+    from PyObjCTools import AppHelper
+
+    return AppKit, Foundation, AppHelper
+
+
+def _show_cocoa_window_and_wait(
+    window: Any,
+    *,
+    main_window: Any | None,
+    timeout: float,
+) -> dict[str, bool]:
+    """Show a pre-created Cocoa child and acknowledge actual visibility.
+
+    ``pywebview.Window.show`` schedules Cocoa work asynchronously and returns
+    before NSWindow has been ordered on screen.  JavaScript bridge calls run on
+    worker threads, so all AppKit interaction is placed in one main-loop
+    transaction and a following main-loop tick verifies the result.
+    """
+
+    AppKit, Foundation, AppHelper = _load_cocoa_runtime()
+    native = getattr(window, "native", None)
+    if native is None:
+        raise RuntimeError("UMAP 原生窗口尚未完成初始化，请重试")
+
+    completed = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def confirm_visible() -> None:
+        try:
+            visible = bool(native.isVisible())
+            miniaturized = bool(native.isMiniaturized())
+            focused = bool(native.isKeyWindow())
+            main_native = getattr(main_window, "native", None) if main_window is not None else None
+            main_visible = bool(main_native.isVisible()) if main_native is not None else True
+            outcome.update(
+                visible=visible and not miniaturized,
+                focused=focused,
+                main_visible=main_visible,
+            )
+            if not visible or miniaturized:
+                outcome["error"] = RuntimeError("UMAP 原生窗口没有显示")
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            completed.set()
+
+    def show_and_focus() -> None:
+        try:
+            move_to_active_space = int(
+                getattr(AppKit, "NSWindowCollectionBehaviorMoveToActiveSpace", 0)
+            )
+            if move_to_active_space:
+                behavior = int(native.collectionBehavior())
+                native.setCollectionBehavior_(behavior | move_to_active_space)
+            if bool(native.isMiniaturized()):
+                native.deminiaturize_(None)
+            application = AppKit.NSApplication.sharedApplication()
+            application.activateIgnoringOtherApps_(Foundation.YES)
+            native.makeKeyAndOrderFront_(None)
+            order_front = getattr(native, "orderFrontRegardless", None)
+            if callable(order_front):
+                order_front()
+            AppHelper.callAfter(confirm_visible)
+        except Exception as exc:
+            outcome["error"] = exc
+            completed.set()
+
+    AppHelper.callAfter(show_and_focus)
+    if not completed.wait(timeout):
+        raise RuntimeError("UMAP 原生窗口显示超时，请重试")
+    error = outcome.get("error")
+    if error is not None:
+        if isinstance(error, RuntimeError):
+            raise error
+        raise RuntimeError("无法显示 UMAP 原生窗口") from error
+    return {
+        "visible": bool(outcome.get("visible")),
+        "focused": bool(outcome.get("focused")),
+        "main_visible": bool(outcome.get("main_visible")),
+    }
+
+
+def _hide_cocoa_window_and_wait(window: Any, *, timeout: float) -> dict[str, bool]:
+    """Hide a Cocoa window and wait until AppKit reports it off screen."""
+
+    _AppKit, _Foundation, AppHelper = _load_cocoa_runtime()
+    native = getattr(window, "native", None)
+    if native is None:
+        raise RuntimeError("UMAP 原生窗口尚未完成初始化")
+
+    completed = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def confirm_hidden() -> None:
+        try:
+            outcome["hidden"] = not bool(native.isVisible())
+            if not outcome["hidden"]:
+                outcome["error"] = RuntimeError("UMAP 原生窗口没有隐藏")
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            completed.set()
+
+    def hide_window() -> None:
+        try:
+            native.orderOut_(None)
+            AppHelper.callAfter(confirm_hidden)
+        except Exception as exc:
+            outcome["error"] = exc
+            completed.set()
+
+    AppHelper.callAfter(hide_window)
+    if not completed.wait(timeout):
+        raise RuntimeError("UMAP 原生窗口隐藏超时")
+    error = outcome.get("error")
+    if error is not None:
+        if isinstance(error, RuntimeError):
+            raise error
+        raise RuntimeError("无法隐藏 UMAP 原生窗口") from error
+    return {"hidden": bool(outcome.get("hidden"))}
+
+
 class DesktopApi:
     """Small pywebview bridge that owns exactly one auxiliary UMAP window."""
 
@@ -239,6 +368,7 @@ class DesktopApi:
         self._umap_window: Any | None = None
         self._shutting_down = False
         self._lock = threading.RLock()
+        self._umap_native_ready = threading.Event()
 
     def _bind_main_window(self, window: Any) -> None:
         self._main_window = window
@@ -248,6 +378,11 @@ class DesktopApi:
 
         with self._lock:
             self._umap_window = window
+            self._umap_native_ready.clear()
+
+        def mark_native_ready(*_args: Any) -> None:
+            if getattr(window, "native", None) is not None or not hasattr(window, "native"):
+                self._umap_native_ready.set()
 
         def keep_loaded_on_user_close(*_args: Any) -> bool | None:
             with self._lock:
@@ -265,6 +400,7 @@ class DesktopApi:
         def forget(*_args: Any) -> None:
             self._forget_umap_window(window)
 
+        window.events.before_show += mark_native_ready
         window.events.closing += keep_loaded_on_user_close
         window.events.closed += forget
 
@@ -272,21 +408,33 @@ class DesktopApi:
         with self._lock:
             if self._umap_window is window:
                 self._umap_window = None
+                self._umap_native_ready.clear()
 
     def open_umap_window(self) -> dict[str, Any]:
         with self._lock:
             existing = self._umap_window
             if existing is None:
                 raise RuntimeError("UMAP 窗口尚未就绪，请重新启动 LMA Studio")
-            try:
-                existing.restore()
-            except Exception:
-                LOGGER.debug("UMAP window restore is unavailable", exc_info=True)
-            try:
-                existing.show()
-            except Exception as exc:
-                raise RuntimeError("无法显示 UMAP 窗口，请重新启动 LMA Studio") from exc
-            return {"ok": True, "created": False}
+            main_window = self._main_window
+            if sys.platform != "darwin":
+                try:
+                    existing.restore()
+                except Exception:
+                    LOGGER.debug("UMAP window restore is unavailable", exc_info=True)
+                try:
+                    existing.show()
+                except Exception as exc:
+                    raise RuntimeError("无法显示 UMAP 窗口，请重新启动 LMA Studio") from exc
+                return {"ok": True, "created": False}
+
+        if not self._umap_native_ready.wait(UMAP_NATIVE_READY_TIMEOUT_SEC):
+            raise RuntimeError("UMAP 原生窗口尚未完成初始化，请重新启动 LMA Studio")
+        state = _show_cocoa_window_and_wait(
+            existing,
+            main_window=main_window,
+            timeout=UMAP_WINDOW_OPEN_TIMEOUT_SEC,
+        )
+        return {"ok": True, "created": False, **state}
 
     def _close_umap_window(self, *_args: Any) -> None:
         with self._lock:
@@ -325,6 +473,78 @@ def _create_preloaded_umap_window(webview_module: Any, server_url: str) -> Any:
     return window
 
 
+def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str, Any]:
+    """Run a packaged Cocoa smoke test for the independent UMAP window."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError("独立 UMAP 窗口探针只适用于 macOS")
+    if webview_module is None:
+        import webview as webview_module
+
+    desktop_api = DesktopApi(object(), webview_module)
+    webview_module.settings["ALLOW_DOWNLOADS"] = False
+    webview_module.settings["SHOW_DEFAULT_MENUS"] = False
+    main_window = webview_module.create_window(
+        f"{APP_DISPLAY_NAME} · Window check",
+        html="<html><body>Checking the main annotation window.</body></html>",
+        width=640,
+        height=420,
+        min_size=(480, 320),
+        resizable=True,
+        background_color="#f6f7f9",
+        js_api=desktop_api,
+    )
+    if main_window is None:
+        raise RuntimeError("无法创建 macOS 主窗口探针")
+    desktop_api._bind_main_window(main_window)
+    umap_window = webview_module.create_window(
+        f"{APP_DISPLAY_NAME} · UMAP window check",
+        html="<html><body>Checking the independent UMAP window.</body></html>",
+        width=600,
+        height=440,
+        min_size=(480, 320),
+        resizable=True,
+        hidden=True,
+        background_color="#f7f8fa",
+    )
+    if umap_window is None:
+        raise RuntimeError("无法创建 macOS UMAP 窗口探针")
+    desktop_api._bind_umap_window(umap_window)
+
+    result: dict[str, Any] = {}
+    failures: list[BaseException] = []
+
+    def exercise_windows() -> None:
+        try:
+            first_open = desktop_api.open_umap_window()
+            hidden = _hide_cocoa_window_and_wait(
+                umap_window,
+                timeout=UMAP_WINDOW_OPEN_TIMEOUT_SEC,
+            )
+            reopened = desktop_api.open_umap_window()
+            if not first_open.get("visible") or not hidden.get("hidden") or not reopened.get("visible"):
+                raise RuntimeError("macOS 独立 UMAP 窗口探针未完成显示、隐藏和重新显示")
+            if not first_open.get("main_visible") or not reopened.get("main_visible"):
+                raise RuntimeError("打开独立 UMAP 窗口时主标注窗口意外消失")
+            result.update(first_open=first_open, hidden=hidden, reopened=reopened)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            desktop_api._close_umap_window()
+            try:
+                main_window.destroy()
+            except Exception as exc:
+                if not failures:
+                    failures.append(exc)
+
+    webview_module.start(func=exercise_windows, debug=False, private_mode=True)
+    if failures:
+        raise RuntimeError(f"macOS 独立 UMAP 窗口探针失败：{failures[0]}") from failures[0]
+    if not result:
+        raise RuntimeError("macOS 独立 UMAP 窗口探针没有返回结果")
+    return result
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"运行 {APP_DISPLAY_NAME} 桌面应用。")
     parser.add_argument("--project-dir", default=None)
@@ -332,6 +552,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--annotation-db", default=None)
     parser.add_argument("--debug", action="store_true", help="启用 WebView 开发工具，仅用于开发调试。")
     parser.add_argument("--check-runtime", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--check-umap-window", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -512,6 +733,9 @@ def main(argv: list[str] | None = None) -> int:
         args = parse_args(argv)
         if args.check_runtime:
             check_desktop_runtime()
+            return 0
+        if args.check_umap_window:
+            check_umap_window_runtime()
             return 0
         if not guard.acquire():
             show_native_message("LMA Studio 已经在运行。请切换到现有窗口。")

@@ -138,6 +138,9 @@ class FakeEvent:
 
 class FakeEvents:
     def __init__(self):
+        self.before_show = FakeEvent()
+        self.shown = FakeEvent()
+        self.loaded = FakeEvent()
         self.closing = FakeEvent()
         self.closed = FakeEvent()
 
@@ -162,6 +165,79 @@ class FakeAuxWindow:
     def destroy(self):
         self.destroy_count += 1
         self.events.closed.fire()
+
+
+class FakeCocoaNativeWindow:
+    def __init__(self, *, visible=False, miniaturized=False, focus_on_show=True):
+        self.visible = visible
+        self.miniaturized = miniaturized
+        self.key = False
+        self.focus_on_show = focus_on_show
+        self.collection_behavior = 0
+        self.show_count = 0
+
+    def collectionBehavior(self):
+        return self.collection_behavior
+
+    def setCollectionBehavior_(self, value):
+        self.collection_behavior = value
+
+    def isMiniaturized(self):
+        return self.miniaturized
+
+    def deminiaturize_(self, _sender):
+        self.miniaturized = False
+
+    def makeKeyAndOrderFront_(self, _sender):
+        self.show_count += 1
+        if self.focus_on_show:
+            self.visible = True
+            self.key = True
+
+    def orderFrontRegardless(self):
+        if self.focus_on_show:
+            self.visible = True
+
+    def orderOut_(self, _sender):
+        self.visible = False
+        self.key = False
+
+    def isVisible(self):
+        return self.visible
+
+    def isKeyWindow(self):
+        return self.key
+
+
+class FakeCocoaApplication:
+    def __init__(self):
+        self.activation_count = 0
+
+    def activateIgnoringOtherApps_(self, _value):
+        self.activation_count += 1
+
+
+class FakeCocoaAppKit:
+    NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1
+    application = FakeCocoaApplication()
+
+    class NSApplication:
+        @classmethod
+        def sharedApplication(cls):
+            return FakeCocoaAppKit.application
+
+
+class FakeCocoaFoundation:
+    YES = True
+
+
+class ImmediateAppHelper:
+    calls = []
+
+    @classmethod
+    def callAfter(cls, func, *args):
+        cls.calls.append((func, args))
+        func(*args)
 
 
 class FakeWindowFactory:
@@ -190,6 +266,23 @@ class FakeLifecycleWebView(FakeWindowFactory):
 
     def start(self, **kwargs):
         self.start_calls.append({"kwargs": kwargs, "window_count": len(self.windows)})
+
+
+class FakeProbeWebView(FakeWindowFactory):
+    def __init__(self):
+        super().__init__()
+        self.settings = {}
+
+    def start(self, *, func, **_kwargs):
+        main = self.windows[0][2]
+        auxiliary = self.windows[1][2]
+        main.native = FakeCocoaNativeWindow(visible=True)
+        auxiliary.native = FakeCocoaNativeWindow()
+        main.events.before_show.fire()
+        main.events.shown.fire()
+        auxiliary.events.before_show.fire()
+        auxiliary.events.shown.fire()
+        func()
 
 
 class FakeLifecycleServer:
@@ -253,6 +346,130 @@ class DesktopApiTest(unittest.TestCase):
         self.assertEqual(precreated.restore_count, 2)
         self.assertEqual(precreated.show_count, 2)
         self.assertEqual(len(webview.windows), 0)
+
+    def test_macos_open_waits_for_native_ready_and_confirms_visibility(self):
+        api = DesktopApi(FakeServerUrl(), FakeWindowFactory())
+        precreated = FakeAuxWindow()
+        api._bind_umap_window(precreated)
+        precreated.events.before_show.fire()
+
+        with mock.patch.object(desktop_module.sys, "platform", "darwin"), mock.patch.object(
+            desktop_module,
+            "_show_cocoa_window_and_wait",
+            return_value={"visible": True, "focused": True},
+        ) as show_cocoa:
+            result = api.open_umap_window()
+
+        show_cocoa.assert_called_once_with(
+            precreated,
+            main_window=None,
+            timeout=desktop_module.UMAP_WINDOW_OPEN_TIMEOUT_SEC,
+        )
+        self.assertEqual(precreated.restore_count, 0)
+        self.assertEqual(precreated.show_count, 0)
+        self.assertTrue(result["visible"])
+        self.assertTrue(result["focused"])
+
+    def test_macos_open_rejects_when_native_child_never_becomes_ready(self):
+        api = DesktopApi(FakeServerUrl(), FakeWindowFactory())
+        precreated = FakeAuxWindow()
+        api._bind_umap_window(precreated)
+
+        with mock.patch.object(desktop_module.sys, "platform", "darwin"), mock.patch.object(
+            desktop_module,
+            "UMAP_NATIVE_READY_TIMEOUT_SEC",
+            0.001,
+        ), mock.patch.object(desktop_module, "_show_cocoa_window_and_wait") as show_cocoa:
+            with self.assertRaisesRegex(RuntimeError, "尚未完成初始化"):
+                api.open_umap_window()
+
+        show_cocoa.assert_not_called()
+
+    def test_cocoa_show_is_one_main_loop_transaction_with_visibility_confirmation(self):
+        native = FakeCocoaNativeWindow(miniaturized=True)
+        auxiliary = mock.Mock(native=native)
+        main_native = FakeCocoaNativeWindow(visible=True)
+        main = mock.Mock(native=main_native)
+        ImmediateAppHelper.calls = []
+        FakeCocoaAppKit.application = FakeCocoaApplication()
+
+        with mock.patch.object(
+            desktop_module,
+            "_load_cocoa_runtime",
+            return_value=(FakeCocoaAppKit, FakeCocoaFoundation, ImmediateAppHelper),
+        ):
+            result = desktop_module._show_cocoa_window_and_wait(
+                auxiliary,
+                main_window=main,
+                timeout=0.1,
+            )
+
+        self.assertTrue(result["visible"])
+        self.assertTrue(result["focused"])
+        self.assertTrue(result["main_visible"])
+        self.assertEqual(native.show_count, 1)
+        self.assertFalse(native.miniaturized)
+        self.assertTrue(
+            native.collection_behavior
+            & FakeCocoaAppKit.NSWindowCollectionBehaviorMoveToActiveSpace
+        )
+        self.assertEqual(FakeCocoaAppKit.application.activation_count, 1)
+        self.assertGreaterEqual(len(ImmediateAppHelper.calls), 2)
+
+    def test_cocoa_show_rejects_an_acknowledgement_when_window_is_not_visible(self):
+        native = FakeCocoaNativeWindow(focus_on_show=False)
+        auxiliary = mock.Mock(native=native)
+        ImmediateAppHelper.calls = []
+
+        with mock.patch.object(
+            desktop_module,
+            "_load_cocoa_runtime",
+            return_value=(FakeCocoaAppKit, FakeCocoaFoundation, ImmediateAppHelper),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "没有显示"):
+                desktop_module._show_cocoa_window_and_wait(
+                    auxiliary,
+                    main_window=None,
+                    timeout=0.1,
+                )
+
+    def test_cocoa_hide_waits_until_the_native_window_is_off_screen(self):
+        native = FakeCocoaNativeWindow(visible=True)
+        auxiliary = mock.Mock(native=native)
+        ImmediateAppHelper.calls = []
+
+        with mock.patch.object(
+            desktop_module,
+            "_load_cocoa_runtime",
+            return_value=(FakeCocoaAppKit, FakeCocoaFoundation, ImmediateAppHelper),
+        ):
+            result = desktop_module._hide_cocoa_window_and_wait(auxiliary, timeout=0.1)
+
+        self.assertTrue(result["hidden"])
+        self.assertFalse(native.visible)
+        self.assertGreaterEqual(len(ImmediateAppHelper.calls), 2)
+
+    def test_packaged_macos_probe_opens_hides_and_reopens_the_independent_window(self):
+        webview = FakeProbeWebView()
+        visible = {"visible": True, "focused": True, "main_visible": True}
+
+        with mock.patch.object(desktop_module.sys, "platform", "darwin"), mock.patch.object(
+            desktop_module,
+            "_show_cocoa_window_and_wait",
+            return_value=visible,
+        ) as show_cocoa, mock.patch.object(
+            desktop_module,
+            "_hide_cocoa_window_and_wait",
+            return_value={"hidden": True},
+        ) as hide_cocoa:
+            result = desktop_module.check_umap_window_runtime(webview_module=webview)
+
+        self.assertEqual(show_cocoa.call_count, 2)
+        hide_cocoa.assert_called_once()
+        self.assertTrue(result["first_open"]["visible"])
+        self.assertTrue(result["reopened"]["visible"])
+        self.assertEqual(webview.windows[0][2].destroy_count, 1)
+        self.assertEqual(webview.windows[1][2].destroy_count, 1)
 
     def test_user_close_hides_precreated_umap_window_instead_of_destroying_it(self):
         api = DesktopApi(FakeServerUrl(), FakeWindowFactory())
@@ -372,6 +589,12 @@ class DesktopArgumentsTest(unittest.TestCase):
         self.assertIsNone(args.annotation_db)
         self.assertFalse(args.debug)
         self.assertFalse(args.check_runtime)
+        self.assertFalse(args.check_umap_window)
+
+    def test_packaged_umap_probe_flag_is_hidden_but_parseable(self):
+        args = parse_args(["--check-umap-window"])
+
+        self.assertTrue(args.check_umap_window)
 
 
 class PackagedScientificRuntimeProbeTest(unittest.TestCase):
@@ -384,6 +607,13 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
             with self.subTest(requirements=relative):
                 requirements = (repository_root / relative).read_text(encoding="utf-8")
                 self.assertIn("pywebview==6.2.1", requirements)
+
+    def test_macos_builder_runs_the_packaged_independent_umap_window_probe(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "packaging/macos/build_macos.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"$executable" --check-umap-window', script)
 
     def test_runtime_probe_exercises_expat_and_dynamic_preprocessing_imports(self):
         probe = getattr(desktop_module, "check_scientific_runtime", None)

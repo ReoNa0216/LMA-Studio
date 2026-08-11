@@ -13490,6 +13490,13 @@ HTML = r"""<!doctype html>
     function syncUmapButtonState() {
       const button = el('openUmap');
       const available = Boolean(state.meta?.cell_event_map?.available);
+      if (button.dataset.opening === 'true') {
+        button.disabled = true;
+        button.textContent = '正在打开 UMAP…';
+        button.title = '正在准备独立 UMAP 窗口';
+        return;
+      }
+      button.disabled = false;
       button.dataset.unavailable = available ? 'false' : 'true';
       button.textContent = available ? 'UMAP' : 'UMAP（未配置）';
       button.title = available
@@ -14014,14 +14021,42 @@ HTML = r"""<!doctype html>
         }
         return;
       }
+      const button = el('openUmap');
+      if (button.dataset.opening === 'true') return;
+      button.dataset.opening = 'true';
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+      button.textContent = '正在打开 UMAP…';
       try {
         if (window.pywebview?.api?.open_umap_window) {
-          await window.pywebview.api.open_umap_window();
+          let timeoutId = null;
+          try {
+            const result = await Promise.race([
+              window.pywebview.api.open_umap_window(),
+              new Promise((resolve, reject) => {
+                timeoutId = window.setTimeout(
+                  () => reject(new Error('独立 UMAP 窗口启动超时，请重试')),
+                  18000
+                );
+              }),
+            ]);
+            if (!result?.ok || result.visible === false) {
+              throw new Error('独立 UMAP 窗口没有成功显示，请重试');
+            }
+          } finally {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
+          }
         } else {
-          window.open('/umap', 'lma-umap');
+          const popup = window.open('/umap', 'lma-umap');
+          if (!popup) throw new Error('浏览器阻止了独立 UMAP 窗口，请允许弹出窗口后重试');
         }
       } catch (err) {
         alert(`无法打开 UMAP 窗口: ${err.message || err}`);
+      } finally {
+        delete button.dataset.opening;
+        button.removeAttribute('aria-busy');
+        button.disabled = false;
+        syncUmapButtonState();
       }
     }
 

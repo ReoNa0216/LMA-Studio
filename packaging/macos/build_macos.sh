@@ -36,6 +36,7 @@ plutil -lint "$app_path/Contents/Info.plist"
 file "$executable" | grep -q "arm64"
 "$executable" --help >/dev/null
 "$executable" --check-runtime >/dev/null
+"$executable" --check-umap-window >/dev/null
 
 mkdir -p release
 archive="$repo_root/release/LMA-Studio-${version}-macos-arm64.zip"
