@@ -107,4 +107,6 @@ Build Windows:
 powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
 ```
 
-The Windows and macOS PyInstaller specs bundle the detector, project-protocol, and project-storage helpers together with both LIF and MS preprocessing entry points. Existing-project regressions must operate on temporary copies and compare protected SQLite, manifest, and parquet hashes before/after. Manual macOS Actions runs create candidate artifacts only; formal publication remains tag-triggered after release gates pass.
+The Windows and macOS PyInstaller specs bundle the detector, project-protocol, and project-storage helpers together with both LIF and MS preprocessing entry points. Existing-project regressions must operate on temporary copies and compare protected SQLite, manifest, and parquet hashes before/after. Manual Actions runs may publish an explicitly requested prerelease candidate; formal publication remains tag-triggered after both desktop release gates pass.
+
+On macOS, the main Cocoa/WebKit document receives a process-random bridge capability URL. Only that exact native document receives the narrow CSP allowance required by pywebview 6.2.1 to install its JavaScript-to-Python bridge; ordinary browser pages and API responses keep the strict policy. The UMAP action waits for `pywebviewready`, passes the exact same-server `/umap` URL to the exposed `open_umap` method, and Python validates the origin and path before creating or restoring a second native WebView. It never falls back to Chrome or another external browser.

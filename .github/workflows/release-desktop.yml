@@ -176,4 +176,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --prerelease \
             --title "LMA Studio ${CANDIDATE_VERSION}" \
-            --notes "Public test candidate. The stable release remains v0.4.2. This candidate must pass mouse-level macOS UMAP validation before promotion. Source workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            --notes "Public test candidate. GitHub Latest remains the stable release. This candidate must pass mouse-level desktop validation before promotion. Source workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
