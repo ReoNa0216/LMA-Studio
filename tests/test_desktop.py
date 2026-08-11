@@ -433,6 +433,20 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
 
         self.assertIn('"$executable" --check-umap-window', script)
 
+    def test_manual_candidate_publication_is_opt_in_and_cannot_match_formal_tags(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/release-desktop.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertRegex(
+            workflow,
+            r"publish_prerelease:\s+description:[\s\S]+?default: false",
+        )
+        self.assertIn('candidate_tag="candidate-${CANDIDATE_VERSION}"', workflow)
+        self.assertIn("--prerelease", workflow)
+        self.assertIn("publish-release:\n    if: github.event_name == 'push'", workflow)
+
     def test_runtime_probe_exercises_expat_and_dynamic_preprocessing_imports(self):
         probe = getattr(desktop_module, "check_scientific_runtime", None)
         self.assertTrue(callable(probe))
