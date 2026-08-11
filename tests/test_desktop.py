@@ -5,6 +5,7 @@ import socket
 import sys
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 import uuid
 
@@ -100,6 +101,26 @@ class DesktopServerTest(unittest.TestCase):
             self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertNotEqual(self.server.httpd.server_port, 8050)
 
+    def test_pywebview_bridge_csp_is_limited_to_the_random_capability_url(self):
+        with urlopen(self.server.url, timeout=5) as response:
+            ordinary_csp = response.headers["Content-Security-Policy"]
+        with urlopen(self.server.webview_url, timeout=5) as response:
+            native_csp = response.headers["Content-Security-Policy"]
+        with urlopen(f"{self.server.url}?native_bridge=wrong", timeout=5) as response:
+            invalid_csp = response.headers["Content-Security-Policy"]
+
+        self.assertNotIn("'unsafe-eval'", ordinary_csp)
+        self.assertIn("'unsafe-eval'", native_csp)
+        self.assertNotIn("'unsafe-eval'", invalid_csp)
+        parsed = urlparse(self.server.webview_url)
+        self.assertEqual(parsed.path, "/")
+        self.assertGreaterEqual(len(parse_qs(parsed.query)["native_bridge"][0]), 32)
+
+        token = parse_qs(parsed.query)["native_bridge"][0]
+        with urlopen(f"{self.server.url}api/meta?native_bridge={token}", timeout=5) as response:
+            api_csp = response.headers["Content-Security-Policy"]
+        self.assertNotIn("'unsafe-eval'", api_csp)
+
     def test_rejects_untrusted_host(self):
         host, port = self.server.httpd.server_address[:2]
         connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -151,6 +172,7 @@ class FakeAuxWindow:
         self.show_count = 0
         self.hide_count = 0
         self.destroy_count = 0
+        self.run_js_calls = []
 
     def restore(self):
         self.restore_count += 1
@@ -164,6 +186,9 @@ class FakeAuxWindow:
     def destroy(self):
         self.destroy_count += 1
         self.events.closed.fire()
+
+    def run_js(self, code):
+        self.run_js_calls.append(code)
 
 
 class FakeWindowFactory:
@@ -199,12 +224,27 @@ class FakeProbeWebView(FakeWindowFactory):
         super().__init__()
         self.settings = {}
 
+    def create_window(self, *args, **kwargs):
+        window = super().create_window(*args, **kwargs)
+        api = kwargs.get("js_api")
+        if api is not None:
+            original_run_js = window.run_js
+
+            def invoke_bridge(code):
+                original_run_js(code)
+                api.open_umap(f"{api._server.url.rstrip('/')}/umap")
+
+            window.run_js = invoke_bridge
+        return window
+
     def start(self, *, func, **_kwargs):
+        self.windows[0][2].events.loaded.fire()
         func()
 
 
 class FakeLifecycleServer:
     url = "http://127.0.0.1:12345/"
+    webview_url = "http://127.0.0.1:12345/?native_bridge=test-capability"
     last_instance = None
 
     def __init__(self, _data):
@@ -265,6 +305,9 @@ class DesktopApiTest(unittest.TestCase):
         self.assertTrue(result["first_open"]["created"])
         self.assertFalse(result["reused"]["created"])
         self.assertTrue(result["reopened"]["created"])
+        self.assertTrue(result["bridge_invoked"])
+        self.assertGreaterEqual(len(webview.windows[0][2].run_js_calls), 1)
+        self.assertIn("window.pywebview.api.open_umap", webview.windows[0][2].run_js_calls[0])
         self.assertEqual(len(webview.windows), 3)
         self.assertEqual(webview.windows[0][2].destroy_count, 1)
         self.assertEqual(webview.windows[1][2].destroy_count, 1)
@@ -313,6 +356,7 @@ class DesktopApiTest(unittest.TestCase):
 
         self.assertEqual(len(webview.windows), 1)
         self.assertEqual(webview.start_calls[0]["window_count"], 1)
+        self.assertEqual(webview.windows[0][0][1], FakeLifecycleServer.webview_url)
         self.assertNotIn("hidden", webview.windows[0][1])
         self.assertEqual(FakeLifecycleServer.last_instance.start_count, 1)
         self.assertEqual(FakeLifecycleServer.last_instance.stop_count, 1)
@@ -388,6 +432,20 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn('"$executable" --check-umap-window', script)
+
+    def test_manual_candidate_publication_is_opt_in_and_cannot_match_formal_tags(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/release-desktop.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertRegex(
+            workflow,
+            r"publish_prerelease:\s+description:[\s\S]+?default: false",
+        )
+        self.assertIn('candidate_tag="candidate-${CANDIDATE_VERSION}"', workflow)
+        self.assertIn("--prerelease", workflow)
+        self.assertIn("publish-release:\n    if: github.event_name == 'push'", workflow)
 
     def test_runtime_probe_exercises_expat_and_dynamic_preprocessing_imports(self):
         probe = getattr(desktop_module, "check_scientific_runtime", None)

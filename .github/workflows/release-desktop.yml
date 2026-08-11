@@ -17,6 +17,11 @@ on:
         required: true
         default: dev-candidate
         type: string
+      publish_prerelease:
+        description: Publish successful manual-build artifacts as a public candidate prerelease
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -123,3 +128,52 @@ jobs:
             --verify-tag \
             --title "LMA Studio $GITHUB_REF_NAME" \
             --notes-file README_RELEASE.md
+
+  publish-prerelease:
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish_prerelease == true &&
+      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (needs.build-macos-arm64.result == 'success' || needs.build-macos-arm64.result == 'skipped')
+    needs:
+      - build-windows
+      - build-macos-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify candidate archives
+        shell: bash
+        run: |
+          shopt -s nullglob
+          checksum_files=(release-assets/*.zip.sha256)
+          if [[ ${#checksum_files[@]} -eq 0 ]]; then
+            echo "No candidate checksum files were downloaded" >&2
+            exit 1
+          fi
+          for checksum_file in "${checksum_files[@]}"; do
+            (
+              cd release-assets
+              sha256sum --check "$(basename "$checksum_file")"
+            )
+          done
+      - name: Publish public candidate prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          candidate_tag="candidate-${CANDIDATE_VERSION}"
+          gh release create "$candidate_tag" \
+            release-assets/*.zip \
+            release-assets/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "LMA Studio ${CANDIDATE_VERSION}" \
+            --notes "Public test candidate. GitHub Latest remains the stable release. This candidate must pass mouse-level desktop validation before promotion. Source workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."

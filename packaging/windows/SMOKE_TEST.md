@@ -1,4 +1,4 @@
-# Windows v0.4.2 Release Smoke Test
+# Windows v0.4.3 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -39,7 +39,7 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4.2 project
+## 3. Create a v0.4.3 project
 
 Create only in a new empty project directory. Configure:
 
@@ -73,7 +73,7 @@ After creation, verify:
 - `provenance/` contains the input manifest, protocol, log, and import report; `diagnostics/lif` and `diagnostics/ms` contain optional review outputs.
 - The new project tree contains no pipeline-version directory and includes a root `README.md` explaining portability and sharing.
 
-Follow `docs/Lin-_LSK_v0.4.2_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+Follow `docs/release_acceptance.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 

@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import secrets
 import sys
 import threading
+import time
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 import uuid
 
 if __package__ in {None, ""}:
@@ -191,13 +194,25 @@ class WebViewPathDialog:
 
 class DesktopServer:
     def __init__(self, data: Any, host: str = "127.0.0.1", port: int = 0) -> None:
-        self.httpd = create_http_server(host, port, data)
+        self._bridge_token = secrets.token_urlsafe(32)
+        self.httpd = create_http_server(
+            host,
+            port,
+            data,
+            desktop_bridge_token=self._bridge_token,
+        )
         self.thread: threading.Thread | None = None
 
     @property
     def url(self) -> str:
         host, port = self.httpd.server_address[:2]
         return f"http://{host}:{port}/"
+
+    @property
+    def webview_url(self) -> str:
+        """Capability URL that enables pywebview's generated JS bridge."""
+
+        return f"{self.url}?{urlencode({'native_bridge': self._bridge_token})}"
 
     @property
     def busy(self) -> bool:
@@ -313,7 +328,7 @@ class DesktopApi:
 
 
 def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str, Any]:
-    """Create the UMAP window dynamically in a packaged macOS GUI loop."""
+    """Exercise the real JS bridge and native UMAP window in a macOS GUI loop."""
 
     if sys.platform != "darwin":
         raise RuntimeError("独立 UMAP 窗口探针只适用于 macOS")
@@ -328,7 +343,7 @@ def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str,
     webview_module.settings["SHOW_DEFAULT_MENUS"] = False
     main_window = webview_module.create_window(
         f"{APP_DISPLAY_NAME} · Window check",
-        server.url,
+        server.webview_url,
         width=640,
         height=420,
         min_size=(480, 320),
@@ -341,12 +356,41 @@ def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str,
 
     result: dict[str, Any] = {}
     failures: list[BaseException] = []
+    main_loaded = threading.Event()
+
+    def mark_main_loaded(*_args: Any) -> None:
+        main_loaded.set()
+
+    main_window.events.loaded += mark_main_loaded
 
     def exercise_windows() -> None:
         try:
             umap_url = urljoin(server.url, "umap")
-            first_open = desktop_api.open_umap(umap_url)
+            if not main_loaded.wait(timeout=20):
+                raise RuntimeError("macOS 主窗口未能完成页面加载")
+            bridge_script = f"""
+              (() => {{
+                const invoke = () => {{
+                  window.__lmaUmapBridgeProbe = {{ started: true }};
+                  window.pywebview.api.open_umap({json.dumps(umap_url)})
+                    .then(value => {{ window.__lmaUmapBridgeProbe = {{ ok: true, value }}; }})
+                    .catch(error => {{
+                      window.__lmaUmapBridgeProbe = {{ ok: false, error: String(error) }};
+                    }});
+                }};
+                if (typeof window.pywebview?.api?.open_umap === 'function') invoke();
+                else window.addEventListener('pywebviewready', invoke, {{ once: true }});
+              }})();
+            """
+            main_window.run_js(bridge_script)
+            deadline = time.monotonic() + 20
             first_window = desktop_api._umap_window
+            while first_window is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+                first_window = desktop_api._umap_window
+            if first_window is None:
+                raise RuntimeError("主页面未能通过桌面桥接创建 UMAP 原生窗口")
+            first_open = {"ok": True, "created": True}
             reused = desktop_api.open_umap(umap_url)
             if first_window is None or not first_open.get("created") or reused.get("created"):
                 raise RuntimeError("macOS UMAP 原生窗口未按预期动态创建或复用")
@@ -355,7 +399,12 @@ def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str,
             reopened = desktop_api.open_umap(umap_url)
             if not reopened.get("created") or desktop_api._umap_window is first_window:
                 raise RuntimeError("macOS UMAP 原生窗口关闭后未能重新创建")
-            result.update(first_open=first_open, reused=reused, reopened=reopened)
+            result.update(
+                bridge_invoked=True,
+                first_open=first_open,
+                reused=reused,
+                reopened=reopened,
+            )
         except BaseException as exc:
             failures.append(exc)
         finally:
@@ -521,7 +570,7 @@ def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) 
     webview_module.settings["SHOW_DEFAULT_MENUS"] = False
     window = webview_module.create_window(
         APP_DISPLAY_NAME,
-        server.url,
+        server.webview_url,
         width=1280,
         height=800,
         min_size=(960, 640),
