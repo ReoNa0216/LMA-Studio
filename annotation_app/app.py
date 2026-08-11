@@ -17,6 +17,7 @@ import contextlib
 import csv
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import importlib.util
 import io
 import json
@@ -17124,6 +17125,7 @@ HTML = r"""<!doctype html>
 class AnnotationHandler(BaseHTTPRequestHandler):
     data: AppData | BootstrapAppData
     path_dialog: Callable[..., dict[str, Any]] = staticmethod(choose_native_path)
+    desktop_bridge_token: str | None = None
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.address_string(), fmt % args)
@@ -17139,14 +17141,29 @@ class AnnotationHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "")
         return host in allowed_hosts and (not origin or origin in allowed_origins)
 
-    def send_security_headers(self) -> None:
+    def native_bridge_is_authorized(self, parsed: Any) -> bool:
+        """Allow pywebview's generated API only on the native main document."""
+
+        expected = self.desktop_bridge_token
+        if not expected or parsed.path != "/":
+            return False
+        supplied = str(parse_qs(parsed.query).get("native_bridge", [""])[0])
+        return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+    def send_security_headers(self, *, allow_native_bridge: bool = False) -> None:
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        script_policy = "script-src 'self' 'unsafe-inline'"
+        if allow_native_bridge:
+            # pywebview 6.2.1 creates the declared JS API with ``new Function``.
+            # Scope this permission to the unguessable native-window URL rather
+            # than weakening pages opened in an ordinary browser.
+            script_policy += " 'unsafe-eval'"
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            f"default-src 'self'; {script_policy}; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
         )
 
@@ -17159,11 +17176,18 @@ class AnnotationHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def send_text(self, payload: str, status: HTTPStatus = HTTPStatus.OK, content_type: str = "text/html") -> None:
+    def send_text(
+        self,
+        payload: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        content_type: str = "text/html",
+        *,
+        allow_native_bridge: bool = False,
+    ) -> None:
         raw = payload.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
-        self.send_security_headers()
+        self.send_security_headers(allow_native_bridge=allow_native_bridge)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -17205,7 +17229,10 @@ class AnnotationHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/":
-                self.send_text(HTML)
+                self.send_text(
+                    HTML,
+                    allow_native_bridge=self.native_bridge_is_authorized(parsed),
+                )
                 return
             if parsed.path == "/umap":
                 self.send_text(UMAP_HTML)
@@ -17652,12 +17679,14 @@ def create_http_server(
     data: AppData | BootstrapAppData,
     *,
     path_dialog: Callable[..., dict[str, Any]] = choose_native_path,
+    desktop_bridge_token: str | None = None,
 ) -> LocalHTTPServer:
     class BoundAnnotationHandler(AnnotationHandler):
         pass
 
     BoundAnnotationHandler.data = data
     BoundAnnotationHandler.path_dialog = staticmethod(path_dialog)
+    BoundAnnotationHandler.desktop_bridge_token = desktop_bridge_token
     return LocalHTTPServer((host, port), BoundAnnotationHandler)
 
 

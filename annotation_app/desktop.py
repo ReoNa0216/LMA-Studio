@@ -14,11 +14,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import secrets
 import sys
 import threading
 import time
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 import uuid
 
 if __package__ in {None, ""}:
@@ -193,13 +194,25 @@ class WebViewPathDialog:
 
 class DesktopServer:
     def __init__(self, data: Any, host: str = "127.0.0.1", port: int = 0) -> None:
-        self.httpd = create_http_server(host, port, data)
+        self._bridge_token = secrets.token_urlsafe(32)
+        self.httpd = create_http_server(
+            host,
+            port,
+            data,
+            desktop_bridge_token=self._bridge_token,
+        )
         self.thread: threading.Thread | None = None
 
     @property
     def url(self) -> str:
         host, port = self.httpd.server_address[:2]
         return f"http://{host}:{port}/"
+
+    @property
+    def webview_url(self) -> str:
+        """Capability URL that enables pywebview's generated JS bridge."""
+
+        return f"{self.url}?{urlencode({'native_bridge': self._bridge_token})}"
 
     @property
     def busy(self) -> bool:
@@ -330,7 +343,7 @@ def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str,
     webview_module.settings["SHOW_DEFAULT_MENUS"] = False
     main_window = webview_module.create_window(
         f"{APP_DISPLAY_NAME} · Window check",
-        server.url,
+        server.webview_url,
         width=640,
         height=420,
         min_size=(480, 320),
@@ -557,7 +570,7 @@ def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) 
     webview_module.settings["SHOW_DEFAULT_MENUS"] = False
     window = webview_module.create_window(
         APP_DISPLAY_NAME,
-        server.url,
+        server.webview_url,
         width=1280,
         height=800,
         min_size=(960, 640),

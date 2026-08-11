@@ -5,6 +5,7 @@ import socket
 import sys
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 import uuid
 
@@ -99,6 +100,26 @@ class DesktopServerTest(unittest.TestCase):
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertNotEqual(self.server.httpd.server_port, 8050)
+
+    def test_pywebview_bridge_csp_is_limited_to_the_random_capability_url(self):
+        with urlopen(self.server.url, timeout=5) as response:
+            ordinary_csp = response.headers["Content-Security-Policy"]
+        with urlopen(self.server.webview_url, timeout=5) as response:
+            native_csp = response.headers["Content-Security-Policy"]
+        with urlopen(f"{self.server.url}?native_bridge=wrong", timeout=5) as response:
+            invalid_csp = response.headers["Content-Security-Policy"]
+
+        self.assertNotIn("'unsafe-eval'", ordinary_csp)
+        self.assertIn("'unsafe-eval'", native_csp)
+        self.assertNotIn("'unsafe-eval'", invalid_csp)
+        parsed = urlparse(self.server.webview_url)
+        self.assertEqual(parsed.path, "/")
+        self.assertGreaterEqual(len(parse_qs(parsed.query)["native_bridge"][0]), 32)
+
+        token = parse_qs(parsed.query)["native_bridge"][0]
+        with urlopen(f"{self.server.url}api/meta?native_bridge={token}", timeout=5) as response:
+            api_csp = response.headers["Content-Security-Policy"]
+        self.assertNotIn("'unsafe-eval'", api_csp)
 
     def test_rejects_untrusted_host(self):
         host, port = self.server.httpd.server_address[:2]
@@ -223,6 +244,7 @@ class FakeProbeWebView(FakeWindowFactory):
 
 class FakeLifecycleServer:
     url = "http://127.0.0.1:12345/"
+    webview_url = "http://127.0.0.1:12345/?native_bridge=test-capability"
     last_instance = None
 
     def __init__(self, _data):
@@ -334,6 +356,7 @@ class DesktopApiTest(unittest.TestCase):
 
         self.assertEqual(len(webview.windows), 1)
         self.assertEqual(webview.start_calls[0]["window_count"], 1)
+        self.assertEqual(webview.windows[0][0][1], FakeLifecycleServer.webview_url)
         self.assertNotIn("hidden", webview.windows[0][1])
         self.assertEqual(FakeLifecycleServer.last_instance.start_count, 1)
         self.assertEqual(FakeLifecycleServer.last_instance.stop_count, 1)
