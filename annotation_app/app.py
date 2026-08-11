@@ -101,7 +101,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.2"
+APP_VERSION = "lma_studio_v0.4.3-rc1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -14073,6 +14073,40 @@ HTML = r"""<!doctype html>
       setModalVisibility('projectConfigModal', open);
     }
 
+    function waitForNativeUmapBridge(timeoutMs = 12000) {
+      if (typeof window.pywebview?.api?.open_umap === 'function') {
+        return Promise.resolve();
+      }
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let pollId = null;
+        let timeoutId = null;
+        const cleanup = () => {
+          window.removeEventListener('pywebviewready', checkBridge);
+          if (pollId !== null) window.clearInterval(pollId);
+          if (timeoutId !== null) window.clearTimeout(timeoutId);
+        };
+        const finish = (error = null) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error) reject(error); else resolve();
+        };
+        const checkBridge = () => {
+          if (typeof window.pywebview?.api?.open_umap === 'function') finish();
+        };
+        window.addEventListener('pywebviewready', checkBridge);
+        pollId = window.setInterval(checkBridge, 50);
+        timeoutId = window.setTimeout(
+          () => finish(new Error(
+            '桌面窗口连接尚未就绪。请关闭并重新打开 LMA Studio；软件不会改用外部浏览器。'
+          )),
+          timeoutMs
+        );
+        checkBridge();
+      });
+    }
+
     async function openUmapWindow() {
       if (!state.meta?.cell_event_map?.available) {
         setProjectConfigModal(true);
@@ -14098,31 +14132,21 @@ HTML = r"""<!doctype html>
       button.textContent = '正在打开 UMAP…';
       try {
         const umapUrl = `${window.location.origin}/umap`;
-        if (window.pywebview?.api?.open_umap) {
-          let timeoutId = null;
-          try {
-            const result = await Promise.race([
-              window.pywebview.api.open_umap(umapUrl),
-              new Promise((resolve, reject) => {
-                timeoutId = window.setTimeout(
-                  () => reject(new Error('独立 UMAP 窗口启动超时，请重试')),
-                  18000
-                );
-              }),
-            ]);
-            if (!result?.ok) throw new Error('独立 UMAP 窗口没有成功创建，请重试');
-          } finally {
-            if (timeoutId !== null) window.clearTimeout(timeoutId);
-          }
-        } else {
-          const link = document.createElement('a');
-          link.href = umapUrl;
-          link.target = 'lma-umap';
-          link.rel = 'noopener';
-          link.style.display = 'none';
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
+        await waitForNativeUmapBridge();
+        let timeoutId = null;
+        try {
+          const result = await Promise.race([
+            window.pywebview.api.open_umap(umapUrl),
+            new Promise((resolve, reject) => {
+              timeoutId = window.setTimeout(
+                () => reject(new Error('独立 UMAP 窗口启动超时，请重试')),
+                18000
+              );
+            }),
+          ]);
+          if (!result?.ok) throw new Error('独立 UMAP 窗口没有成功创建，请重试');
+        } finally {
+          if (timeoutId !== null) window.clearTimeout(timeoutId);
         }
       } catch (err) {
         alert(`无法打开 UMAP 窗口: ${err.message || err}`);

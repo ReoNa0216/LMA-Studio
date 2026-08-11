@@ -151,6 +151,7 @@ class FakeAuxWindow:
         self.show_count = 0
         self.hide_count = 0
         self.destroy_count = 0
+        self.run_js_calls = []
 
     def restore(self):
         self.restore_count += 1
@@ -164,6 +165,9 @@ class FakeAuxWindow:
     def destroy(self):
         self.destroy_count += 1
         self.events.closed.fire()
+
+    def run_js(self, code):
+        self.run_js_calls.append(code)
 
 
 class FakeWindowFactory:
@@ -199,7 +203,21 @@ class FakeProbeWebView(FakeWindowFactory):
         super().__init__()
         self.settings = {}
 
+    def create_window(self, *args, **kwargs):
+        window = super().create_window(*args, **kwargs)
+        api = kwargs.get("js_api")
+        if api is not None:
+            original_run_js = window.run_js
+
+            def invoke_bridge(code):
+                original_run_js(code)
+                api.open_umap(f"{api._server.url.rstrip('/')}/umap")
+
+            window.run_js = invoke_bridge
+        return window
+
     def start(self, *, func, **_kwargs):
+        self.windows[0][2].events.loaded.fire()
         func()
 
 
@@ -265,6 +283,9 @@ class DesktopApiTest(unittest.TestCase):
         self.assertTrue(result["first_open"]["created"])
         self.assertFalse(result["reused"]["created"])
         self.assertTrue(result["reopened"]["created"])
+        self.assertTrue(result["bridge_invoked"])
+        self.assertGreaterEqual(len(webview.windows[0][2].run_js_calls), 1)
+        self.assertIn("window.pywebview.api.open_umap", webview.windows[0][2].run_js_calls[0])
         self.assertEqual(len(webview.windows), 3)
         self.assertEqual(webview.windows[0][2].destroy_count, 1)
         self.assertEqual(webview.windows[1][2].destroy_count, 1)

@@ -30,13 +30,18 @@ def javascript_function_body(name: str, next_name: str) -> str:
 class V04UiRegressionTest(unittest.TestCase):
     def test_umap_button_reports_progress_without_replacing_the_main_window(self):
         body = javascript_function_body("openUmapWindow", "selectedRawInputMode")
+        bridge = javascript_function_body("waitForNativeUmapBridge", "openUmapWindow")
 
         self.assertIn("正在打开 UMAP", body)
         self.assertRegex(body, r"button\.disabled\s*=\s*true")
         self.assertIn("aria-busy", body)
         self.assertIn("window.pywebview.api.open_umap(umapUrl)", body)
         self.assertIn("window.location.origin", body)
-        self.assertIn("link.target = 'lma-umap'", body)
+        self.assertIn("waitForNativeUmapBridge", body)
+        self.assertIn("pywebviewready", bridge)
+        self.assertIn("window.addEventListener", bridge)
+        self.assertNotIn("document.createElement('a')", body)
+        self.assertNotIn("link.target", body)
         self.assertNotIn("window.open(", body)
         self.assertIn("finally", body)
         self.assertNotIn("location.href", body)

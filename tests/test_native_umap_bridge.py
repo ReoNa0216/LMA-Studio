@@ -105,10 +105,18 @@ class NativeUmapBridgeContractTest(unittest.TestCase):
         self.assertEqual(webview.windows, [])
 
     def test_frontend_passes_full_origin_url_to_native_bridge_without_window_open(self):
-        self.assertIn("window.location.origin", HTML)
-        self.assertIn("window.pywebview.api.open_umap(umapUrl)", HTML)
-        self.assertNotIn("window.pywebview.api.open_umap_window", HTML)
-        self.assertNotIn("window.open('/umap'", HTML)
+        start = HTML.index("function waitForNativeUmapBridge")
+        end = HTML.index("function selectedRawInputMode", start)
+        umap_bridge = HTML[start:end]
+
+        self.assertIn("window.location.origin", umap_bridge)
+        self.assertIn("window.pywebview.api.open_umap(umapUrl)", umap_bridge)
+        self.assertIn("pywebviewready", umap_bridge)
+        self.assertIn("waitForNativeUmapBridge", umap_bridge)
+        self.assertNotIn("window.pywebview.api.open_umap_window", umap_bridge)
+        self.assertNotIn("window.open(", umap_bridge)
+        self.assertNotIn("link.target", umap_bridge)
+        self.assertNotIn("document.createElement('a')", umap_bridge)
 
 
 if __name__ == "__main__":
