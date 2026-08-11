@@ -56,7 +56,13 @@ The frozen time model is bound to the acquisition-layout hash, calibration-proto
 
 ## UMAP and Track synchronization
 
-The coordinate source CSV must contain `scan_start_time`, `UMAP1`, and `UMAP2`, but it may contain any number of unrelated columns. The importer locates and loads only those three required columns; source `CellNumber`, `batch`, `Type`, `leiden`, and other fields are ignored. The UMAP window displays only canonical event-map points. Colors are projected from current accepted SQLite semantics, and the QC legend is omitted when there is no active current QC event. Track-to-UMAP and UMAP-to-Track messages are bound to both project ID and map SHA, and navigation uses canonical `ms_event_id`.
+The coordinate source CSV must contain `scan_start_time`, `UMAP1`, and `UMAP2`, but it may contain any number of unrelated columns. The importer locates and loads only those three required columns; source `CellNumber`, `batch`, `Type`, `leiden`, and other fields are ignored. Project configuration can import a replacement coordinate CSV only when it resolves to exactly the same canonical MS-event population as the current map. The application writes a normalized project-internal copy and stores only content hashes, never a machine-specific external path. Switching coordinates changes UMAP and exported coordinates only; annotations, peaks, and the frozen time model remain unchanged, and a failed validation atomically preserves the current map. The UMAP window displays only canonical event-map points. Colors are projected from current accepted SQLite semantics, and the QC legend is omitted when there is no active current QC event. Track-to-UMAP and UMAP-to-Track messages are bound to both project ID and map SHA, and navigation uses canonical `ms_event_id`.
+
+## MS event-calling compatibility
+
+New raw preprocessing uses a project-adaptive PC34 background threshold and a fixed ±12 ppm extraction window. The wider mass window is an inclusive extension of the earlier ±10 ppm rule and covers the observed −10.68 ppm PC34 signal while retaining the per-event mass error for review. The revised threshold estimates the background body with robust quantiles and keeps the event separation at two scan intervals; it is deliberately more sensitive than the prior high-quantile rule.
+
+Opening an existing v0.4.0 project never reruns this caller: its manifest-bound MS event and scan tables remain the active evidence, so existing annotations and candidates do not change merely because the software was upgraded. Rebuilding the same raw input is an algorithm upgrade rather than a promise of byte-identical event counts; it may add previously missed events. Compatibility gates therefore require all established event apices to remain recoverable, reject event-free positive noise, and require the selected coordinate CSV to match completely before a new project is published.
 
 ## Compact CSV contract
 
@@ -70,9 +76,22 @@ MS_event_id,residual_sec,annotation_id
 
 Every canonical event-map event appears exactly once. `Type` is generated from the current accepted project relation: channel identity for cell rows, `QC` for active post-QC rows, and `unknown` when the event has not yet been annotated. It is never copied from the source coordinate CSV. Unknown rows keep annotation-specific fields blank. Detailed protocol/model hashes, ambiguity alternatives, payloads, and audits remain in SQLite and `export_runs` rather than bloating the user CSV.
 
-## Project-driven preprocessing
+## Project storage and preprocessing
 
-New projects write `results/tables/v3/00_project_protocol.json`. Both LIF and MS preprocessing use the same policy to label reference segments, the pre-annotation gap, and the annotation region. Reports and plots do not assign fixed 0–10.5 / 10.5–40 / >=40 meanings.
+New projects use a compact, manifest-bound layout:
+
+```text
+<project>/
+├─ lifms_project.json
+├─ data/          # four runtime parquet tables and cell_event_map.csv
+├─ annotations/   # annotation.sqlite and exports/
+├─ provenance/    # input manifest, project protocol, log, and report
+└─ diagnostics/   # optional LIF/MS review artifacts
+```
+
+`provenance/project_protocol.json` is written before preprocessing. Both LIF and MS preprocessing read the same project policy for reference segments, the pre-annotation gap, and the annotation region; reports and plots do not assign fixed 0–10.5 / 10.5–40 / >=40 meanings. Runtime tables, the canonical event map, and SQLite are resolved only from project-relative paths declared in `lifms_project.json` and are content-bound to that manifest.
+
+Existing v0.4.0 projects keep their historical manifest paths and are opened without directory migration. New projects do not recreate `results/`, `reports/`, `annotation_app/`, or pipeline-version subdirectories. External-reference projects are portable for browsing, annotation, and export, but require the original raw inputs for exact preprocessing reruns; copy mode additionally keeps those inputs under `raw_inputs/`.
 
 ## Development and packaging
 
@@ -88,4 +107,4 @@ Build Windows:
 powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
 ```
 
-The Windows and macOS PyInstaller specs must bundle all three preprocessing modules, including `scripts/v3/project_protocol.py`. Existing-project regressions must operate on temporary copies and compare protected SQLite, manifest, and parquet hashes before/after. Manual macOS Actions runs create candidate artifacts only; no formal Release is published before Windows user acceptance.
+The Windows and macOS PyInstaller specs bundle the detector, project-protocol, and project-storage helpers together with both LIF and MS preprocessing entry points. Existing-project regressions must operate on temporary copies and compare protected SQLite, manifest, and parquet hashes before/after. Manual macOS Actions runs create candidate artifacts only; formal publication remains tag-triggered after release gates pass.

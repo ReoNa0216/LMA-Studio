@@ -4,6 +4,7 @@ from pathlib import Path
 import socket
 import sys
 import unittest
+from unittest import mock
 from urllib.request import urlopen
 import uuid
 
@@ -14,6 +15,7 @@ from annotation_app.desktop import (
     DesktopServer,
     SingleInstanceGuard,
     WebViewPathDialog,
+    _create_preloaded_umap_window,
     parse_args,
 )
 
@@ -136,6 +138,7 @@ class FakeEvent:
 
 class FakeEvents:
     def __init__(self):
+        self.closing = FakeEvent()
         self.closed = FakeEvent()
 
 
@@ -144,6 +147,7 @@ class FakeAuxWindow:
         self.events = FakeEvents()
         self.restore_count = 0
         self.show_count = 0
+        self.hide_count = 0
         self.destroy_count = 0
 
     def restore(self):
@@ -151,6 +155,9 @@ class FakeAuxWindow:
 
     def show(self):
         self.show_count += 1
+
+    def hide(self):
+        self.hide_count += 1
 
     def destroy(self):
         self.destroy_count += 1
@@ -167,11 +174,63 @@ class FakeWindowFactory:
         return window
 
 
+class FakeLifecycleWebView(FakeWindowFactory):
+    FileDialog = FakeFileDialog
+
+    def __init__(self, *, fail_child=False):
+        super().__init__()
+        self.settings = {}
+        self.fail_child = fail_child
+        self.start_calls = []
+
+    def create_window(self, *args, **kwargs):
+        if self.fail_child and len(self.windows) == 1:
+            return None
+        return super().create_window(*args, **kwargs)
+
+    def start(self, **kwargs):
+        self.start_calls.append({"kwargs": kwargs, "window_count": len(self.windows)})
+
+
+class FakeLifecycleServer:
+    url = "http://127.0.0.1:12345/"
+    last_instance = None
+
+    def __init__(self, _data):
+        type(self).last_instance = self
+        self.start_count = 0
+        self.stop_count = 0
+        self.path_dialog = None
+
+    @property
+    def busy(self):
+        return False
+
+    def set_path_dialog(self, provider):
+        self.path_dialog = provider
+
+    def start(self):
+        self.start_count += 1
+
+    def stop(self):
+        self.stop_count += 1
+
+
 class FakeServerUrl:
     url = "http://127.0.0.1:12345/"
 
 
 class DesktopApiTest(unittest.TestCase):
+    def test_umap_child_is_created_hidden_before_the_gui_loop(self):
+        webview = FakeWindowFactory()
+
+        window = _create_preloaded_umap_window(webview, FakeServerUrl.url)
+
+        self.assertIs(window, webview.windows[0][2])
+        args, kwargs, _created = webview.windows[0]
+        self.assertEqual(args[1], "http://127.0.0.1:12345/umap")
+        self.assertTrue(kwargs["hidden"])
+
     def test_js_api_surface_does_not_expose_recursive_state(self) -> None:
         api = DesktopApi(FakeServerUrl(), FakeWindowFactory())
 
@@ -183,31 +242,89 @@ class DesktopApiTest(unittest.TestCase):
         }
         self.assertEqual(public_methods, {"open_umap_window"})
 
-    def test_umap_window_is_singleton_and_recreated_after_close(self):
+    def test_precreated_umap_window_is_reused_without_dynamic_window_creation(self):
         webview = FakeWindowFactory()
         api = DesktopApi(FakeServerUrl(), webview)
+        precreated = FakeAuxWindow()
+        api._bind_umap_window(precreated)
 
-        self.assertTrue(api.open_umap_window()["created"])
-        first = webview.windows[0][2]
         self.assertFalse(api.open_umap_window()["created"])
-        self.assertEqual(first.restore_count, 1)
-        self.assertEqual(first.show_count, 1)
-        self.assertEqual(len(webview.windows), 1)
+        self.assertFalse(api.open_umap_window()["created"])
+        self.assertEqual(precreated.restore_count, 2)
+        self.assertEqual(precreated.show_count, 2)
+        self.assertEqual(len(webview.windows), 0)
 
-        first.events.closed.fire()
-        self.assertTrue(api.open_umap_window()["created"])
-        self.assertEqual(len(webview.windows), 2)
+    def test_user_close_hides_precreated_umap_window_instead_of_destroying_it(self):
+        api = DesktopApi(FakeServerUrl(), FakeWindowFactory())
+        precreated = FakeAuxWindow()
+        api._bind_umap_window(precreated)
+
+        results = [handler() for handler in precreated.events.closing.handlers]
+
+        self.assertIn(False, results)
+        self.assertEqual(precreated.hide_count, 1)
+        self.assertEqual(precreated.destroy_count, 0)
+        self.assertIs(api._umap_window, precreated)
 
     def test_closing_main_owned_state_destroys_umap_only(self):
         webview = FakeWindowFactory()
         api = DesktopApi(FakeServerUrl(), webview)
-        api.open_umap_window()
-        auxiliary = webview.windows[0][2]
+        auxiliary = FakeAuxWindow()
+        api._bind_umap_window(auxiliary)
 
         api._close_umap_window()
 
         self.assertEqual(auxiliary.destroy_count, 1)
         self.assertIsNone(api._umap_window)
+
+    def test_desktop_precreates_both_native_windows_before_start(self):
+        webview = FakeLifecycleWebView()
+        args = parse_args([])
+        with mock.patch.object(
+            desktop_module,
+            "DesktopServer",
+            FakeLifecycleServer,
+        ), mock.patch.object(
+            desktop_module,
+            "initial_app_data",
+            return_value=object(),
+        ), mock.patch.object(
+            desktop_module,
+            "webview2_runtime_version",
+            return_value="test-runtime",
+        ):
+            desktop_module.run_desktop(args, webview_module=webview)
+
+        self.assertEqual(len(webview.windows), 2)
+        self.assertEqual(webview.start_calls[0]["window_count"], 2)
+        self.assertNotIn("hidden", webview.windows[0][1])
+        self.assertTrue(webview.windows[1][1]["hidden"])
+        self.assertEqual(FakeLifecycleServer.last_instance.start_count, 1)
+        self.assertEqual(FakeLifecycleServer.last_instance.stop_count, 1)
+        self.assertEqual(webview.windows[1][2].destroy_count, 1)
+
+    def test_hidden_umap_creation_failure_stops_server_before_native_loop(self):
+        webview = FakeLifecycleWebView(fail_child=True)
+        args = parse_args([])
+        with mock.patch.object(
+            desktop_module,
+            "DesktopServer",
+            FakeLifecycleServer,
+        ), mock.patch.object(
+            desktop_module,
+            "initial_app_data",
+            return_value=object(),
+        ), mock.patch.object(
+            desktop_module,
+            "webview2_runtime_version",
+            return_value="test-runtime",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "无法准备 UMAP 窗口"):
+                desktop_module.run_desktop(args, webview_module=webview)
+
+        self.assertEqual(webview.start_calls, [])
+        self.assertEqual(FakeLifecycleServer.last_instance.start_count, 0)
+        self.assertEqual(FakeLifecycleServer.last_instance.stop_count, 1)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows mutex semantics")
@@ -258,6 +375,16 @@ class DesktopArgumentsTest(unittest.TestCase):
 
 
 class PackagedScientificRuntimeProbeTest(unittest.TestCase):
+    def test_desktop_webview_runtime_is_pinned_for_reproducible_window_lifecycle(self):
+        repository_root = Path(__file__).resolve().parents[1]
+        for relative in (
+            "packaging/windows/requirements-win.txt",
+            "packaging/macos/requirements-macos.txt",
+        ):
+            with self.subTest(requirements=relative):
+                requirements = (repository_root / relative).read_text(encoding="utf-8")
+                self.assertIn("pywebview==6.2.1", requirements)
+
     def test_runtime_probe_exercises_expat_and_dynamic_preprocessing_imports(self):
         probe = getattr(desktop_module, "check_scientific_runtime", None)
         self.assertTrue(callable(probe))

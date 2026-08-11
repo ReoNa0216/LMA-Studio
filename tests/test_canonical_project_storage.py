@@ -239,10 +239,15 @@ def _new_project_request(root: Path, project_name: str = "new_project") -> dict:
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
-    """Capture persisted bytes; SQLite may touch WAL/SHM mtimes on connection."""
+    """Capture persisted bytes, excluding SQLite's transient WAL/SHM sidecars."""
 
     snapshot: dict[str, tuple[int, str]] = {}
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    for path in sorted(
+        item
+        for item in root.rglob("*")
+        if item.is_file()
+        and not item.name.endswith((".sqlite-wal", ".sqlite-shm"))
+    ):
         digest = hashlib.sha256()
         with path.open("rb") as handle:
             for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
@@ -942,6 +947,80 @@ class CanonicalProjectStorageTest(unittest.TestCase):
                     copied_project,
                     read_project_manifest(copied_project),
                 )
+
+    @unittest.skipUnless(
+        (REAL_V04_PROJECT / "lifms_project.json").is_file(),
+        "Lin-_LSK real-project integration fixture is not available",
+    )
+    def test_v040_project_copy_can_switch_umap_coordinates_and_reopen(self):
+        """Coordinate switching is additive and keeps a formal v0.4 project operable."""
+
+        original_before = _tree_snapshot(REAL_V04_PROJECT)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            copied_project = root / "renamed-v040-coordinate-switch"
+            shutil.copytree(REAL_V04_PROJECT, copied_project)
+            app = AppData.load(ProjectPaths.from_args(project_dir=str(copied_project)))
+            manifest_before = read_project_manifest(copied_project)
+            records_before = app.store.records()
+            frozen_before = json.loads(json.dumps(app.frozen_time_model()))
+            current_map = app.cell_event_map.copy()
+            self.assertGreater(len(current_map), 0)
+
+            replacement_source = root / "batch-uncorrected-coordinates.csv"
+            replacement = current_map.loc[
+                :, ["scan_start_time", "UMAP1", "UMAP2"]
+            ].copy()
+            replacement["UMAP1"] = replacement["UMAP1"] + 100.0
+            replacement["UMAP2"] = replacement["UMAP2"] - 100.0
+            replacement["batch"] = "uncorrected"
+            replacement.to_csv(replacement_source, index=False)
+
+            switched = app.attach_cell_event_map(replacement_source)
+            self.assertEqual(switched.store.records(), records_before)
+            self.assertEqual(switched.frozen_time_model(), frozen_before)
+            manifest_after = read_project_manifest(copied_project)
+            self.assertEqual(
+                manifest_after["intermediate_tables"],
+                manifest_before["intermediate_tables"],
+            )
+            self.assertEqual(
+                manifest_after["annotation_db"],
+                manifest_before["annotation_db"],
+            )
+            self.assertEqual(
+                manifest_after["cell_event_map"]["path"],
+                manifest_before["cell_event_map"]["path"],
+            )
+            self.assertEqual(
+                manifest_after["cell_event_map_history"][-1]["sha256"],
+                manifest_before["cell_event_map"]["sha256"],
+            )
+            self.assertNotIn(str(replacement_source.resolve()), json.dumps(manifest_after))
+
+            target_event_id = str(current_map.iloc[0]["ms_event_id"])
+            expected_umap1 = float(current_map.iloc[0]["UMAP1"]) + 100.0
+            expected_umap2 = float(current_map.iloc[0]["UMAP2"]) - 100.0
+            del app, switched
+            gc.collect()
+
+            reopened = AppData.load(
+                ProjectPaths.from_args(project_dir=str(copied_project))
+            )
+            self.assertEqual(reopened.store.records(), records_before)
+            self.assertEqual(reopened.frozen_time_model(), frozen_before)
+            exported = reopened.export_accepted_annotations_csv()
+            exported_frame = pd.read_csv(exported["csv_path"])
+            exported_row = exported_frame.loc[
+                exported_frame["MS_event_id"].astype(str) == target_event_id
+            ]
+            self.assertEqual(len(exported_row), 1)
+            self.assertAlmostEqual(float(exported_row.iloc[0]["UMAP1"]), expected_umap1)
+            self.assertAlmostEqual(float(exported_row.iloc[0]["UMAP2"]), expected_umap2)
+            del reopened
+            gc.collect()
+
+        self.assertEqual(_tree_snapshot(REAL_V04_PROJECT), original_before)
 
 
 if __name__ == "__main__":

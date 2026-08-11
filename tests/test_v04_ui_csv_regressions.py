@@ -147,6 +147,45 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(channels_rule.group("body"), r"min-height\s*:\s*34px")
         self.assertRegex(channels_rule.group("body"), r"align-items\s*:\s*center")
 
+    def test_config_protocol_rows_do_not_reserve_a_delete_column_or_overflow_modal(self):
+        render = javascript_function_body(
+            "renderConfigProtocolEditor",
+            "configChannelCheckboxes",
+        )
+        self.assertIn('class="protocol-row config-protocol-row"', render)
+        self.assertNotRegex(
+            render,
+            r"protocol-confirm[^\n]+</label>\s*<span></span>",
+            "Configuration rows have no delete button and must not reserve its empty column",
+        )
+
+        row_rule = re.search(
+            r"\.config-protocol-row\s*\{(?P<body>[^}]*)\}",
+            HTML,
+        )
+        self.assertIsNotNone(row_rule)
+        body = row_rule.group("body")
+        self.assertRegex(body, r"grid-template-columns\s*:")
+        self.assertRegex(body, r"max-width\s*:\s*100%")
+        self.assertRegex(body, r"min-width\s*:\s*0")
+
+        child_rule = re.search(
+            r"\.config-protocol-row\s*>\s*\*\s*\{(?P<body>[^}]*)\}",
+            HTML,
+        )
+        self.assertIsNotNone(child_rule)
+        self.assertRegex(child_rule.group("body"), r"min-width\s*:\s*0")
+
+        description_rule = re.search(
+            r"\.config-protocol-description\s*\{(?P<body>[^}]*)\}",
+            HTML,
+        )
+        self.assertIsNotNone(description_rule)
+        self.assertRegex(
+            description_rule.group("body"),
+            r"overflow-wrap\s*:\s*(?:anywhere|break-word)",
+        )
+
     def test_project_creation_has_persistent_busy_and_elapsed_feedback(self):
         body = javascript_function_body("importProject", "openExistingProject")
         self.assertIn("button.disabled = true", body)

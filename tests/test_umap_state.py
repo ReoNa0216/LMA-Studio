@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
@@ -337,7 +338,7 @@ class UmapAppStateTest(unittest.TestCase):
                     annotation_id="cell-without-frozen-model",
                 )
 
-    def test_one_time_attach_preserves_annotations_and_time_model(self):
+    def test_attach_and_replacement_preserve_annotations_and_time_model(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             app = make_app(root, with_map=False)
@@ -377,8 +378,127 @@ class UmapAppStateTest(unittest.TestCase):
             self.assertNotIn("AUTHOR_LABEL", canonical_text)
             manifest = json.loads((root / "lifms_project.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["cell_event_map"]["row_count"], 1)
-            with self.assertRaisesRegex(BadRequest, "不支持替换"):
-                attached.attach_cell_event_map(source)
+
+            replacement_source = root / "replacement.csv"
+            with replacement_source.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["scan_start_time", "UMAP1", "UMAP2", "batch"])
+                writer.writerow([41.0, -8.5, 9.25, "after-correction"])
+
+            replaced = attached.attach_cell_event_map(replacement_source)
+
+            self.assertEqual(replaced.store.records(), records_before)
+            self.assertEqual(replaced.store.active_time_model(), model_before)
+            self.assertEqual(float(replaced.cell_event_map.iloc[0]["UMAP1"]), -8.5)
+            self.assertEqual(float(replaced.cell_event_map.iloc[0]["UMAP2"]), 9.25)
+            replaced_manifest = json.loads(
+                (root / "lifms_project.json").read_text(encoding="utf-8")
+            )
+            self.assertNotEqual(
+                replaced_manifest["cell_event_map"]["sha256"],
+                manifest["cell_event_map"]["sha256"],
+            )
+            self.assertEqual(
+                replaced_manifest["cell_event_map_history"][-1]["sha256"],
+                manifest["cell_event_map"]["sha256"],
+            )
+            self.assertEqual(
+                replaced_manifest["cell_event_map"]["source_name"],
+                replacement_source.name,
+            )
+            self.assertNotIn(
+                "path",
+                replaced_manifest["cell_event_map_history"][-1],
+            )
+            self.assertNotIn(str(replacement_source), json.dumps(replaced_manifest))
+
+    def test_invalid_replacement_leaves_current_map_and_manifest_untouched(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            app = make_app(root, with_map=False)
+            app.store.upsert_review(
+                annotation_id="accepted-cell",
+                source="manual_created",
+                review_status="accepted",
+                payload={
+                    "review_stage": "cell_annotation",
+                    "candidate_type": "manual_cell_pair",
+                    "ms_event_id": "ms-1",
+                    "ms_time_min": 41.0,
+                    "time_model_version": "tm-current",
+                    "lif_channel": "G1",
+                },
+                action="test_accept_before_map_switch",
+            )
+            destination = root / "data/interim/lma/cell_event_umap.csv"
+            manifest_before = (root / "lifms_project.json").read_bytes()
+
+            invalid_source = root / "invalid.csv"
+            invalid_source.write_text(
+                "scan_start_time,UMAP1,UMAP2\n42.0,3.0,4.0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BadRequest, "缺少已有 accepted"):
+                app.attach_cell_event_map(invalid_source)
+
+            self.assertFalse(destination.exists())
+            self.assertEqual((root / "lifms_project.json").read_bytes(), manifest_before)
+
+    def test_manifest_write_failure_rolls_back_replacement_bytes(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            app = make_app(root, with_map=False)
+            first_source = root / "first.csv"
+            first_source.write_text(
+                "scan_start_time,UMAP1,UMAP2\n41.0,1.0,2.0\n",
+                encoding="utf-8",
+            )
+            attached = app.attach_cell_event_map(first_source)
+            destination = root / "data/interim/lma/cell_event_umap.csv"
+            map_before = destination.read_bytes()
+            manifest_before = (root / "lifms_project.json").read_bytes()
+            replacement_source = root / "replacement.csv"
+            replacement_source.write_text(
+                "scan_start_time,UMAP1,UMAP2\n41.0,8.0,9.0\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "annotation_app.app.write_existing_project_manifest",
+                side_effect=OSError("simulated manifest failure"),
+            ):
+                with self.assertRaisesRegex(BadRequest, "失败"):
+                    attached.attach_cell_event_map(replacement_source)
+
+            self.assertEqual(destination.read_bytes(), map_before)
+            self.assertEqual((root / "lifms_project.json").read_bytes(), manifest_before)
+
+    def test_replacement_requires_the_same_ms_event_population(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            app = make_app(root, with_map=False)
+            first_source = root / "first.csv"
+            first_source.write_text(
+                "scan_start_time,UMAP1,UMAP2\n"
+                "41.0,1.0,2.0\n"
+                "42.0,3.0,4.0\n",
+                encoding="utf-8",
+            )
+            attached = app.attach_cell_event_map(first_source)
+            destination = root / "data/interim/lma/cell_event_umap.csv"
+            map_before = destination.read_bytes()
+            manifest_before = (root / "lifms_project.json").read_bytes()
+
+            incomplete_source = root / "incomplete.csv"
+            incomplete_source.write_text(
+                "scan_start_time,UMAP1,UMAP2\n41.0,8.0,9.0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BadRequest, "相同的一批 MS event"):
+                attached.attach_cell_event_map(incomplete_source)
+
+            self.assertEqual(destination.read_bytes(), map_before)
+            self.assertEqual((root / "lifms_project.json").read_bytes(), manifest_before)
 
     def test_export_adds_coordinates_only_for_third_stage(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

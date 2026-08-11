@@ -9,6 +9,11 @@ $VenvDir = Join-Path $RepoRoot ".venv-win"
 
 Set-Location $RepoRoot
 
+# Keep subprocess output deterministic on non-English Windows code pages. Some
+# compatibility probes emit UTF-8 paths/text while unittest captures them.
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
 if (!$PythonExe -and $env:LIFMS_BUILD_PYTHON) {
     $PythonExe = $env:LIFMS_BUILD_PYTHON
 }

@@ -57,7 +57,7 @@ OUT_REPORT = ROOT / "reports/v3/02_ms_event_calling.md"
 CANONICAL_STORAGE = False
 EXPECTED_ALLOWED_STAGE = "V3-01~V3-06 main workflow"
 
-TOLERANCE_PPM = 10.0
+TOLERANCE_PPM = 12.0
 PSEUDOCOUNT = 1.0
 BIN_SIZE_MIN = 2.0
 COLLISION_GAP_SEC = 0.60
@@ -605,13 +605,23 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         )
     quiet_scans = pd.concat(quiet_scan_parts, ignore_index=True)
     quiet_peaks = pd.concat(quiet_peak_parts, ignore_index=True)
+    quiet_scan_p90 = float(quiet_scans.quantile(0.90))
     quiet_scan_p99 = float(quiet_scans.quantile(0.99))
+    quiet_localmax_p75 = (
+        float(quiet_peaks.quantile(0.75)) if not quiet_peaks.empty else 0.0
+    )
     quiet_localmax_p99 = float(quiet_peaks.quantile(0.99))
     quiet_mad_sigma = float(1.4826 * np.median(np.abs(quiet_scans - quiet_scans.median())))
 
     if signal_col == "pc34_760_max_intensity":
-        height = float(max(6.0 * quiet_scan_p99, 4.0 * quiet_localmax_p99))
-        prominence = float(max(0.8 * quiet_localmax_p99, 3.0 * quiet_mad_sigma))
+        # Cell events are sparse positive impulses on a continuously sampled
+        # background.  The former q99/q99 rule let even a small number of real
+        # events contaminate the selected background interval; one extreme
+        # event could then raise the threshold above nearly the whole run.
+        # Lower robust quantiles estimate the background body while the
+        # multipliers still require a clear height and local-prominence excess.
+        height = float(max(6.0 * quiet_scan_p90, 4.0 * quiet_localmax_p75))
+        prominence = float(max(0.8 * quiet_localmax_p75, 3.0 * quiet_mad_sigma))
     else:
         quiet_median = float(quiet_scans.median())
         localmax_excess_p99 = max(0.0, quiet_localmax_p99 - quiet_median)
@@ -622,10 +632,12 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
     t = scan["scan_start_time_sec"].to_numpy(float)
     threshold_fallback_reason = ""
     signal_max = float(np.nanmax(y)) if len(y) else 0.0
+    sparse_high_contrast_trace = 2 <= len(quiet_peaks) <= 5
     if (
         signal_col == "pc34_760_max_intensity"
         and signal_max > 0
         and (not np.isfinite(height) or height >= signal_max)
+        and sparse_high_contrast_trace
     ):
         # A contaminated "quiet" run can put its estimated threshold above
         # the entire trace.  Falling back to the median positive local maximum
@@ -647,7 +659,7 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
             )
         )
         threshold_fallback_reason = "quiet_threshold_exceeded_signal_range"
-    prelim_distance_points = 2 if threshold_fallback_reason else 3
+    prelim_distance_points = 2 if signal_col == "pc34_760_max_intensity" else 3
     prelim_idx, _ = find_peaks(
         y,
         height=height,
@@ -658,13 +670,13 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         gap_q10 = float(np.quantile(np.diff(t[prelim_idx]), 0.10))
         min_distance_sec = (
             float(2.0 * dt_sec)
-            if threshold_fallback_reason
+            if signal_col == "pc34_760_max_intensity"
             else float(np.clip(gap_q10, 6.0 * dt_sec, 15.0 * dt_sec))
         )
     else:
         gap_q10 = np.nan
         min_distance_sec = float(
-            (2.0 if threshold_fallback_reason else 6.0) * dt_sec
+            (2.0 if signal_col == "pc34_760_max_intensity" else 6.0) * dt_sec
         )
 
     params = {
@@ -673,7 +685,9 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         "quiet_start_min": float(quiet_bins["start_min"].min()),
         "quiet_end_min": float(quiet_bins["end_min"].max()),
         "quiet_bin_count": int(len(quiet_bins)),
+        "quiet_scan_p90": quiet_scan_p90,
         "quiet_scan_p99": quiet_scan_p99,
+        "quiet_localmax_p75": quiet_localmax_p75,
         "quiet_localmax_p99": quiet_localmax_p99,
         "quiet_median": float(quiet_scans.median()),
         "quiet_mad_sigma": quiet_mad_sigma,

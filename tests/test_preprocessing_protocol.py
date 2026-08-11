@@ -254,7 +254,7 @@ class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
         self.assertGreaterEqual(params["preliminary_peak_count"], 3)
         self.assertAlmostEqual(params["min_distance_sec"], 0.2, places=9)
 
-    def test_pc34_fallback_does_not_collapse_to_the_noise_localmax_median(self):
+    def test_pc34_robust_background_quantile_rejects_noise_without_fallback(self):
         signal_col = "pc34_760_max_intensity"
         time_sec = np.arange(1200, dtype=float) * 0.1
         signal = np.zeros(1200, dtype=float)
@@ -298,13 +298,11 @@ class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
             0.1,
         )
 
-        self.assertEqual(
-            params["threshold_fallback_reason"],
-            "quiet_threshold_exceeded_signal_range",
-        )
-        self.assertAlmostEqual(params["peak_height"], 300.0, places=9)
-        self.assertLessEqual(params["peak_prominence"], 30.0)
+        self.assertEqual(params["threshold_fallback_reason"], "")
+        self.assertAlmostEqual(params["peak_height"], 80.0, places=9)
+        self.assertAlmostEqual(params["peak_prominence"], 16.0, places=9)
         self.assertEqual(params["preliminary_peak_count"], 3)
+        self.assertAlmostEqual(params["min_distance_sec"], 0.2, places=9)
 
 
 if __name__ == "__main__":

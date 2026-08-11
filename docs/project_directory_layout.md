@@ -38,6 +38,8 @@ MyProject/
 
 新项目中的 MS 背景诊断使用“background estimation”语义；它只是自动阈值估计的低信号区间，不是 QC 群体，也不是 event 类型。
 
+UMAP 坐标可以在项目“配置”中切换，例如比较批次校正前后的坐标。软件只接受能映射到同一批 MS event 的 CSV，并把三列必要坐标规范化写入项目自己的 `cell_event_map.csv`；不会把创建电脑上的外部 CSV 绝对路径作为运行依赖。切换不改变标注、峰表或时间模型，校验失败时保留原坐标。
+
 ## 哪些文件必须一起保留
 
 软件运行边界由 `lifms_project.json` 声明，至少包括四张 parquet、`data/cell_event_map.csv` 和 `annotations/annotation.sqlite`。这些文件的路径和内容摘要绑定在一起，不能单独移动、替换或重新命名。

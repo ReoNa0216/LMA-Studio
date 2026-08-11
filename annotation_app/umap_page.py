@@ -695,7 +695,7 @@ UMAP_HTML = r"""<!doctype html>
     if (channel) {
       channel.addEventListener('message', event => {
         const message = event.data || {};
-        if (['annotation-changed', 'project-changed', 'map-attached'].includes(message.type)) {
+        if (['annotation-changed', 'project-changed', 'map-attached', 'map-replaced'].includes(message.type)) {
           pollRevision();
         }
       });

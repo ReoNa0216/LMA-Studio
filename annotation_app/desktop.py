@@ -237,10 +237,36 @@ class DesktopApi:
         self._webview = webview_module
         self._main_window: Any | None = None
         self._umap_window: Any | None = None
+        self._shutting_down = False
         self._lock = threading.RLock()
 
     def _bind_main_window(self, window: Any) -> None:
         self._main_window = window
+
+    def _bind_umap_window(self, window: Any) -> None:
+        """Own a child window created before the native GUI loop starts."""
+
+        with self._lock:
+            self._umap_window = window
+
+        def keep_loaded_on_user_close(*_args: Any) -> bool | None:
+            with self._lock:
+                if self._shutting_down:
+                    return None
+            try:
+                window.hide()
+            except Exception:
+                LOGGER.debug("UMAP window hide is unavailable", exc_info=True)
+            # Reuse one preloaded Cocoa/WinForms window.  Creating a Cocoa
+            # child from a JavaScript callback can otherwise leave a packaged
+            # app waiting on the native main run loop.
+            return False
+
+        def forget(*_args: Any) -> None:
+            self._forget_umap_window(window)
+
+        window.events.closing += keep_loaded_on_user_close
+        window.events.closed += forget
 
     def _forget_umap_window(self, window: Any) -> None:
         with self._lock:
@@ -250,41 +276,21 @@ class DesktopApi:
     def open_umap_window(self) -> dict[str, Any]:
         with self._lock:
             existing = self._umap_window
-            if existing is not None:
-                try:
-                    existing.restore()
-                except Exception:
-                    LOGGER.debug("UMAP window restore is unavailable", exc_info=True)
-                try:
-                    existing.show()
-                    return {"ok": True, "created": False}
-                except Exception:
-                    LOGGER.info("Existing UMAP window is no longer available; recreating it")
-                    self._umap_window = None
+            if existing is None:
+                raise RuntimeError("UMAP 窗口尚未就绪，请重新启动 LMA Studio")
+            try:
+                existing.restore()
+            except Exception:
+                LOGGER.debug("UMAP window restore is unavailable", exc_info=True)
+            try:
+                existing.show()
+            except Exception as exc:
+                raise RuntimeError("无法显示 UMAP 窗口，请重新启动 LMA Studio") from exc
+            return {"ok": True, "created": False}
 
-            window = self._webview.create_window(
-                f"{APP_DISPLAY_NAME} · UMAP",
-                f"{self._server.url}umap",
-                width=900,
-                height=720,
-                min_size=(560, 420),
-                resizable=True,
-                text_select=True,
-                zoomable=True,
-                background_color="#f7f8fa",
-            )
-            if window is None:
-                raise RuntimeError("无法创建 UMAP 窗口")
-            self._umap_window = window
-
-            def forget() -> None:
-                self._forget_umap_window(window)
-
-            window.events.closed += forget
-            return {"ok": True, "created": True}
-
-    def _close_umap_window(self) -> None:
+    def _close_umap_window(self, *_args: Any) -> None:
         with self._lock:
+            self._shutting_down = True
             window = self._umap_window
             self._umap_window = None
         if window is not None:
@@ -292,6 +298,31 @@ class DesktopApi:
                 window.destroy()
             except Exception:
                 LOGGER.debug("UMAP window was already closed", exc_info=True)
+
+
+def _create_preloaded_umap_window(webview_module: Any, server_url: str) -> Any:
+    """Create the sole auxiliary window before ``webview.start``.
+
+    pywebview's supported multi-window lifecycle initializes children before
+    the GUI loop and Cocoa requires that loop on the main thread.  Keeping the
+    child hidden makes the toolbar action a fast show/restore operation.
+    """
+
+    window = webview_module.create_window(
+        f"{APP_DISPLAY_NAME} · UMAP",
+        f"{server_url}umap",
+        width=900,
+        height=720,
+        min_size=(560, 420),
+        resizable=True,
+        hidden=True,
+        text_select=True,
+        zoomable=True,
+        background_color="#f7f8fa",
+    )
+    if window is None:
+        raise RuntimeError("无法准备 UMAP 窗口")
+    return window
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -449,6 +480,12 @@ def run_desktop(args: argparse.Namespace, *, webview_module: Any | None = None) 
         server.stop()
         raise RuntimeError("无法创建 LMA Studio 应用窗口")
     desktop_api._bind_main_window(window)
+    try:
+        umap_window = _create_preloaded_umap_window(webview_module, server.url)
+    except Exception:
+        server.stop()
+        raise
+    desktop_api._bind_umap_window(umap_window)
     server.set_path_dialog(WebViewPathDialog(window, webview_module))
 
     def block_unsafe_close() -> bool | None:

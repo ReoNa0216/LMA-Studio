@@ -1,4 +1,4 @@
-# Windows v0.4.1-rc1 Candidate Smoke Test
+# Windows v0.4.1 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio candidate can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -39,7 +39,7 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4.1 candidate project
+## 3. Create a v0.4.1 project
 
 Create only in a new empty project directory. Configure:
 
@@ -73,7 +73,7 @@ After creation, verify:
 - `provenance/` contains the input manifest, protocol, log, and import report; `diagnostics/lif` and `diagnostics/ms` contain optional review outputs.
 - The new project tree contains no pipeline-version directory and includes a root `README.md` explaining portability and sharing.
 
-For the renamed real-project regression, follow `docs/Lin-_LSK_v0.4.1-rc1_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
+For the renamed real-project regression, follow `docs/Lin-_LSK_v0.4.1_UAT.md`. Do not run the 8 GB MS import as part of a routine package smoke test.
 
 ## 4. Reject retired peak-standard projects without writes
 
@@ -163,6 +163,9 @@ On a project with a canonical event map:
 - Clicking a UMAP point opens the same canonical `ms_event_id` in its containing 2.5-minute Track window.
 - Project/map identity prevents events from a prior project leaking into the current window.
 - Closing the main window closes UMAP and releases the listener.
+- In `配置 > UMAP coordinates`, import an alternate CSV for the same MS events. `Validate & switch` must preserve annotation counts and the frozen time model, refresh the open UMAP window, and make the next main CSV use the new coordinates.
+- Rename or move the external CSV after a successful switch. UMAP must still open because the project owns a normalized internal copy rather than an external absolute path.
+- A CSV that omits or adds an MS event must be rejected, and the previously active UMAP coordinates must remain unchanged.
 
 ## 9. Compact CSV contract
 

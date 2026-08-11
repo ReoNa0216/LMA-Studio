@@ -101,7 +101,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.1-rc1"
+APP_VERSION = "lma_studio_v0.4.1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -809,6 +809,72 @@ def suggest_calibration_segment_windows(
             "warnings": warnings,
         }
 
+    # Each segment's highest-scoring cluster is its independent, data-driven
+    # dominant evidence.  Ordered arbitration must not silently replace a
+    # dominant cluster with a much weaker tail merely to satisfy a mistakenly
+    # declared segment order.  That failure mode looks scientifically
+    # plausible in the UI while representing the wrong population.
+    dominant_sequence = tuple(candidates[0] for candidates in candidates_by_segment)
+    dominant_score = float(sum(float(row["score"]) for row in dominant_sequence))
+    dominant_declared_order_ok = all(
+        float(current["suggested_end_min"]) < float(following["suggested_start_min"])
+        for current, following in zip(dominant_sequence, dominant_sequence[1:])
+    )
+    dominant_chronology = sorted(
+        zip(declared, dominant_sequence),
+        key=lambda item: (
+            float(item[1]["suggested_start_min"]),
+            float(item[1]["suggested_end_min"]),
+            int(item[0]["order"]),
+        ),
+    )
+    dominant_clusters_do_not_overlap = all(
+        float(current[1]["suggested_end_min"])
+        < float(following[1]["suggested_start_min"])
+        for current, following in zip(dominant_chronology, dominant_chronology[1:])
+    )
+    recommended_segment_order = (
+        [str(segment["segment_id"]) for segment, _candidate in dominant_chronology]
+        if dominant_clusters_do_not_overlap
+        else []
+    )
+
+    def dominant_evidence_warning() -> str:
+        evidence = []
+        for segment, candidate in dominant_chronology:
+            label = str(segment.get("population_label") or segment["segment_id"])
+            channels = "+".join(str(value) for value in segment["reference_channels"])
+            evidence.append(
+                f"{label}/{channels} "
+                f"{float(candidate['suggested_start_min']):.3f}–"
+                f"{float(candidate['suggested_end_min']):.3f} min"
+            )
+        if dominant_clusters_do_not_overlap:
+            return (
+                "主峰簇顺序与参考段填写顺序不一致："
+                + "；".join(evidence)
+                + "。请调整参考段顺序或人工填写边界；未回填次要尾部峰簇。"
+            )
+        return (
+            "各参考段的主峰簇发生重叠："
+            + "；".join(evidence)
+            + "。请核对参考段身份并人工填写边界；未回填次要峰簇。"
+        )
+
+    def dominant_conflict_rows() -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for base, candidate in zip(base_rows, dominant_sequence):
+            rows.append(
+                {
+                    **base,
+                    "status": "order_conflict",
+                    "dominant_start_min": candidate["suggested_start_min"],
+                    "dominant_end_min": candidate["suggested_end_min"],
+                    "dominant_peak_count": candidate["peak_count"],
+                }
+            )
+        return rows
+
     valid_sequences: list[tuple[float, tuple[dict[str, Any], ...]]] = []
 
     def collect_sequences(
@@ -833,14 +899,15 @@ def suggest_calibration_segment_windows(
 
     collect_sequences(0, (), 0.0)
     if not valid_sequences:
-        for row in base_rows:
-            row["status"] = "order_conflict"
-        return {
-            "segments": base_rows,
+        result = {
+            "segments": dominant_conflict_rows(),
             "can_apply_suggestions": False,
             "requires_user_confirmation": True,
-            "warnings": ["峰形证据无法组成严格按序且不重叠的参考窗口，请人工检查错序或重叠。"],
+            "warnings": [dominant_evidence_warning()],
         }
+        if recommended_segment_order:
+            result["recommended_segment_order"] = recommended_segment_order
+        return result
 
     valid_sequences.sort(
         key=lambda item: (
@@ -849,6 +916,21 @@ def suggest_calibration_segment_windows(
         )
     )
     best_score, best_sequence = valid_sequences[0]
+    if (
+        not dominant_declared_order_ok
+        and dominant_score > 0.0
+        and float(best_score) < 0.80 * dominant_score
+    ):
+        result = {
+            "segments": dominant_conflict_rows(),
+            "can_apply_suggestions": False,
+            "requires_user_confirmation": True,
+            "warnings": [dominant_evidence_warning()],
+        }
+        if recommended_segment_order:
+            result["recommended_segment_order"] = recommended_segment_order
+        return result
+
     ambiguity_tolerance = max(1e-9, abs(float(best_score)) * 0.05)
     near_best = [
         sequence
@@ -2456,11 +2538,11 @@ def load_project_cell_event_map(
     return frame, copy.deepcopy(entry)
 
 
-def write_existing_project_manifest(project_dir: Path, manifest: dict[str, Any]) -> None:
-    path = project_manifest_path(project_dir)
-    payload = (
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+def atomic_replace_bytes(path: Path, payload: bytes) -> None:
+    """Replace one project file without exposing a partially written payload."""
+
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_bytes(payload)
@@ -2468,6 +2550,14 @@ def write_existing_project_manifest(project_dir: Path, manifest: dict[str, Any])
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def write_existing_project_manifest(project_dir: Path, manifest: dict[str, Any]) -> None:
+    path = project_manifest_path(project_dir)
+    payload = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    atomic_replace_bytes(path, payload)
 
 
 def remove_staging_project(staging_dir: Path, intended_parent: Path) -> None:
@@ -7160,7 +7250,11 @@ class AppData:
                 "available": self.cell_event_map is not None,
                 "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
                 "sha256": str((self.cell_event_map_info or {}).get("sha256") or ""),
+                "source_name": str((self.cell_event_map_info or {}).get("source_name") or ""),
+                "source_sha256": str((self.cell_event_map_info or {}).get("source_sha256") or ""),
                 "attach_allowed": self.cell_event_map is None,
+                "replace_allowed": self.cell_event_map is not None,
+                "manage_allowed": bool(self.manifest),
             },
             "channel_identity_prior": self.channel_identity_prior,
             "inputs": {
@@ -7349,18 +7443,25 @@ class AppData:
             )
 
     def attach_cell_event_map(self, source_path: Path) -> "AppData":
-        if self.cell_event_map is not None or (self.manifest or {}).get("cell_event_map"):
-            raise BadRequest("当前项目已绑定 cell event map；当前版本不支持替换")
         manifest = copy.deepcopy(self.manifest or read_project_manifest(self.project.project_dir))
         if not manifest:
-            raise BadRequest("旧项目必须先建立 lifms_project.json 才能附加 event map")
-        destination = self.project.project_dir / (
-            CANONICAL_CELL_EVENT_MAP_PATH
-            if manifest_uses_canonical_storage(manifest)
-            else CELL_EVENT_MAP_RELATIVE_PATH
-        )
-        if destination.exists():
-            raise BadRequest("项目中已存在未登记的 canonical event map，拒绝覆盖")
+            raise BadRequest("项目缺少 lifms_project.json，不能启用 UMAP 坐标视图")
+        current_entry = manifest.get("cell_event_map")
+        if current_entry is not None and not isinstance(current_entry, dict):
+            raise BadRequest("当前项目的 UMAP 坐标记录无效，拒绝覆盖")
+        if isinstance(current_entry, dict):
+            destination = manifest_entry_path(self.project.project_dir, current_entry)
+        else:
+            destination = self.project.project_dir / (
+                CANONICAL_CELL_EVENT_MAP_PATH
+                if manifest_uses_canonical_storage(manifest)
+                else CELL_EVENT_MAP_RELATIVE_PATH
+            )
+        replacing = current_entry is not None or self.cell_event_map is not None
+        if replacing and not destination.is_file():
+            raise BadRequest("当前 UMAP 坐标文件缺失，拒绝在损坏状态下替换")
+        if not replacing and destination.exists():
+            raise BadRequest("项目中已存在未登记的 UMAP 坐标文件，拒绝覆盖")
         try:
             canonical, import_metadata = import_cell_event_map(
                 source_path,
@@ -7370,6 +7471,20 @@ class AppData:
         except CellEventMapError as exc:
             raise BadRequest(str(exc)) from exc
         allowed_ids = set(canonical["ms_event_id"].astype(str))
+        if replacing and self.cell_event_map is not None:
+            current_ids = set(self.cell_event_map["ms_event_id"].astype(str))
+            if allowed_ids != current_ids:
+                missing = sorted(current_ids - allowed_ids)
+                added = sorted(allowed_ids - current_ids)
+                details: list[str] = []
+                if missing:
+                    details.append("缺少 " + ", ".join(missing[:5]))
+                if added:
+                    details.append("新增 " + ", ".join(added[:5]))
+                raise BadRequest(
+                    "切换 UMAP 坐标必须覆盖与当前坐标相同的一批 MS event；"
+                    + "；".join(details)
+                )
         annotation_start = float(
             self.project_config().get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
         )
@@ -7390,7 +7505,7 @@ class AppData:
                 ms_time = ms_time_by_event.get(event_id, math.nan)
             if not math.isfinite(ms_time):
                 raise BadRequest(
-                    f"已有 accepted 第三阶段 annotation {row.get('annotation_id')} 无法绑定 MS 时间，拒绝附加 event map"
+                    f"已有 accepted 第三阶段 annotation {row.get('annotation_id')} 无法绑定 MS 时间，拒绝切换 UMAP 坐标"
                 )
             if ms_time < annotation_start:
                 continue
@@ -7399,9 +7514,12 @@ class AppData:
         if missing_history:
             preview = ", ".join(sorted(missing_history)[:10])
             raise BadRequest(
-                "event map 缺少已有 accepted 第三阶段 MS event，不能附加: " + preview
+                "新的 UMAP 坐标缺少已有 accepted 第三阶段 MS event，不能切换: " + preview
             )
 
+        manifest_path = project_manifest_path(self.project.project_dir)
+        previous_map_bytes = destination.read_bytes() if destination.is_file() else None
+        previous_manifest_bytes = manifest_path.read_bytes()
         try:
             write_canonical_map(canonical, destination)
             entry = cell_event_map_manifest_entry(
@@ -7419,19 +7537,62 @@ class AppData:
             }
             if isinstance(manifest.get("annotation_db"), dict):
                 manifest["annotation_db"]["schema_version"] = PROJECT_SCHEMA_VERSION
+            if isinstance(current_entry, dict):
+                history = manifest.get("cell_event_map_history")
+                if not isinstance(history, list):
+                    history = []
+                retired = {
+                    key: copy.deepcopy(current_entry[key])
+                    for key in (
+                        "sha256",
+                        "source_name",
+                        "source_sha256",
+                        "row_count",
+                        "matched_event_count",
+                        "time_unit",
+                        "match_tolerance_sec",
+                    )
+                    if key in current_entry
+                }
+                retired["retired_at"] = now_iso()
+                history.append(retired)
+                # The active map remains the only runtime source.  A bounded
+                # manifest history is enough to audit switches without copying
+                # author labels or retaining machine-specific source paths.
+                manifest["cell_event_map_history"] = history[-20:]
             manifest["cell_event_map"] = entry
             manifest["updated_by_app_version"] = APP_VERSION
             manifest["updated_at"] = now_iso()
             write_existing_project_manifest(self.project.project_dir, manifest)
-        except (CellEventMapError, OSError) as exc:
-            if destination.exists():
-                destination.unlink()
-            raise BadRequest(f"附加 event map 失败: {exc}") from exc
+            loaded_map, loaded_entry = load_project_cell_event_map(
+                self.project.project_dir,
+                manifest,
+                self.ms_events,
+            )
+            if loaded_map is None or loaded_entry is None:
+                raise CellEventMapError("写入后未能重新读取 UMAP 坐标")
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            try:
+                if previous_map_bytes is None:
+                    if destination.exists():
+                        destination.unlink()
+                else:
+                    atomic_replace_bytes(destination, previous_map_bytes)
+            except Exception as rollback_exc:  # pragma: no cover - catastrophic I/O
+                rollback_errors.append(f"坐标文件回滚失败: {rollback_exc}")
+            try:
+                atomic_replace_bytes(manifest_path, previous_manifest_bytes)
+            except Exception as rollback_exc:  # pragma: no cover - catastrophic I/O
+                rollback_errors.append(f"项目记录回滚失败: {rollback_exc}")
+            details = f"；{'；'.join(rollback_errors)}" if rollback_errors else ""
+            action = "替换" if replacing else "启用"
+            raise BadRequest(f"{action} UMAP 坐标失败: {exc}{details}") from exc
         return replace(
             self,
             manifest=manifest,
-            cell_event_map=canonical,
-            cell_event_map_info=entry,
+            cell_event_map=loaded_map,
+            cell_event_map_info=loaded_entry,
         )
 
     def export_accepted_annotations_csv(self) -> dict[str, Any]:
@@ -12138,6 +12299,21 @@ HTML = r"""<!doctype html>
     .modal.import-modal .protocol-row {
       grid-template-columns: 34px 150px 116px 116px minmax(190px, 1fr) 104px 32px;
     }
+    .config-protocol-row {
+      grid-template-columns: 34px 130px 84px 84px minmax(0, 1fr) max-content;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+    }
+    .config-protocol-row > * {
+      min-width: 0;
+    }
+    .config-protocol-description {
+      align-self: center;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
     .protocol-row input,
     .protocol-row select {
       width: 100%;
@@ -12204,11 +12380,20 @@ HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
       gap: 8px;
       margin: 0 0 7px;
       color: #111827;
       font-size: 13px;
       font-weight: 700;
+    }
+    .import-section-title > .row-actions {
+      flex: 0 0 auto;
+      flex-wrap: nowrap;
+    }
+    .import-section-title > .row-actions button {
+      flex: 0 0 auto;
+      white-space: nowrap;
     }
     .policy-fields {
       display: grid;
@@ -12433,6 +12618,29 @@ HTML = r"""<!doctype html>
       .protocol-row > *:nth-child(5),
       .protocol-row > *:nth-child(6) {
         grid-column: 2 / 4;
+      }
+      .config-protocol-row {
+        grid-template-columns: 34px minmax(0, 1fr) minmax(0, 1fr);
+      }
+      .config-protocol-row > *:nth-child(2) {
+        grid-column: 2 / 4;
+        grid-row: 1;
+      }
+      .config-protocol-row > *:nth-child(3) {
+        grid-column: 2;
+        grid-row: 2;
+      }
+      .config-protocol-row > *:nth-child(4) {
+        grid-column: 3;
+        grid-row: 2;
+      }
+      .config-protocol-row > *:nth-child(5) {
+        grid-column: 2 / 4;
+        grid-row: 3;
+      }
+      .config-protocol-row > *:nth-child(6) {
+        grid-column: 2 / 4;
+        grid-row: 4;
       }
       .policy-fields {
         grid-template-columns: 1fr;
@@ -12787,24 +12995,23 @@ HTML = r"""<!doctype html>
       </section>
       <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
         <div class="attach-map-heading">
-          <p class="side-title">为旧项目附加 UMAP 事件坐标</p>
-          <span class="attach-map-badge">仅可附加一次</span>
+          <p class="side-title">UMAP coordinates</p>
+          <span id="attachMapBadge" class="attach-map-badge">Not set</span>
         </div>
         <p class="attach-map-copy">
-          选择与当前 MS 数据对应的 CSV。软件会先校验全部时间匹配，成功后才写入项目并启用 UMAP；
-          校验失败不会改变项目。
+          导入另一份 CSV 即可切换批次校正前/后的坐标视图。仅更新 UMAP 与导出坐标；标注、峰和时间模型不变。
         </p>
-        <label class="attach-map-label" for="attachCellEventMap">事件坐标 CSV</label>
+        <label class="attach-map-label" for="attachCellEventMap">Coordinate CSV</label>
         <div class="path-picker-row">
-          <input id="attachCellEventMap" type="text" autocomplete="off" spellcheck="false" aria-describedby="attachMapRequirements" placeholder="请选择与当前项目对应的 .csv 文件" />
-          <button class="small-button secondary path-picker-button" aria-label="选择待附加的事件坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择待附加的事件坐标 CSV">选择 CSV</button>
+          <input id="attachCellEventMap" type="text" autocomplete="off" spellcheck="false" aria-describedby="attachMapRequirements" placeholder="选择与当前 MS 对应的 .csv" />
+          <button class="small-button secondary path-picker-button" aria-label="选择 UMAP 坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择 UMAP 坐标 CSV">选择 CSV</button>
         </div>
         <div id="attachMapRequirements" class="attach-map-requirements">
           必需列：<code>scan_start_time</code>、<code>UMAP1</code>、<code>UMAP2</code>；
-          其他列会被忽略。<span id="attachMapProjectName"></span>
+          其他列忽略。软件保存项目内副本，不依赖原 CSV 路径。<span id="attachMapProjectName"></span>
         </div>
         <div class="attach-map-actions">
-          <button id="attachMap" type="button" class="small-button" disabled>校验并附加到当前项目</button>
+          <button id="attachMap" type="button" class="small-button" disabled>Validate &amp; enable</button>
           <span id="attachMapReady" class="attach-map-ready">尚未选择文件</span>
         </div>
       </div>
@@ -13643,13 +13850,14 @@ HTML = r"""<!doctype html>
           return;
         }
         const byId = new Map((result.segments || []).map(row => [String(row.segment_id), row]));
+        const canApplySuggestions = Boolean(result.can_apply_suggestions);
         state.importSegments.forEach((segment, index) => {
           const requestId = segments[index].segment_id;
           const suggestion = byId.get(requestId) || result.segments?.[index] || {};
-          if (suggestion.suggested_start_min !== null && suggestion.suggested_start_min !== undefined && suggestion.suggested_start_min !== '' && Number.isFinite(Number(suggestion.suggested_start_min))) {
+          if (canApplySuggestions && suggestion.suggested_start_min !== null && suggestion.suggested_start_min !== undefined && suggestion.suggested_start_min !== '' && Number.isFinite(Number(suggestion.suggested_start_min))) {
             segment.start_min = Number(suggestion.suggested_start_min);
           }
-          if (suggestion.suggested_end_min !== null && suggestion.suggested_end_min !== undefined && suggestion.suggested_end_min !== '' && Number.isFinite(Number(suggestion.suggested_end_min))) {
+          if (canApplySuggestions && suggestion.suggested_end_min !== null && suggestion.suggested_end_min !== undefined && suggestion.suggested_end_min !== '' && Number.isFinite(Number(suggestion.suggested_end_min))) {
             segment.end_min = Number(suggestion.suggested_end_min);
           }
           segment.boundaries_confirmed = false;
@@ -13776,8 +13984,8 @@ HTML = r"""<!doctype html>
       if (open) {
         renderConfigInputs(true);
         setConfigSaveStatus('');
-        const attachAllowed = Boolean(state.meta?.cell_event_map?.attach_allowed);
-        el('attachMapPanel').style.display = attachAllowed ? 'block' : 'none';
+        const manageMap = Boolean(state.meta?.cell_event_map?.manage_allowed);
+        el('attachMapPanel').style.display = manageMap ? 'block' : 'none';
         el('attachCellEventMap').value = '';
         el('attachCellEventMap').title = '';
         const projectName = state.meta?.project?.project_dir
@@ -13792,9 +14000,9 @@ HTML = r"""<!doctype html>
     async function openUmapWindow() {
       if (!state.meta?.cell_event_map?.available) {
         setProjectConfigModal(true);
-        if (state.meta?.cell_event_map?.attach_allowed) {
+        if (state.meta?.cell_event_map?.manage_allowed) {
           setConfigSaveStatus(
-            '当前项目尚未附加事件坐标 CSV，因此 UMAP 暂不可用。请在上方选择 CSV，再点击“校验并附加到当前项目”。',
+            '当前项目尚未启用 UMAP 坐标。请在上方选择 CSV，再点击“Validate & enable”。',
             'warning'
           );
           window.setTimeout(() => el('attachCellEventMap').focus(), 0);
@@ -14360,14 +14568,13 @@ HTML = r"""<!doctype html>
         ? '<div class="qc-anchor-rule">此项目的前段参考窗口按原规则只读显示；软件不会静默改写。</div>'
         : '';
       box.innerHTML = legacyNotice + (protocol.segments || []).map((segment, index) => `
-        <div class="protocol-row" data-cfg-segment-index="${index}">
+        <div class="protocol-row config-protocol-row" data-cfg-segment-index="${index}">
           <strong>#${segment.order}</strong>
           <span><strong>${escapeText(calibrationSegmentDisplayName(segment))}</strong><br><small>${escapeText((segment.reference_channels || []).join('/'))}</small></span>
           <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(calibrationSegmentDisplayName(segment))} 开始时间"${legacy ? ' disabled' : ''} /></label>
           <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(calibrationSegmentDisplayName(segment))} 结束时间"${legacy ? ' disabled' : ''} /></label>
-          <span>${escapeText(referenceModeLabel(segment.reference_mode))} · ${(segment.time_axes || []).map(axis => escapeText(physicalAxisName(axis))).join('/')}</span>
+          <span class="config-protocol-description">${escapeText(referenceModeLabel(segment.reference_mode))} · ${(segment.time_axes || []).map(axis => escapeText(physicalAxisName(axis))).join('/')}</span>
           <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
-          <span></span>
         </div>
       `).join('');
     }
@@ -14565,11 +14772,20 @@ HTML = r"""<!doctype html>
       const input = el('attachCellEventMap');
       const value = input.value.trim();
       const filename = value.split(/[\\/]/).filter(Boolean).pop() || '';
+      const mapInfo = state.meta?.cell_event_map || {};
+      const active = Boolean(mapInfo.available);
+      const activeSourceName = String(mapInfo.source_name || '').trim();
       input.title = value;
       el('attachMap').disabled = Boolean(state.actionBusy) || !value;
+      el('attachMap').textContent = active ? 'Validate & switch' : 'Validate & enable';
+      el('attachMapBadge').textContent = active
+        ? `Active · ${Number(mapInfo.row_count || 0).toLocaleString()} points`
+        : 'Not set';
       el('attachMapReady').textContent = value
         ? `已选择：${filename}`
-        : '尚未选择文件';
+        : (active
+            ? `${activeSourceName ? `当前：${activeSourceName}；` : ''}选择新 CSV 可切换坐标视图`
+            : '尚未选择文件');
     }
 
     async function saveProjectConfig() {
@@ -15270,7 +15486,11 @@ HTML = r"""<!doctype html>
         setConfigSaveStatus('请选择事件坐标 CSV。', 'error');
         return;
       }
-      if (!window.confirm('软件会读取必需坐标列并一次性绑定到当前项目；绑定后不能直接替换。继续？')) return;
+      const replacing = Boolean(state.meta?.cell_event_map?.available);
+      const prompt = replacing
+        ? '切换后 UMAP 和主 CSV 将使用新坐标；现有标注与时间模型保持不变。继续？'
+        : '校验通过后将启用 UMAP；现有标注与时间模型保持不变。继续？';
+      if (!window.confirm(prompt)) return;
       state.actionBusy = true;
       const button = el('attachMap');
       const oldText = button.textContent;
@@ -15278,21 +15498,22 @@ HTML = r"""<!doctype html>
       button.textContent = '校验中…';
       setConfigSaveStatus('正在校验 CSV 坐标与当前 MS 事件的一对一关系…');
       try {
-        const result = await postJson('/api/attach-cell-event-map', { source_path: sourcePath });
+        const result = await postJson('/api/replace-cell-event-map', { source_path: sourcePath });
         state.meta = result.meta;
         state.current = null;
         syncUmapButtonState();
-        el('attachMapPanel').style.display = 'none';
         await loadWindow();
-        notifyStateChannel('map-attached');
+        notifyStateChannel(replacing ? 'map-replaced' : 'map-attached');
         const rowCount = Number(result.meta?.cell_event_map?.row_count || 0);
         setConfigSaveStatus(
-          `已成功附加 ${rowCount.toLocaleString()} 个事件坐标点，UMAP 已启用。`,
+          replacing
+            ? `已切换 ${rowCount.toLocaleString()} 个 UMAP 坐标点。标注与时间模型未改变。`
+            : `已启用 ${rowCount.toLocaleString()} 个 UMAP 坐标点。`,
           'success'
         );
       } catch (err) {
-        setConfigSaveStatus(`附加失败：${err.message}`, 'error');
-        alert(`附加事件坐标失败: ${err.message}`);
+        setConfigSaveStatus(`坐标切换失败：${err.message}；当前坐标保持不变。`, 'error');
+        alert(`UMAP 坐标切换失败: ${err.message}`);
       } finally {
         button.textContent = oldText;
         state.actionBusy = false;
@@ -15338,8 +15559,11 @@ HTML = r"""<!doctype html>
           target.focus();
           if (attachPicker) {
             const filename = result.path.split(/[\\/]/).filter(Boolean).pop() || result.path;
+            const actionLabel = state.meta?.cell_event_map?.available
+              ? 'Validate & switch'
+              : 'Validate & enable';
             setConfigSaveStatus(
-              `已选择 ${filename}。点击“校验并附加到当前项目”后才会写入项目。`
+              `已选择 ${filename}。点击“${actionLabel}”后才会写入项目。`
             );
           } else {
             el('importHint').textContent = duplicateImportLifPathMessage();
@@ -17072,7 +17296,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json(result)
                 return
-            if parsed.path == "/api/attach-cell-event-map":
+            if parsed.path in {"/api/attach-cell-event-map", "/api/replace-cell-event-map"}:
                 if not isinstance(self.data, AppData):
                     raise BadRequest("请先打开项目")
                 source_path = str(payload.get("source_path", "")).strip()

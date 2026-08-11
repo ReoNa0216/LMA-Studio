@@ -7,7 +7,8 @@ param(
     [string]$CopyRoot = "",
     [switch]$CleanupStaleCopy,
     [switch]$ExerciseBoundaryAnchorWrite,
-    [switch]$ExerciseSavedPairPerformance
+    [switch]$ExerciseSavedPairPerformance,
+    [switch]$ExerciseUmapCoordinateSwitch
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +24,7 @@ $TempPrefix = $TempBase + [IO.Path]::DirectorySeparatorChar
 $CopyRoot = if ($CopyRoot) {
     [IO.Path]::GetFullPath($CopyRoot)
 } else {
-    Join-Path $TempBase "LMAStudioProjectRegression_Lin_LSK_v041rc1"
+    Join-Path $TempBase "LMAStudioProjectRegression_Lin_LSK_v041rc2"
 }
 $CopyRoot = [IO.Path]::GetFullPath($CopyRoot)
 $CopyProject = Join-Path $CopyRoot "Lin-_LSK"
@@ -116,6 +117,7 @@ try {
     $Before = Get-ProjectSnapshot $CopyProject
     $Manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $CopyProject "lifms_project.json") |
         ConvertFrom-Json
+    $ManifestPath = Join-Path $CopyProject "lifms_project.json"
 
     $Process = Start-Process -FilePath $Exe `
         -ArgumentList @("--project-dir", "`"$CopyProject`"") `
@@ -201,6 +203,66 @@ try {
     )
     if ($TimeDefaultMatches.Count -ne 1) {
         throw "Default MS760-time tolerance must locate exactly one HSC1 target point for the UAT value."
+    }
+
+    $UmapSwitchExercised = $false
+    $UmapSwitchRows = 0
+    $UmapSwitchSourceName = ""
+    if ($ExerciseUmapCoordinateSwitch) {
+        $MapRelativePathBefore = [string]$Manifest.cell_event_map.path
+        $MapPath = Join-Path $CopyProject ($MapRelativePathBefore -replace "/", "\")
+        $CoordinateSource = Join-Path $CopyRoot "batch_corrected_coordinates.csv"
+        $CoordinateRows = @(Import-Csv -LiteralPath $MapPath)
+        if ($CoordinateRows.Count -ne $UmapPoints.Count) {
+            throw "The packaged UMAP switch fixture does not match the active event population."
+        }
+        foreach ($Row in $CoordinateRows) {
+            $Row.UMAP1 = ([double]$Row.UMAP1 + 100.0).ToString(
+                "R",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+            $Row.UMAP2 = ([double]$Row.UMAP2 - 50.0).ToString(
+                "R",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        $CoordinateRows | Export-Csv -LiteralPath $CoordinateSource -NoTypeInformation -Encoding UTF8
+        $FirstPointBefore = $UmapPoints[0]
+        $SwitchPayload = @{ source_path = $CoordinateSource } | ConvertTo-Json -Compress
+        $SwitchResult = Invoke-RestMethod `
+            -Method Post `
+            -Uri "$BaseUrl/api/replace-cell-event-map" `
+            -Headers @{ "X-Annotation-Write-Token" = $Meta.write_token } `
+            -ContentType "application/json; charset=utf-8" `
+            -Body $SwitchPayload `
+            -TimeoutSec 60
+        $UmapStateAfterSwitch = Invoke-RestMethod -Uri "$BaseUrl/api/cell-event-map" -TimeoutSec 60
+        $MatchingPointAfter = @(
+            $UmapStateAfterSwitch.points |
+                Where-Object { [string]$_.ms_event_id -eq [string]$FirstPointBefore.ms_event_id }
+        )
+        if (
+            $MatchingPointAfter.Count -ne 1 -or
+            [math]::Abs(
+                [double]$MatchingPointAfter[0].UMAP1 - ([double]$FirstPointBefore.UMAP1 + 100.0)
+            ) -gt 0.000000001
+        ) {
+            throw "Packaged UMAP coordinate switching did not update the selected event."
+        }
+        $ManifestAfterSwitch = Get-Content -Raw -Encoding UTF8 -LiteralPath $ManifestPath |
+            ConvertFrom-Json
+        if ([string]$ManifestAfterSwitch.cell_event_map.path -ne $MapRelativePathBefore) {
+            throw "Switching UMAP coordinates migrated the v0.4.0 project path."
+        }
+        if ([string]$ManifestAfterSwitch.cell_event_map.source_name -ne "batch_corrected_coordinates.csv") {
+            throw "Switching UMAP coordinates did not preserve the user-facing source name."
+        }
+        if (@($UmapStateAfterSwitch.points).Count -ne $UmapPoints.Count) {
+            throw "Switching UMAP coordinates changed the event population."
+        }
+        $UmapSwitchExercised = $true
+        $UmapSwitchRows = @($UmapStateAfterSwitch.points).Count
+        $UmapSwitchSourceName = [string]$ManifestAfterSwitch.cell_event_map.source_name
     }
 
     $BoundaryWindow = Invoke-RestMethod `
@@ -413,12 +475,39 @@ try {
     }
 
     $After = Get-ProjectSnapshot $CopyProject
-    $CopyWriteExercised = [bool]($ExerciseBoundaryAnchorWrite -or $ExerciseSavedPairPerformance)
+    $CopyWriteExercised = [bool](
+        $ExerciseBoundaryAnchorWrite -or
+        $ExerciseSavedPairPerformance -or
+        $ExerciseUmapCoordinateSwitch
+    )
     if (!$CopyWriteExercised -and $Before -cne $After) {
         throw "Packaged HSC1 read-only smoke changed protected project state."
     }
     if ($CopyWriteExercised -and $Before -ceq $After) {
         throw "Packaged write exercise did not change its temporary project copy."
+    }
+    if ($ExerciseUmapCoordinateSwitch) {
+        $BeforeLogical = $Before | ConvertFrom-Json
+        $AfterLogical = $After | ConvertFrom-Json
+        $ProtectedLogicalFields = @(
+            "annotations_sha256",
+            "annotation_count",
+            "counts",
+            "project_config_sha256",
+            "time_models_sha256",
+            "time_model_audit_sha256",
+            "input_manifest_sha256",
+            "parquets"
+        )
+        foreach ($Field in $ProtectedLogicalFields) {
+            $BeforeValue = $BeforeLogical.PSObject.Properties[$Field].Value |
+                ConvertTo-Json -Compress -Depth 20
+            $AfterValue = $AfterLogical.PSObject.Properties[$Field].Value |
+                ConvertTo-Json -Compress -Depth 20
+            if ($BeforeValue -cne $AfterValue) {
+                throw "UMAP coordinate switching changed protected project content: $Field"
+            }
+        }
     }
     $OriginalProjectAfter = Get-ProjectSnapshot $SourceProject
     if ($OriginalProjectBefore -cne $OriginalProjectAfter) {
@@ -440,6 +529,9 @@ try {
         Saved49CompleteWindowCount = $Saved49InCompleteWindow.Count
         UmapPointsWithTime = $UmapPointsWithTime.Count
         UmapDefaultTimeMatches = $TimeDefaultMatches.Count
+        UmapSwitchExercised = $UmapSwitchExercised
+        UmapSwitchRows = $UmapSwitchRows
+        UmapSwitchSourceName = $UmapSwitchSourceName
         BoundaryQcCandidates = $BoundaryGroups.Count
         BoundaryAnchorWriteExercised = [bool]$ExerciseBoundaryAnchorWrite
         SavedPairPerformanceExercised = [bool]$ExerciseSavedPairPerformance

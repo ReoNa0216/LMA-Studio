@@ -16,7 +16,7 @@ It opens its own native desktop window, lets users create or open project direct
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
-- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations.
+- Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations. A different coordinate CSV for the same MS-event population can be validated and imported from project configuration to switch, for example, between pre- and post-batch-correction views without changing annotations or the time model.
 - Export a compact 16-column full event roster intended for downstream cell labeling. Unannotated events use `Type=unknown`; internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
 - Create new projects with a compact manifest-bound layout: `data/`, `annotations/`, `provenance/`, and `diagnostics/`, without exposing internal pipeline-version directories. Existing v0.4.0 projects retain their original manifest paths and are never auto-migrated.
 - Use external raw input references to avoid copying large MS files into every project.
@@ -25,7 +25,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The current formal release is v0.4.0. The directory-layout iteration is being validated as v0.4.1-rc1; it is a candidate, not a formal Release.
+The current formal release is v0.4.1. Existing v0.4.0 projects remain manifest-compatible and are not migrated when opened.
 
 Windows x64:
 
@@ -78,9 +78,9 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.1-rc1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.1 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload non-publishing test artifacts. Formal GitHub Release publication is tag-triggered after all release gates pass.
 
-Release notes: [README_RELEASE.md](README_RELEASE.md). Current renamed-project walkthrough: [docs/Lin-_LSK_v0.4.1-rc1_UAT.md](docs/Lin-_LSK_v0.4.1-rc1_UAT.md).
+Release notes: [README_RELEASE.md](README_RELEASE.md). Current renamed-project walkthrough: [docs/Lin-_LSK_v0.4.1_UAT.md](docs/Lin-_LSK_v0.4.1_UAT.md).

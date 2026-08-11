@@ -188,6 +188,11 @@ def match_source_to_events(
 
     failures: list[str] = []
     if unmatched_rows:
+        if len(events) < len(source_coordinates):
+            failures.append(
+                f"MS760 event 仅识别到 {len(events)} 个，但事件坐标 CSV 有 "
+                f"{len(source_coordinates)} 行；请检查 MS 峰识别结果，不要删除坐标 CSV 行"
+            )
         failures.append("未匹配 CSV 行 " + ", ".join(str(row) for row in unmatched_rows[:10]))
     if ambiguous_rows:
         preview = "; ".join(
@@ -223,6 +228,7 @@ def import_cell_event_map(
     canonical = match_source_to_events(coordinates, ms_events, tolerance_sec=tolerance_sec)
     return canonical, {
         "schema_version": CELL_EVENT_MAP_SCHEMA_VERSION,
+        "source_name": source_path.name,
         "source_sha256": sha256_file(source_path),
         "row_count": int(len(canonical)),
         "matched_event_count": int(canonical["ms_event_id"].nunique()),
@@ -309,6 +315,7 @@ def cell_event_map_manifest_entry(
         "schema_version": CELL_EVENT_MAP_SCHEMA_VERSION,
         "path": relative,
         "sha256": sha256_file(canonical_path),
+        "source_name": str(import_metadata.get("source_name") or ""),
         "source_sha256": str(import_metadata.get("source_sha256") or ""),
         "row_count": int(import_metadata.get("row_count", 0)),
         "matched_event_count": int(import_metadata.get("matched_event_count", 0)),

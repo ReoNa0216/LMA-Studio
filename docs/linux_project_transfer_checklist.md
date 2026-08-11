@@ -140,4 +140,4 @@ Expected behavior:
 - Treat `export_runs` as provenance, not as new input.
 - Before experimenting, make an untouched full-directory backup.
 
-For Windows candidate behavior, use `README_RELEASE.md` and `docs/Lin-_LSK_v0.4.1-rc1_UAT.md`.
+For Windows release behavior, use `README_RELEASE.md` and `docs/Lin-_LSK_v0.4.1_UAT.md`.
