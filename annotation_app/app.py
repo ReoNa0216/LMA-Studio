@@ -102,7 +102,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.3"
+APP_VERSION = "lma_studio_v0.4.4"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -2644,10 +2644,13 @@ def validate_staged_project_artifacts(project: ProjectPaths) -> ProjectPaths:
             raise BadRequest(f"staging 中间表无法读取: {display_path(path, resolved.project_dir)}") from exc
     try:
         lif_peaks = pd.read_parquet(resolved.lif_peaks_path)
-        ms_events = pd.read_parquet(
-            resolved.ms_events_path,
-            columns=["event_id", "event_strategy", "primary_signal_col", "scan_id", "time_min"],
-        )
+        # The event-map binding may use the event caller's measured
+        # half-height support (left_sec/right_sec) when a source coordinate is
+        # on a unique peak shoulder rather than within the strict apex
+        # tolerance.  Staging validation must re-evaluate the exact same
+        # evidence as initial import; projecting to the five legacy columns
+        # would incorrectly reject a project that was just imported safely.
+        ms_events = pd.read_parquet(resolved.ms_events_path)
     except Exception as exc:
         raise BadRequest("staging 项目中间表缺少 event-map 绑定所需字段") from exc
     validate_and_adapt_lif_peak_detector_binding(
@@ -7552,6 +7555,10 @@ class AppData:
                         "matched_event_count",
                         "time_unit",
                         "match_tolerance_sec",
+                        "match_policy",
+                        "apex_tolerance_match_count",
+                        "peak_support_match_count",
+                        "max_apex_offset_sec",
                     )
                     if key in current_entry
                 }

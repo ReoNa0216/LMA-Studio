@@ -613,6 +613,9 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
     quiet_localmax_p99 = float(quiet_peaks.quantile(0.99))
     quiet_mad_sigma = float(1.4826 * np.median(np.abs(quiet_scans - quiet_scans.median())))
 
+    peak_height_body_candidate = np.nan
+    peak_height_positive_noise_candidate = np.nan
+    peak_height_model = "default"
     if signal_col == "pc34_760_max_intensity":
         # Cell events are sparse positive impulses on a continuously sampled
         # background.  The former q99/q99 rule let even a small number of real
@@ -620,7 +623,29 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         # event could then raise the threshold above nearly the whole run.
         # Lower robust quantiles estimate the background body while the
         # multipliers still require a clear height and local-prominence excess.
-        height = float(max(6.0 * quiet_scan_p90, 4.0 * quiet_localmax_p75))
+        peak_height_body_candidate = float(
+            max(6.0 * quiet_scan_p90, 4.0 * quiet_localmax_p75)
+        )
+        height = peak_height_body_candidate
+        peak_height_model = "background_body_multiplier"
+        if quiet_mad_sigma > np.finfo(float).eps:
+            # A positive continuous background has a measurable robust noise
+            # scale.  In that regime, multiplying the absolute p90 can reject
+            # genuine low-amplitude impulses merely because the baseline is
+            # elevated.  The empirical p99 plus three robust sigmas is an
+            # independent upper-tail noise bound.  Use it only as a lower
+            # threshold cap; zero-inflated traces (MAD == 0), such as MPP,
+            # retain the established body/local-maximum estimator.
+            peak_height_positive_noise_candidate = float(
+                quiet_scan_p99 + 3.0 * quiet_mad_sigma
+            )
+            if (
+                np.isfinite(peak_height_positive_noise_candidate)
+                and peak_height_positive_noise_candidate > 0
+                and peak_height_positive_noise_candidate < height
+            ):
+                height = peak_height_positive_noise_candidate
+                peak_height_model = "positive_background_tail_cap"
         prominence = float(max(0.8 * quiet_localmax_p75, 3.0 * quiet_mad_sigma))
     else:
         quiet_median = float(quiet_scans.median())
@@ -659,6 +684,7 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
             )
         )
         threshold_fallback_reason = "quiet_threshold_exceeded_signal_range"
+        peak_height_model = "sparse_high_contrast_range_fallback"
     prelim_distance_points = 2 if signal_col == "pc34_760_max_intensity" else 3
     prelim_idx, _ = find_peaks(
         y,
@@ -692,6 +718,9 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         "quiet_median": float(quiet_scans.median()),
         "quiet_mad_sigma": quiet_mad_sigma,
         "peak_height": height,
+        "peak_height_model": peak_height_model,
+        "peak_height_body_candidate": peak_height_body_candidate,
+        "peak_height_positive_noise_candidate": peak_height_positive_noise_candidate,
         "peak_prominence": prominence,
         "threshold_fallback_reason": threshold_fallback_reason,
         "signal_max": signal_max,

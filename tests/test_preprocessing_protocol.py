@@ -304,6 +304,51 @@ class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
         self.assertEqual(params["preliminary_peak_count"], 3)
         self.assertAlmostEqual(params["min_distance_sec"], 0.2, places=9)
 
+    def test_pc34_positive_background_uses_robust_tail_without_losing_low_events(self):
+        rng = np.random.default_rng(20260812)
+        signal_col = "pc34_760_max_intensity"
+        dt_sec = 0.1
+        signal = np.clip(rng.normal(100.0, 100.0, 12_000), 0.0, 500.0)
+        true_peak_indices = np.arange(500, 11_500, 1000)
+        signal[true_peak_indices] = 1000.0
+        time_sec = np.arange(len(signal), dtype=float) * dt_sec
+        scan = pd.DataFrame(
+            {
+                "scan_start_time_sec": time_sec,
+                "scan_start_time_min": time_sec / 60.0,
+                signal_col: signal,
+            }
+        )
+        bins, localmax = ms_qc.build_bin_summary(scan, signal_col, dt_sec)
+
+        params, _background = ms_qc.estimate_parameters(
+            scan,
+            signal_col,
+            bins,
+            localmax,
+            dt_sec,
+        )
+        called = ms_qc.call_peak_indices(
+            scan,
+            signal_col,
+            params["peak_height"],
+            params["peak_prominence"],
+            params["min_distance_sec"],
+            dt_sec,
+        )
+
+        recalled = sum(np.any(np.abs(called - index) <= 1) for index in true_peak_indices)
+        extras = sum(not np.any(np.abs(true_peak_indices - index) <= 1) for index in called)
+        self.assertEqual(recalled, len(true_peak_indices))
+        self.assertEqual(extras, 0)
+        self.assertLess(params["peak_height"], 1000.0)
+        self.assertEqual(
+            params["peak_height_model"],
+            "positive_background_tail_cap",
+        )
+        self.assertGreater(params["peak_height_body_candidate"], 1000.0)
+        self.assertLess(params["peak_height_positive_noise_candidate"], 1000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

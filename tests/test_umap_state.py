@@ -403,6 +403,18 @@ class UmapAppStateTest(unittest.TestCase):
                 manifest["cell_event_map"]["sha256"],
             )
             self.assertEqual(
+                replaced_manifest["cell_event_map_history"][-1]["match_policy"],
+                "apex_tolerance_then_unique_peak_support_v1",
+            )
+            self.assertEqual(
+                replaced_manifest["cell_event_map_history"][-1]["apex_tolerance_match_count"],
+                1,
+            )
+            self.assertEqual(
+                replaced_manifest["cell_event_map_history"][-1]["peak_support_match_count"],
+                0,
+            )
+            self.assertEqual(
                 replaced_manifest["cell_event_map"]["source_name"],
                 replacement_source.name,
             )
