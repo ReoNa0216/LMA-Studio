@@ -102,7 +102,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.3"
+APP_VERSION = "lma_studio_v0.4.4-rc1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -7552,6 +7552,10 @@ class AppData:
                         "matched_event_count",
                         "time_unit",
                         "match_tolerance_sec",
+                        "match_policy",
+                        "apex_tolerance_match_count",
+                        "peak_support_match_count",
+                        "max_apex_offset_sec",
                     )
                     if key in current_entry
                 }

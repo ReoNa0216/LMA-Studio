@@ -145,6 +145,91 @@ class CellEventMapImportTest(unittest.TestCase):
 
         self.assertEqual(canonical["ms_event_id"].tolist(), ["ms_shifted_apex"])
 
+    def test_unique_peak_support_accepts_clp_two_scan_apex_offset(self):
+        source_time = 80.269766666667
+        apex_time = 80.273216666667
+        source = pd.DataFrame(
+            {
+                "scan_start_time": [source_time],
+                "UMAP1": [4.0],
+                "UMAP2": [6.0],
+            }
+        )
+        events = ms_events(
+            [
+                (
+                    "ms_clp_shoulder",
+                    "4816401",
+                    apex_time,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                )
+            ]
+        )
+        events["left_sec"] = [source_time * 60.0 - 0.02]
+        events["right_sec"] = [apex_time * 60.0 + 0.10]
+
+        canonical = match_source_to_events(source, events)
+
+        self.assertGreater((apex_time - source_time) * 60.0, 0.15)
+        self.assertEqual(canonical["ms_event_id"].tolist(), ["ms_clp_shoulder"])
+        self.assertEqual(canonical.attrs["match_diagnostics"]["peak_support_match_count"], 1)
+        self.assertEqual(canonical.attrs["match_diagnostics"]["apex_tolerance_match_count"], 0)
+
+    def test_apex_tolerance_match_takes_priority_over_broad_neighbor_support(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                ("ms_exact", "scan-exact", 1.0, "pc34_primary", "pc34_760_max_intensity"),
+                ("ms_broad", "scan-broad", 1.02, "pc34_primary", "pc34_760_max_intensity"),
+            ]
+        )
+        events["left_sec"] = [59.98, 59.5]
+        events["right_sec"] = [60.02, 60.5]
+
+        canonical = match_source_to_events(source, events)
+
+        self.assertEqual(canonical["ms_event_id"].tolist(), ["ms_exact"])
+        self.assertEqual(canonical.attrs["match_diagnostics"]["apex_tolerance_match_count"], 1)
+        self.assertEqual(canonical.attrs["match_diagnostics"]["peak_support_match_count"], 0)
+
+    def test_overlapping_peak_support_remains_ambiguous(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                ("ms_left", "scan-left", 1.01, "pc34_primary", "pc34_760_max_intensity"),
+                ("ms_right", "scan-right", 1.02, "pc34_primary", "pc34_760_max_intensity"),
+            ]
+        )
+        events["left_sec"] = [59.7, 59.9]
+        events["right_sec"] = [60.1, 60.3]
+
+        with self.assertRaisesRegex(CellEventMapError, "多个.*MS event"):
+            match_source_to_events(source, events)
+
+    def test_legacy_event_table_without_peak_support_keeps_strict_tolerance(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                (
+                    "ms_two_scans_away",
+                    "scan-apex",
+                    1.0 + 0.207 / 60.0,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(CellEventMapError, "CSV"):
+            match_source_to_events(source, events)
+
     def test_unmatched_ambiguous_and_reused_events_fail_the_whole_import(self):
         base = ms_events(
             [
@@ -230,6 +315,13 @@ class CellEventMapImportTest(unittest.TestCase):
 
         self.assertEqual(metadata["row_count"], 1)
         self.assertEqual(metadata["matched_event_count"], 1)
+        self.assertEqual(metadata["apex_tolerance_match_count"], 1)
+        self.assertEqual(metadata["peak_support_match_count"], 0)
+        self.assertAlmostEqual(metadata["max_apex_offset_sec"], 0.0)
+        self.assertEqual(
+            metadata["match_policy"],
+            "apex_tolerance_then_unique_peak_support_v1",
+        )
         self.assertEqual(len(metadata["source_sha256"]), 64)
         self.assertNotIn("must-not-copy", canonical_csv_bytes(canonical).decode("utf-8"))
 

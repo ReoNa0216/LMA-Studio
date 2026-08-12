@@ -35,6 +35,7 @@ CELL_EVENT_MAP_CANONICAL_COLUMNS = (
 # remaining below half the 0.30 s minimum event separation; ambiguity is still
 # rejected rather than guessed.
 DEFAULT_MATCH_TOLERANCE_SEC = 0.15
+MATCH_POLICY = "apex_tolerance_then_unique_peak_support_v1"
 PRIMARY_EVENT_STRATEGY = "pc34_primary"
 PRIMARY_SIGNAL_COLUMN = "pc34_760_max_intensity"
 
@@ -115,10 +116,14 @@ def primary_ms_events(ms_events: pd.DataFrame) -> pd.DataFrame:
     missing = sorted(required - set(ms_events.columns))
     if missing:
         raise CellEventMapError(f"MS event 表缺少必需列: {', '.join(missing)}")
+    selected_columns = ["event_id", "scan_id", "time_min"]
+    has_peak_support = {"left_sec", "right_sec"}.issubset(ms_events.columns)
+    if has_peak_support:
+        selected_columns.extend(["left_sec", "right_sec"])
     selected = ms_events[
         ms_events["event_strategy"].astype(str).eq(PRIMARY_EVENT_STRATEGY)
         & ms_events["primary_signal_col"].astype(str).eq(PRIMARY_SIGNAL_COLUMN)
-    ][["event_id", "scan_id", "time_min"]].copy()
+    ][selected_columns].copy()
     if selected.empty:
         raise CellEventMapError("MS event 表没有 pc34_primary / pc34_760_max_intensity event")
     selected["event_id"] = selected["event_id"].astype(str)
@@ -133,6 +138,16 @@ def primary_ms_events(ms_events: pd.DataFrame) -> pd.DataFrame:
     if selected["scan_id"].isna().any():
         ids = selected.loc[selected["scan_id"].isna(), "event_id"].astype(str).tolist()
         raise CellEventMapError(f"MS event scan_id 缺失: {', '.join(ids[:5])}")
+    if has_peak_support:
+        selected["left_sec"] = pd.to_numeric(selected["left_sec"], errors="coerce")
+        selected["right_sec"] = pd.to_numeric(selected["right_sec"], errors="coerce")
+        left_sec = selected["left_sec"].to_numpy(dtype=float, na_value=np.nan)
+        right_sec = selected["right_sec"].to_numpy(dtype=float, na_value=np.nan)
+        selected["_peak_support_available"] = (
+            np.isfinite(left_sec)
+            & np.isfinite(right_sec)
+            & (left_sec <= right_sec)
+        )
     return selected.sort_values(["time_min", "event_id"], kind="stable").reset_index(drop=True)
 
 
@@ -155,6 +170,29 @@ def match_source_to_events(
     matches: list[dict[str, Any]] = []
     unmatched_rows: list[int] = []
     ambiguous_rows: list[tuple[int, list[str]]] = []
+    apex_tolerance_match_count = 0
+    peak_support_match_count = 0
+    apex_offsets_sec: list[float] = []
+    has_peak_support = {
+        "left_sec",
+        "right_sec",
+        "_peak_support_available",
+    }.issubset(events.columns)
+    support_available = (
+        events["_peak_support_available"].to_numpy(dtype=bool)
+        if has_peak_support
+        else np.asarray([], dtype=bool)
+    )
+    support_left_sec = (
+        events["left_sec"].to_numpy(dtype=float)
+        if has_peak_support
+        else np.asarray([], dtype=float)
+    )
+    support_right_sec = (
+        events["right_sec"].to_numpy(dtype=float)
+        if has_peak_support
+        else np.asarray([], dtype=float)
+    )
 
     for frame_index, source_row in source_coordinates.reset_index(drop=True).iterrows():
         source_line = int(frame_index) + 2
@@ -166,6 +204,15 @@ def match_source_to_events(
             for index in range(left, right)
             if abs(float(event_times[index]) - source_time) * 60.0 <= float(tolerance_sec) + 1e-12
         ]
+        match_method = "apex_tolerance"
+        if not candidate_indices and has_peak_support:
+            source_sec = source_time * 60.0
+            candidate_indices = np.flatnonzero(
+                support_available
+                & (support_left_sec <= source_sec + 1e-12)
+                & (source_sec <= support_right_sec + 1e-12)
+            ).tolist()
+            match_method = "peak_support"
         if not candidate_indices:
             unmatched_rows.append(source_line)
             continue
@@ -175,6 +222,11 @@ def match_source_to_events(
             )
             continue
         event = events.iloc[candidate_indices[0]]
+        apex_offsets_sec.append(abs(float(event["time_min"]) - source_time) * 60.0)
+        if match_method == "peak_support":
+            peak_support_match_count += 1
+        else:
+            apex_tolerance_match_count += 1
         matches.append(
             {
                 "source_line": source_line,
@@ -198,7 +250,7 @@ def match_source_to_events(
         preview = "; ".join(
             f"{line} -> {','.join(event_ids)}" for line, event_ids in ambiguous_rows[:10]
         )
-        failures.append("容差内存在多个 MS event: " + preview)
+        failures.append("存在多个 MS event 可匹配: " + preview)
     if failures:
         raise CellEventMapError("；".join(failures))
 
@@ -214,7 +266,14 @@ def match_source_to_events(
     if len(matched) != len(source_coordinates):
         raise CellEventMapError("事件坐标 CSV 未能整体一对一匹配")
     canonical = matched.loc[:, ["ms_event_id", "scan_id", "scan_start_time", "UMAP1", "UMAP2"]]
-    return canonical.sort_values(["scan_start_time", "ms_event_id"], kind="stable").reset_index(drop=True)
+    canonical = canonical.sort_values(["scan_start_time", "ms_event_id"], kind="stable").reset_index(drop=True)
+    canonical.attrs["match_diagnostics"] = {
+        "match_policy": MATCH_POLICY,
+        "apex_tolerance_match_count": int(apex_tolerance_match_count),
+        "peak_support_match_count": int(peak_support_match_count),
+        "max_apex_offset_sec": float(max(apex_offsets_sec, default=0.0)),
+    }
+    return canonical
 
 
 def import_cell_event_map(
@@ -226,6 +285,7 @@ def import_cell_event_map(
     source_path = source_path.expanduser().resolve()
     coordinates = read_source_coordinates(source_path)
     canonical = match_source_to_events(coordinates, ms_events, tolerance_sec=tolerance_sec)
+    diagnostics = canonical.attrs.get("match_diagnostics", {})
     return canonical, {
         "schema_version": CELL_EVENT_MAP_SCHEMA_VERSION,
         "source_name": source_path.name,
@@ -234,6 +294,12 @@ def import_cell_event_map(
         "matched_event_count": int(canonical["ms_event_id"].nunique()),
         "time_unit": "min",
         "match_tolerance_sec": float(tolerance_sec),
+        "match_policy": str(diagnostics.get("match_policy") or MATCH_POLICY),
+        "apex_tolerance_match_count": int(
+            diagnostics.get("apex_tolerance_match_count", len(canonical))
+        ),
+        "peak_support_match_count": int(diagnostics.get("peak_support_match_count", 0)),
+        "max_apex_offset_sec": float(diagnostics.get("max_apex_offset_sec", 0.0)),
         "required_source_columns": list(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS),
     }
 
@@ -323,6 +389,15 @@ def cell_event_map_manifest_entry(
         "match_tolerance_sec": float(
             import_metadata.get("match_tolerance_sec", DEFAULT_MATCH_TOLERANCE_SEC)
         ),
+        "match_policy": str(import_metadata.get("match_policy") or MATCH_POLICY),
+        "apex_tolerance_match_count": int(
+            import_metadata.get(
+                "apex_tolerance_match_count",
+                import_metadata.get("row_count", 0),
+            )
+        ),
+        "peak_support_match_count": int(import_metadata.get("peak_support_match_count", 0)),
+        "max_apex_offset_sec": float(import_metadata.get("max_apex_offset_sec", 0.0)),
         "required_source_columns": list(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS),
     }
     if not entry["source_sha256"]:
