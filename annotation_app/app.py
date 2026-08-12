@@ -2644,10 +2644,13 @@ def validate_staged_project_artifacts(project: ProjectPaths) -> ProjectPaths:
             raise BadRequest(f"staging 中间表无法读取: {display_path(path, resolved.project_dir)}") from exc
     try:
         lif_peaks = pd.read_parquet(resolved.lif_peaks_path)
-        ms_events = pd.read_parquet(
-            resolved.ms_events_path,
-            columns=["event_id", "event_strategy", "primary_signal_col", "scan_id", "time_min"],
-        )
+        # The event-map binding may use the event caller's measured
+        # half-height support (left_sec/right_sec) when a source coordinate is
+        # on a unique peak shoulder rather than within the strict apex
+        # tolerance.  Staging validation must re-evaluate the exact same
+        # evidence as initial import; projecting to the five legacy columns
+        # would incorrectly reject a project that was just imported safely.
+        ms_events = pd.read_parquet(resolved.ms_events_path)
     except Exception as exc:
         raise BadRequest("staging 项目中间表缺少 event-map 绑定所需字段") from exc
     validate_and_adapt_lif_peak_detector_binding(

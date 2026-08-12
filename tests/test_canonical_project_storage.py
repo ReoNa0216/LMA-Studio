@@ -260,6 +260,40 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
 
 
 class CanonicalProjectStorageTest(unittest.TestCase):
+    def test_staging_recheck_preserves_unique_peak_support_event_map_binding(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            request = _new_project_request(root, "peak_support_staging_project")
+
+            def write_peak_support_outputs(script_name: str, project_dir: Path) -> str:
+                message = _write_synthetic_preprocessor_outputs(script_name, project_dir)
+                if "02_ms" in script_name:
+                    path = Path(project_dir) / CANONICAL_TABLE_PATHS["ms_events"]
+                    events = pd.read_parquet(path)
+                    source_time_min = 24.001
+                    events["time_min"] = source_time_min + 0.207 / 60.0
+                    events["time_sec"] = events["time_min"] * 60.0
+                    events["left_sec"] = source_time_min * 60.0 - 0.02
+                    events["right_sec"] = events["time_sec"] + 0.10
+                    events.to_parquet(path, index=False)
+                return message
+
+            with mock.patch(
+                "annotation_app.app.run_preprocessing_script",
+                side_effect=write_peak_support_outputs,
+            ):
+                created = AppData.create_project_from_raw_inputs(**request)
+
+            self.assertEqual(len(created.cell_event_map), 1)
+            self.assertEqual(
+                created.cell_event_map_info["match_policy"],
+                "apex_tolerance_then_unique_peak_support_v1",
+            )
+            self.assertEqual(
+                created.cell_event_map_info["peak_support_match_count"],
+                1,
+            )
+
     @unittest.skipUnless(shutil.which("git"), "git is required for the v0.4.0 reader probe")
     def test_released_v040_reader_opens_and_exports_a_new_canonical_project(self):
         """The additive layout marker must remain forward-readable by v0.4.0."""
