@@ -143,6 +143,69 @@ class PendingManualCellPairContractTest(unittest.TestCase):
         self.assertEqual(saved["review_status"], "accepted")
         self.assertTrue(saved["exportable"])
 
+    def test_roster_supported_ms_event_is_manual_cell_only(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = self.make_app(Path(tmp))
+            ms_events = app.ms_events.copy()
+            ms_events["event_strategy"] = "pc34_primary"
+            ms_events["primary_signal_col"] = "pc34_760_max_intensity"
+            ms_events.loc[
+                ms_events["event_id"].eq("ms-cell-1"),
+                "event_strategy",
+            ] = "pc34_roster_supported"
+            object.__setattr__(app, "ms_events", ms_events)
+
+            automatic = app.build_cell_candidates(24.0, 25.0, "aligned")
+            saved = app.create_manual_cell_pair(
+                "G1",
+                "g1-core",
+                "ms-cell-1",
+                window_start_min=24.0,
+                window_end_min=25.0,
+                time_mode="aligned",
+            )
+
+        self.assertNotIn(
+            "ms-cell-1",
+            {str(row.get("ms_event_id")) for row in automatic},
+        )
+        self.assertEqual(saved["review_status"], "accepted")
+        self.assertEqual(saved["ms_event_id"], "ms-cell-1")
+        self.assertTrue(saved["exportable"])
+
+    def test_roster_supported_manual_cell_exports_the_selected_mass_lane_mz(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = self.make_app(Path(tmp))
+            ms_events = app.ms_events.copy()
+            ms_events["event_strategy"] = "pc34_primary"
+            ms_events["primary_signal_col"] = "pc34_760_max_intensity"
+            target = ms_events["event_id"].eq("ms-cell-1")
+            ms_events.loc[target, "event_strategy"] = "pc34_roster_supported"
+            ms_events.loc[target, "pc34_760_mz_at_apex"] = 760.575748358
+            object.__setattr__(app, "ms_events", ms_events)
+            ms_scan = app.ms_scan.copy()
+            target_scan = str(ms_events.loc[target, "scan_id"].iloc[0])
+            ms_scan.loc[
+                ms_scan["scan_id"].astype(str).eq(target_scan),
+                "pc34_760_mz_at_max_intensity",
+            ] = float("nan")
+            object.__setattr__(app, "ms_scan", ms_scan)
+
+            app.create_manual_cell_pair(
+                "G1",
+                "g1-core",
+                "ms-cell-1",
+                window_start_min=24.0,
+                window_end_min=25.0,
+                time_mode="aligned",
+            )
+            exported = pd.read_csv(
+                io.StringIO(app.export_accepted_annotations_csv()["csv_text"])
+            )
+
+        row = exported.loc[exported["MS_event_id"].eq("ms-cell-1")].iloc[0]
+        self.assertAlmostEqual(float(row["PC(34:1)_mz"]), 760.575748358)
+
     def test_pending_pair_can_be_accepted_later_and_then_reaches_csv_and_umap(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = self.make_app(Path(tmp))

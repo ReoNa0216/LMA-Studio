@@ -1,9 +1,9 @@
-"""Strict import and state projection for the single-cell UMAP event map.
+"""Strict import and state projection for the single-cell event map.
 
-The source CSV is deliberately treated as a coordinate/whitelist input, not as
-an annotation source.  Only the three explicitly allowed columns are loaded.
-After import, every row is bound to a stable ``ms_event_id`` and all later
-operations use the canonical five-column table.
+The source CSV is deliberately treated as an event whitelist with optional
+UMAP coordinates, not as an annotation source.  Only explicitly allowed
+columns are loaded.  After import, every row is bound to a stable
+``ms_event_id`` and all later operations use the canonical five-column table.
 """
 
 from __future__ import annotations
@@ -20,9 +20,12 @@ import numpy as np
 import pandas as pd
 
 
-CELL_EVENT_MAP_SCHEMA_VERSION = 1
+CELL_EVENT_MAP_SCHEMA_VERSION = 2
+CELL_EVENT_MAP_SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 CELL_EVENT_MAP_RELATIVE_PATH = "data/interim/lma/cell_event_umap.csv"
-CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS = ("scan_start_time", "UMAP1", "UMAP2")
+CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS = ("scan_start_time",)
+CELL_EVENT_MAP_LEGACY_REQUIRED_SOURCE_COLUMNS = ("scan_start_time", "UMAP1", "UMAP2")
+CELL_EVENT_MAP_COORDINATE_COLUMNS = ("UMAP1", "UMAP2")
 CELL_EVENT_MAP_CANONICAL_COLUMNS = (
     "ms_event_id",
     "scan_id",
@@ -31,12 +34,21 @@ CELL_EVENT_MAP_CANONICAL_COLUMNS = (
     "UMAP2",
 )
 # One MS scan in supported acquisitions is about 0.10 s.  A 0.15 s window
-# binds a coordinate selected on the shoulder to its unique called apex while
-# remaining below half the 0.30 s minimum event separation; ambiguity is still
-# rejected rather than guessed.
+# covers roughly one scan of timestamp rounding/selection difference;
+# ambiguity is still rejected rather than guessed.
 DEFAULT_MATCH_TOLERANCE_SEC = 0.15
-MATCH_POLICY = "apex_tolerance_then_unique_peak_support_v1"
+# A support/basin relation is only a two-scan timing correction, never a
+# license to attach an arbitrary roster time somewhere inside a broad
+# prominence basin.  Real HSC2 inputs require at most 0.207 s; 0.25 s leaves
+# one bounded margin while keeping this shape-based fallback strictly local.
+MAX_PEAK_SHAPE_APEX_OFFSET_SEC = 0.25
+MATCH_POLICY = "apex_tolerance_then_unique_near_peak_shape_v3"
 PRIMARY_EVENT_STRATEGY = "pc34_primary"
+ROSTER_SUPPORTED_EVENT_STRATEGY = "pc34_roster_supported"
+EVENT_MAP_EVENT_STRATEGIES = (
+    PRIMARY_EVENT_STRATEGY,
+    ROSTER_SUPPORTED_EVENT_STRATEGY,
+)
 PRIMARY_SIGNAL_COLUMN = "pc34_760_max_intensity"
 
 
@@ -65,27 +77,60 @@ def _csv_header(path: Path) -> list[str]:
 
 
 def read_source_coordinates(path: Path) -> pd.DataFrame:
-    """Load only the three allowed source columns and validate every value."""
+    """Load event times plus an optional, complete UMAP coordinate pair.
+
+    ``UMAP`` is accepted as an explicit alias for ``UMAP1`` only when paired
+    with ``UMAP2``.  No cluster, label, or other numeric column is guessed as a
+    coordinate.
+    """
 
     path = path.expanduser().resolve()
     if not path.is_file():
         raise CellEventMapError(f"事件坐标 CSV 不存在: {path}")
     header = _csv_header(path)
-    bad_counts = {
-        column: header.count(column)
-        for column in CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS
-        if header.count(column) != 1
+    scan_count = header.count("scan_start_time")
+    if scan_count != 1:
+        raise CellEventMapError(
+            "事件表必需列必须出现一次: " f"scan_start_time={scan_count}"
+        )
+    coordinate_counts = {
+        column: header.count(column) for column in ("UMAP1", "UMAP", "UMAP2")
     }
-    if bad_counts:
-        details = ", ".join(f"{column}={count}" for column, count in bad_counts.items())
-        raise CellEventMapError(f"事件坐标 CSV 必需列必须各出现一次: {details}")
+    duplicated_coordinates = {
+        column: count for column, count in coordinate_counts.items() if count > 1
+    }
+    if duplicated_coordinates:
+        details = ", ".join(
+            f"{column}={count}" for column, count in duplicated_coordinates.items()
+        )
+        raise CellEventMapError(f"UMAP 坐标列不能重复: {details}")
+
+    exact_pair = coordinate_counts["UMAP1"] == 1 and coordinate_counts["UMAP2"] == 1
+    alias_pair = coordinate_counts["UMAP"] == 1 and coordinate_counts["UMAP2"] == 1
+    no_coordinates = all(count == 0 for count in coordinate_counts.values())
+    if exact_pair and coordinate_counts["UMAP"] == 0:
+        coordinate_mapping = {"UMAP1": "UMAP1", "UMAP2": "UMAP2"}
+    elif alias_pair and coordinate_counts["UMAP1"] == 0:
+        coordinate_mapping = {"UMAP1": "UMAP", "UMAP2": "UMAP2"}
+    elif no_coordinates:
+        coordinate_mapping = {}
+    else:
+        raise CellEventMapError(
+            "UMAP1（或 UMAP）与 UMAP2 必须成对提供；"
+            + ", ".join(
+                f"{column}={coordinate_counts[column]}"
+                for column in ("UMAP1", "UMAP", "UMAP2")
+            )
+        )
+
+    selected_source_columns = ["scan_start_time", *coordinate_mapping.values()]
 
     try:
         # Security boundary: never load Type/leiden/CellNumber or any other
-        # source column.  Header inspection above checks names only.
+        # source column. Header inspection above checks names only.
         frame = pd.read_csv(
             path,
-            usecols=list(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS),
+            usecols=selected_source_columns,
             encoding="utf-8-sig",
         )
     except (OSError, UnicodeDecodeError, pd.errors.ParserError, ValueError) as exc:
@@ -93,14 +138,24 @@ def read_source_coordinates(path: Path) -> pd.DataFrame:
 
     if frame.empty:
         raise CellEventMapError("事件坐标 CSV 没有数据行")
-    frame = frame.loc[:, list(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS)].copy()
-    for column in CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS:
+    frame = frame.loc[:, selected_source_columns].copy()
+    if coordinate_mapping:
+        frame = frame.rename(
+            columns={source: canonical for canonical, source in coordinate_mapping.items()}
+        )
+    else:
+        frame["UMAP1"] = np.nan
+        frame["UMAP2"] = np.nan
+    frame = frame.loc[:, ["scan_start_time", "UMAP1", "UMAP2"]]
+    numeric_columns = ["scan_start_time", *CELL_EVENT_MAP_COORDINATE_COLUMNS]
+    for column in numeric_columns:
         numeric = pd.to_numeric(frame[column], errors="coerce")
-        finite = np.isfinite(numeric.to_numpy(dtype=float, na_value=np.nan))
-        if not finite.all():
-            source_rows = (np.flatnonzero(~finite) + 2).tolist()
-            preview = ", ".join(str(row) for row in source_rows[:10])
-            raise CellEventMapError(f"{column} 含非数值/NaN/Inf，CSV 行: {preview}")
+        if column == "scan_start_time" or coordinate_mapping:
+            finite = np.isfinite(numeric.to_numpy(dtype=float, na_value=np.nan))
+            if not finite.all():
+                source_rows = (np.flatnonzero(~finite) + 2).tolist()
+                preview = ", ".join(str(row) for row in source_rows[:10])
+                raise CellEventMapError(f"{column} 含非数值/NaN/Inf，CSV 行: {preview}")
         frame[column] = numeric.astype(float)
 
     duplicate_mask = frame["scan_start_time"].duplicated(keep=False)
@@ -108,6 +163,8 @@ def read_source_coordinates(path: Path) -> pd.DataFrame:
         source_rows = (np.flatnonzero(duplicate_mask.to_numpy()) + 2).tolist()
         preview = ", ".join(str(row) for row in source_rows[:10])
         raise CellEventMapError(f"scan_start_time 不能重复，CSV 行: {preview}")
+    frame.attrs["coordinates_available"] = bool(coordinate_mapping)
+    frame.attrs["source_coordinate_columns"] = coordinate_mapping
     return frame
 
 
@@ -120,8 +177,11 @@ def primary_ms_events(ms_events: pd.DataFrame) -> pd.DataFrame:
     has_peak_support = {"left_sec", "right_sec"}.issubset(ms_events.columns)
     if has_peak_support:
         selected_columns.extend(["left_sec", "right_sec"])
+    has_peak_basin = {"left_base_sec", "right_base_sec"}.issubset(ms_events.columns)
+    if has_peak_basin:
+        selected_columns.extend(["left_base_sec", "right_base_sec"])
     selected = ms_events[
-        ms_events["event_strategy"].astype(str).eq(PRIMARY_EVENT_STRATEGY)
+        ms_events["event_strategy"].astype(str).isin(EVENT_MAP_EVENT_STRATEGIES)
         & ms_events["primary_signal_col"].astype(str).eq(PRIMARY_SIGNAL_COLUMN)
     ][selected_columns].copy()
     if selected.empty:
@@ -148,7 +208,142 @@ def primary_ms_events(ms_events: pd.DataFrame) -> pd.DataFrame:
             & np.isfinite(right_sec)
             & (left_sec <= right_sec)
         )
+    if has_peak_basin:
+        selected["left_base_sec"] = pd.to_numeric(
+            selected["left_base_sec"], errors="coerce"
+        )
+        selected["right_base_sec"] = pd.to_numeric(
+            selected["right_base_sec"], errors="coerce"
+        )
+        left_base_sec = selected["left_base_sec"].to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        right_base_sec = selected["right_base_sec"].to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        selected["_peak_basin_available"] = (
+            np.isfinite(left_base_sec)
+            & np.isfinite(right_base_sec)
+            & (left_base_sec <= right_base_sec)
+        )
     return selected.sort_values(["time_min", "event_id"], kind="stable").reset_index(drop=True)
+
+
+def _candidate_indices_for_source_time(
+    events: pd.DataFrame,
+    source_time_min: float,
+    *,
+    tolerance_sec: float,
+    include_peak_basin: bool = True,
+    max_peak_shape_apex_offset_sec: float | None = MAX_PEAK_SHAPE_APEX_OFFSET_SEC,
+) -> tuple[list[int], str]:
+    """Return event-map candidates using the same policy as final binding."""
+
+    event_times = events["time_min"].to_numpy(dtype=float)
+    tolerance_min = float(tolerance_sec) / 60.0
+    left = int(
+        np.searchsorted(event_times, source_time_min - tolerance_min, side="left")
+    )
+    right = int(
+        np.searchsorted(event_times, source_time_min + tolerance_min, side="right")
+    )
+    candidate_indices = [
+        index
+        for index in range(left, right)
+        if abs(float(event_times[index]) - source_time_min) * 60.0
+        <= float(tolerance_sec) + 1e-12
+    ]
+    if candidate_indices:
+        return candidate_indices, "apex_tolerance"
+
+    support_columns = {
+        "left_sec",
+        "right_sec",
+        "_peak_support_available",
+    }
+    if not support_columns.issubset(events.columns):
+        return [], "apex_tolerance"
+    source_sec = source_time_min * 60.0
+    apex_offset_sec = np.abs(event_times * 60.0 - source_sec)
+    if max_peak_shape_apex_offset_sec is None:
+        shape_offset_ok = np.ones(len(events), dtype=bool)
+    else:
+        maximum_offset = float(max_peak_shape_apex_offset_sec)
+        if not math.isfinite(maximum_offset) or maximum_offset <= 0:
+            raise CellEventMapError("峰形匹配的峰顶距离上限必须是正有限秒数")
+        shape_offset_ok = apex_offset_sec <= maximum_offset + 1e-12
+    support_available = events["_peak_support_available"].to_numpy(dtype=bool)
+    support_left_sec = events["left_sec"].to_numpy(dtype=float)
+    support_right_sec = events["right_sec"].to_numpy(dtype=float)
+    candidate_indices = np.flatnonzero(
+        support_available
+        & shape_offset_ok
+        & (support_left_sec <= source_sec + 1e-12)
+        & (source_sec <= support_right_sec + 1e-12)
+    ).tolist()
+    if candidate_indices:
+        return candidate_indices, "peak_support"
+
+    if not include_peak_basin:
+        return [], "peak_support"
+    basin_columns = {
+        "left_base_sec",
+        "right_base_sec",
+        "_peak_basin_available",
+    }
+    if not basin_columns.issubset(events.columns):
+        return [], "peak_support"
+    basin_available = events["_peak_basin_available"].to_numpy(dtype=bool)
+    basin_left_sec = events["left_base_sec"].to_numpy(dtype=float)
+    basin_right_sec = events["right_base_sec"].to_numpy(dtype=float)
+    candidate_indices = np.flatnonzero(
+        basin_available
+        & shape_offset_ok
+        & (basin_left_sec <= source_sec + 1e-12)
+        & (source_sec <= basin_right_sec + 1e-12)
+    ).tolist()
+    return candidate_indices, "peak_basin"
+
+
+def source_event_candidates(
+    source_coordinates: pd.DataFrame,
+    ms_events: pd.DataFrame,
+    *,
+    tolerance_sec: float = DEFAULT_MATCH_TOLERANCE_SEC,
+    include_peak_basin: bool = True,
+    max_peak_shape_apex_offset_sec: float | None = MAX_PEAK_SHAPE_APEX_OFFSET_SEC,
+) -> list[dict[str, Any]]:
+    """Inspect candidate relations without accepting or guessing a match.
+
+    This is used by project creation to identify only the roster rows that
+    lack a conservative core event.  The final import still performs the
+    complete one-to-one and ambiguity validation.
+    """
+
+    if not math.isfinite(float(tolerance_sec)) or float(tolerance_sec) <= 0:
+        raise CellEventMapError("match tolerance 必须是正有限秒数")
+    if "scan_start_time" not in source_coordinates.columns:
+        raise CellEventMapError("坐标表缺少必需列: scan_start_time")
+    events = primary_ms_events(ms_events)
+    relations: list[dict[str, Any]] = []
+    for frame_index, source_row in source_coordinates.reset_index(drop=True).iterrows():
+        source_time = float(source_row["scan_start_time"])
+        indices, method = _candidate_indices_for_source_time(
+            events,
+            source_time,
+            tolerance_sec=float(tolerance_sec),
+            include_peak_basin=bool(include_peak_basin),
+            max_peak_shape_apex_offset_sec=max_peak_shape_apex_offset_sec,
+        )
+        relations.append(
+            {
+                "source_line": int(frame_index) + 2,
+                "scan_start_time": source_time,
+                "candidate_event_ids": events.iloc[indices]["event_id"].astype(str).tolist(),
+                "match_method": method,
+            }
+        )
+    return relations
 
 
 def match_source_to_events(
@@ -156,6 +351,8 @@ def match_source_to_events(
     ms_events: pd.DataFrame,
     *,
     tolerance_sec: float = DEFAULT_MATCH_TOLERANCE_SEC,
+    include_peak_basin: bool = True,
+    max_peak_shape_apex_offset_sec: float | None = MAX_PEAK_SHAPE_APEX_OFFSET_SEC,
 ) -> pd.DataFrame:
     """Bind every source row to exactly one distinct primary MS760 event."""
 
@@ -164,55 +361,43 @@ def match_source_to_events(
     missing_source = sorted(set(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS) - set(source_coordinates.columns))
     if missing_source:
         raise CellEventMapError(f"坐标表缺少必需列: {', '.join(missing_source)}")
+    source_coordinates = source_coordinates.copy()
+    has_umap1 = "UMAP1" in source_coordinates.columns
+    has_umap2 = "UMAP2" in source_coordinates.columns
+    if has_umap1 != has_umap2:
+        raise CellEventMapError("UMAP1 与 UMAP2 必须成对提供")
+    if not has_umap1:
+        source_coordinates["UMAP1"] = np.nan
+        source_coordinates["UMAP2"] = np.nan
+    coordinate_values = source_coordinates[["UMAP1", "UMAP2"]].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    coordinate_finite = np.isfinite(coordinate_values.to_numpy(dtype=float))
+    coordinates_available = bool(coordinate_finite.all())
+    coordinates_missing = bool((~coordinate_finite).all())
+    if not coordinates_available and not coordinates_missing:
+        raise CellEventMapError("UMAP1 与 UMAP2 必须为完整有限坐标，或整表同时留空")
+    source_coordinates[["UMAP1", "UMAP2"]] = coordinate_values
     events = primary_ms_events(ms_events)
-    event_times = events["time_min"].to_numpy(dtype=float)
-    tolerance_min = float(tolerance_sec) / 60.0
     matches: list[dict[str, Any]] = []
     unmatched_rows: list[int] = []
     ambiguous_rows: list[tuple[int, list[str]]] = []
     apex_tolerance_match_count = 0
     peak_support_match_count = 0
+    peak_basin_match_count = 0
     apex_offsets_sec: list[float] = []
-    has_peak_support = {
-        "left_sec",
-        "right_sec",
-        "_peak_support_available",
-    }.issubset(events.columns)
-    support_available = (
-        events["_peak_support_available"].to_numpy(dtype=bool)
-        if has_peak_support
-        else np.asarray([], dtype=bool)
-    )
-    support_left_sec = (
-        events["left_sec"].to_numpy(dtype=float)
-        if has_peak_support
-        else np.asarray([], dtype=float)
-    )
-    support_right_sec = (
-        events["right_sec"].to_numpy(dtype=float)
-        if has_peak_support
-        else np.asarray([], dtype=float)
-    )
 
     for frame_index, source_row in source_coordinates.reset_index(drop=True).iterrows():
         source_line = int(frame_index) + 2
         source_time = float(source_row["scan_start_time"])
-        left = int(np.searchsorted(event_times, source_time - tolerance_min, side="left"))
-        right = int(np.searchsorted(event_times, source_time + tolerance_min, side="right"))
-        candidate_indices = [
-            index
-            for index in range(left, right)
-            if abs(float(event_times[index]) - source_time) * 60.0 <= float(tolerance_sec) + 1e-12
-        ]
-        match_method = "apex_tolerance"
-        if not candidate_indices and has_peak_support:
-            source_sec = source_time * 60.0
-            candidate_indices = np.flatnonzero(
-                support_available
-                & (support_left_sec <= source_sec + 1e-12)
-                & (source_sec <= support_right_sec + 1e-12)
-            ).tolist()
-            match_method = "peak_support"
+        candidate_indices, match_method = _candidate_indices_for_source_time(
+            events,
+            source_time,
+            tolerance_sec=float(tolerance_sec),
+            include_peak_basin=bool(include_peak_basin),
+            max_peak_shape_apex_offset_sec=max_peak_shape_apex_offset_sec,
+        )
         if not candidate_indices:
             unmatched_rows.append(source_line)
             continue
@@ -223,7 +408,9 @@ def match_source_to_events(
             continue
         event = events.iloc[candidate_indices[0]]
         apex_offsets_sec.append(abs(float(event["time_min"]) - source_time) * 60.0)
-        if match_method == "peak_support":
+        if match_method == "peak_basin":
+            peak_basin_match_count += 1
+        elif match_method == "peak_support":
             peak_support_match_count += 1
         else:
             apex_tolerance_match_count += 1
@@ -233,8 +420,12 @@ def match_source_to_events(
                 "ms_event_id": str(event["event_id"]),
                 "scan_id": event["scan_id"],
                 "scan_start_time": source_time,
-                "UMAP1": float(source_row["UMAP1"]),
-                "UMAP2": float(source_row["UMAP2"]),
+                "UMAP1": (
+                    float(source_row["UMAP1"]) if coordinates_available else np.nan
+                ),
+                "UMAP2": (
+                    float(source_row["UMAP2"]) if coordinates_available else np.nan
+                ),
             }
         )
 
@@ -271,7 +462,9 @@ def match_source_to_events(
         "match_policy": MATCH_POLICY,
         "apex_tolerance_match_count": int(apex_tolerance_match_count),
         "peak_support_match_count": int(peak_support_match_count),
+        "peak_basin_match_count": int(peak_basin_match_count),
         "max_apex_offset_sec": float(max(apex_offsets_sec, default=0.0)),
+        "coordinates_available": coordinates_available,
     }
     return canonical
 
@@ -284,6 +477,10 @@ def import_cell_event_map(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     source_path = source_path.expanduser().resolve()
     coordinates = read_source_coordinates(source_path)
+    coordinates_available = bool(coordinates.attrs.get("coordinates_available", False))
+    source_coordinate_columns = dict(
+        coordinates.attrs.get("source_coordinate_columns") or {}
+    )
     canonical = match_source_to_events(coordinates, ms_events, tolerance_sec=tolerance_sec)
     diagnostics = canonical.attrs.get("match_diagnostics", {})
     return canonical, {
@@ -299,8 +496,11 @@ def import_cell_event_map(
             diagnostics.get("apex_tolerance_match_count", len(canonical))
         ),
         "peak_support_match_count": int(diagnostics.get("peak_support_match_count", 0)),
+        "peak_basin_match_count": int(diagnostics.get("peak_basin_match_count", 0)),
         "max_apex_offset_sec": float(diagnostics.get("max_apex_offset_sec", 0.0)),
         "required_source_columns": list(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS),
+        "coordinates_available": coordinates_available,
+        "source_coordinate_columns": source_coordinate_columns,
     }
 
 
@@ -313,6 +513,7 @@ def canonical_csv_bytes(frame: pd.DataFrame) -> bytes:
         index=False,
         lineterminator="\n",
         float_format="%.15g",
+        na_rep="",
     )
     return text.encode("utf-8")
 
@@ -337,7 +538,12 @@ def write_canonical_map(frame: pd.DataFrame, destination: Path) -> dict[str, Any
     }
 
 
-def read_canonical_map(path: Path, *, expected_sha256: str | None = None) -> pd.DataFrame:
+def read_canonical_map(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    allow_missing_coordinates: bool = False,
+) -> pd.DataFrame:
     path = path.expanduser().resolve()
     if not path.is_file():
         raise CellEventMapError(f"canonical event map 不存在: {path}")
@@ -358,11 +564,27 @@ def read_canonical_map(path: Path, *, expected_sha256: str | None = None) -> pd.
         raise CellEventMapError("canonical event map 的 ms_event_id 必须非空且唯一")
     if frame["scan_id"].isna().any() or frame["scan_id"].astype(str).str.strip().eq("").any():
         raise CellEventMapError("canonical event map 的 scan_id 必须非空")
-    for column in ("scan_start_time", "UMAP1", "UMAP2"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        if not np.isfinite(frame[column].to_numpy(dtype=float, na_value=np.nan)).all():
-            raise CellEventMapError(f"canonical event map 的 {column} 含 NaN/Inf")
-    return frame.loc[:, list(CELL_EVENT_MAP_CANONICAL_COLUMNS)].copy()
+    frame["scan_start_time"] = pd.to_numeric(frame["scan_start_time"], errors="coerce")
+    if not np.isfinite(
+        frame["scan_start_time"].to_numpy(dtype=float, na_value=np.nan)
+    ).all():
+        raise CellEventMapError("canonical event map 的 scan_start_time 含 NaN/Inf")
+    coordinates = frame.loc[:, list(CELL_EVENT_MAP_COORDINATE_COLUMNS)].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    coordinate_finite = np.isfinite(coordinates.to_numpy(dtype=float))
+    coordinates_available = bool(coordinate_finite.all())
+    coordinates_missing = bool((~coordinate_finite).all())
+    if not coordinates_available:
+        if not allow_missing_coordinates or not coordinates_missing:
+            raise CellEventMapError(
+                "canonical event map 的 UMAP1/UMAP2 含 NaN/Inf 或坐标不完整"
+            )
+    frame.loc[:, list(CELL_EVENT_MAP_COORDINATE_COLUMNS)] = coordinates
+    result = frame.loc[:, list(CELL_EVENT_MAP_CANONICAL_COLUMNS)].copy()
+    result.attrs["coordinates_available"] = coordinates_available
+    return result
 
 
 def cell_event_map_manifest_entry(
@@ -378,7 +600,9 @@ def cell_event_map_manifest_entry(
     except ValueError as exc:
         raise CellEventMapError("canonical event map 必须复制到项目目录内") from exc
     entry = {
-        "schema_version": CELL_EVENT_MAP_SCHEMA_VERSION,
+        "schema_version": int(
+            import_metadata.get("schema_version", CELL_EVENT_MAP_SCHEMA_VERSION)
+        ),
         "path": relative,
         "sha256": sha256_file(canonical_path),
         "source_name": str(import_metadata.get("source_name") or ""),
@@ -397,13 +621,38 @@ def cell_event_map_manifest_entry(
             )
         ),
         "peak_support_match_count": int(import_metadata.get("peak_support_match_count", 0)),
+        "peak_basin_match_count": int(import_metadata.get("peak_basin_match_count", 0)),
         "max_apex_offset_sec": float(import_metadata.get("max_apex_offset_sec", 0.0)),
-        "required_source_columns": list(CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS),
+        "required_source_columns": list(
+            import_metadata.get(
+                "required_source_columns",
+                CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS,
+            )
+        ),
+        "coordinates_available": bool(
+            import_metadata.get("coordinates_available", False)
+        ),
+        "source_coordinate_columns": dict(
+            import_metadata.get("source_coordinate_columns") or {}
+        ),
     }
     if not entry["source_sha256"]:
         raise CellEventMapError("event map import metadata 缺少 source_sha256")
     if entry["row_count"] <= 0 or entry["matched_event_count"] != entry["row_count"]:
         raise CellEventMapError("event map manifest 需要完整的一对一匹配计数")
+    for key in ("core_event_count", "roster_supported_event_count"):
+        if key in import_metadata:
+            entry[key] = int(import_metadata[key])
+    support_model = str(import_metadata.get("event_roster_support_model") or "")
+    if support_model:
+        entry["event_roster_support_model"] = support_model
+    for key in (
+        "event_roster_support_height",
+        "event_roster_support_prominence",
+    ):
+        value = import_metadata.get(key)
+        if value is not None and math.isfinite(float(value)):
+            entry[key] = float(value)
     return entry
 
 
@@ -480,13 +729,16 @@ def project_annotation_state(
         scan_id = source["scan_id"]
         if isinstance(scan_id, np.generic):
             scan_id = scan_id.item()
+        umap1 = float(source["UMAP1"])
+        umap2 = float(source["UMAP2"])
+        coordinates_available = math.isfinite(umap1) and math.isfinite(umap2)
         points.append(
             {
                 "ms_event_id": event_id,
                 "scan_id": scan_id,
                 "scan_start_time": float(source["scan_start_time"]),
-                "UMAP1": float(source["UMAP1"]),
-                "UMAP2": float(source["UMAP2"]),
+                "UMAP1": umap1 if coordinates_available else None,
+                "UMAP2": umap2 if coordinates_available else None,
                 "classification": classification,
                 "lif_channel": lif_channel,
                 "label": label,
@@ -497,6 +749,13 @@ def project_annotation_state(
         "points": points,
         "counts": counts,
         "active_time_model_version": active_version,
+        "coordinates_available": bool(
+            points
+            and all(
+                point["UMAP1"] is not None and point["UMAP2"] is not None
+                for point in points
+            )
+        ),
     }
 
 

@@ -446,6 +446,10 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
         self.assertIn('candidate_tag="candidate-${CANDIDATE_VERSION}"', workflow)
         self.assertIn("--prerelease", workflow)
         self.assertIn("publish-release:\n    if: github.event_name == 'push'", workflow)
+        self.assertIn("prepare_version:", workflow)
+        self.assertIn('Formal tag must exactly equal APP_VERSION', workflow)
+        self.assertIn('Candidate base version must equal APP_VERSION', workflow)
+        self.assertIn('sha256sum --check "$archive.sha256"', workflow)
 
     def test_runtime_probe_exercises_expat_and_dynamic_preprocessing_imports(self):
         probe = getattr(desktop_module, "check_scientific_runtime", None)
@@ -463,6 +467,20 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
         )
         self.assertEqual(result["lif_detector_tiers"], ["core", "weak"])
         self.assertEqual(result["project_storage_layout"], "portable_project")
+        self.assertEqual(result["ms_core_tolerance_ppm"], 12.0)
+        self.assertEqual(result["ms_event_roster_support_tolerance_ppm"], 15.0)
+        self.assertEqual(
+            result["ms_event_roster_support_model"],
+            "zero_inflated_height_and_shoulder_gate",
+        )
+        self.assertAlmostEqual(
+            result["ms_event_roster_support_mz"],
+            760.575748358,
+        )
+        self.assertAlmostEqual(
+            result["ms_event_roster_support_ratio"],
+            11.01,
+        )
 
     def test_windows_builder_prioritizes_selected_python_environment_dlls(self):
         script = (

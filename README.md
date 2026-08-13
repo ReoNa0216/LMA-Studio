@@ -6,7 +6,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Current Scope
 
-- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and a single-cell event-coordinate CSV containing `scan_start_time`, `UMAP1`, and `UMAP2`; unrelated source columns are allowed and ignored.
+- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and an event-list CSV containing `scan_start_time`. `UMAP1` and `UMAP2` are optional and may be attached later; unrelated source columns are allowed and ignored.
 - Open an existing project containing the manifest-bound preprocessing parquet tables and annotation SQLite path; both the compact current layout and unchanged v0.4.0 paths are supported.
 - Configure each channel's signal color, sample label, and cell-annotation role. A channel may simultaneously serve as a front `QC anchor` and an Events-stage `Cell pair` source; the two uses are independent. Shared acquisition-time groups are assigned automatically, so users never type internal axis names.
 - Use one project-wide adaptive two-tier LIF peak standard. High-confidence peaks are the only evidence used by automatic calibration, time-difference estimation, QC, candidate generation, and model fitting. Weak candidate peaks are optional display evidence for manual cell pairing only.
@@ -16,6 +16,7 @@ It opens its own native desktop window, lets users create or open project direct
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
+- Keep the established automatic MS760 caller on its ±12 ppm core trace. If a whitelist row has no core event, a separately gated ±15 ppm review lane may expose one resolved event for manual Cell pairing only; it never enters automatic calibration, time-difference, QC, or Cell-candidate evidence.
 - Open a separate synchronized UMAP window. Its colors are derived only from current accepted SQLite relations; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations. A different coordinate CSV for the same MS-event population can be validated and imported from project configuration to switch, for example, between pre- and post-batch-correction views without changing annotations or the time model.
 - Export a compact 16-column full event roster intended for downstream cell labeling. Unannotated events use `Type=unknown`; internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
 - Create new projects with a compact manifest-bound layout: `data/`, `annotations/`, `provenance/`, and `diagnostics/`, without exposing internal pipeline-version directories. Existing v0.4.0 projects retain their original manifest paths and are never auto-migrated.
@@ -25,7 +26,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The current formal release is v0.4.4. Existing v0.4.0-v0.4.3 projects remain manifest-compatible and are not migrated when opened.
+The current formal release is v0.4.5. Existing v0.4.0-v0.4.4 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
 
 Windows x64:
 
@@ -43,7 +44,7 @@ macOS Apple Silicon:
 2. Move `LMA Studio.app` to Applications or another writable location.
 3. Control-click the app and choose **Open** on first launch if Gatekeeper warns that the package is from an unidentified developer.
 
-The macOS ARM64 build uses the native Cocoa/WebKit backend. UMAP opens as a second native app window through the pywebview bridge rather than an external browser. The package remains unsigned and not notarized until an Apple Developer ID is configured.
+The macOS ARM64 build uses the native Cocoa/WebKit backend. UMAP opens as a second native app window through the pywebview bridge rather than an external browser. The package is ad-hoc signed, but is not Apple Developer ID signed or notarized.
 
 ## Project Data Policy
 
@@ -78,7 +79,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.4 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.5 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload test artifacts and may explicitly publish a public prerelease candidate. Formal GitHub Release publication remains tag-triggered after both desktop release gates pass.

@@ -34,7 +34,7 @@ The canonical event map is a project asset with exactly:
 ms_event_id,scan_id,scan_start_time,UMAP1,UMAP2
 ```
 
-It is not the original source coordinate CSV. The source CSV may have extra columns, but only `scan_start_time`, `UMAP1`, and `UMAP2` are imported.
+It is not the original source event CSV. The source must contain `scan_start_time`; `UMAP1` and `UMAP2` are optional but must appear together. Extra columns are ignored as scientific evidence.
 
 New projects also keep these with the project:
 

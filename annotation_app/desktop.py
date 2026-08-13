@@ -11,6 +11,7 @@ import argparse
 import ctypes
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
@@ -529,6 +530,106 @@ def check_scientific_runtime() -> dict[str, Any]:
             "Bundled detector-v2 scientific probe did not emit core and weak tiers"
         )
 
+    # Exercise the packaged MS script's independent roster-review lane as
+    # well.  The generic/core threshold must remain stricter, while the
+    # zero-inflated robust upper bound recovers the resolved shoulder only in
+    # this explicitly gated lane.
+    ms_module = loaded_scripts["run_v3_02_ms_event_calling.py"]
+    if float(getattr(ms_module, "TOLERANCE_PPM", 0.0)) != 12.0:
+        raise RuntimeError("Bundled core MS760 mass tolerance changed unexpectedly")
+    if float(getattr(ms_module, "EVENT_ROSTER_SUPPORT_TOLERANCE_PPM", 0.0)) != 15.0:
+        raise RuntimeError("Bundled event-roster MS760 review lane is unavailable")
+    if (
+        str(getattr(ms_module, "EVENT_ROSTER_SUPPORT_MZ_COLUMN", ""))
+        != "pc34_760_roster_support_mz_at_max_intensity"
+    ):
+        raise RuntimeError("Bundled event-roster MS760 m/z evidence is unavailable")
+    scan_count = 24_000
+    scan_step_sec = 0.1
+    scan_time_sec = np.arange(scan_count, dtype=float) * scan_step_sec
+    roster_signal = np.zeros(scan_count, dtype=float)
+    noise_indices = np.arange(10, scan_count - 10, 20)
+    roster_signal[noise_indices] = np.random.default_rng(20260814).uniform(
+        80.0, 420.0, len(noise_indices)
+    )
+    roster_signal[1000:1007] = [5000.0, 2500.0, 1100.0, 920.0, 1100.0, 980.0, 700.0]
+    ms_probe = pd.DataFrame(
+        {
+            "scan_row_index": np.arange(scan_count, dtype=int),
+            "spectrum_index": np.arange(scan_count, dtype=int),
+            "scan_id": np.arange(1_000_000, 1_000_000 + scan_count, dtype=int),
+            "scan_start_time_sec": scan_time_sec,
+            "scan_start_time_min": scan_time_sec / 60.0,
+            "pc34_760_max_intensity": roster_signal,
+            "pc34_760_mz_at_max_intensity": np.full(scan_count, 760.5851),
+            "pc34_760_ppm_error_at_max_intensity": np.zeros(scan_count),
+            ms_module.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN: roster_signal,
+            ms_module.EVENT_ROSTER_SUPPORT_MZ_COLUMN: np.full(
+                scan_count, 760.575748358
+            ),
+            ms_module.EVENT_ROSTER_SUPPORT_PPM_COLUMN: np.full(
+                scan_count, -12.3
+            ),
+            "qc_782_max_intensity": np.full(scan_count, 99.0),
+            "qc_782_ppm_error_at_max_intensity": np.zeros(scan_count),
+            "tic": np.full(scan_count, 2_000_000.0),
+            "array_length": np.full(scan_count, 8_000, dtype=int),
+            "base_peak_mz": np.full(scan_count, 760.5851),
+        }
+    )
+    bins, localmax = ms_module.build_bin_summary(
+        ms_probe,
+        "pc34_760_max_intensity",
+        scan_step_sec,
+    )
+    ms_params, _background = ms_module.estimate_parameters(
+        ms_probe,
+        "pc34_760_max_intensity",
+        bins,
+        localmax,
+        scan_step_sec,
+    )
+    support_height = float(ms_params.get("event_roster_support_height", math.inf))
+    if not (
+        ms_params.get("event_roster_support_model")
+        == "zero_inflated_height_and_shoulder_gate"
+        and support_height < float(ms_params["peak_height"])
+    ):
+        raise RuntimeError("Bundled event-roster robust support threshold did not activate")
+    support_indices = ms_module.call_peak_indices(
+        ms_probe,
+        "pc34_760_max_intensity",
+        support_height,
+        float(ms_params["event_roster_support_prominence"]),
+        float(ms_params["min_distance_sec"]),
+        scan_step_sec,
+    )
+    if 1004 not in set(int(value) for value in support_indices):
+        raise RuntimeError("Bundled event-roster review lane missed its deterministic shoulder")
+    support_event_params = dict(ms_params)
+    support_event_params["signal_col"] = ms_module.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN
+    support_event = ms_module.build_event_table(
+        ms_probe,
+        np.asarray([1004], dtype=int),
+        support_event_params,
+        "pc34_roster_supported",
+    ).iloc[0]
+    if not math.isclose(
+        float(support_event["pc34_760_mz_at_apex"]),
+        760.575748358,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError("Bundled event-roster event table lost its selected m/z")
+    expected_ratio = (1100.0 + 1.0) / (99.0 + 1.0)
+    if not math.isclose(
+        float(support_event["ratio_760_782_max_pseudo1"]),
+        expected_ratio,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError("Bundled event-roster event table has an inconsistent ratio")
+
     return {
         "expat_version": str(expat.EXPAT_VERSION),
         "openssl_version": str(ssl.OPENSSL_VERSION),
@@ -536,6 +637,19 @@ def check_scientific_runtime() -> dict[str, Any]:
         "preprocessing_scripts": script_names,
         "lif_detector_tiers": detector_tiers,
         "project_storage_layout": str(storage_layout["name"]),
+        "ms_core_tolerance_ppm": float(ms_module.TOLERANCE_PPM),
+        "ms_event_roster_support_tolerance_ppm": float(
+            ms_module.EVENT_ROSTER_SUPPORT_TOLERANCE_PPM
+        ),
+        "ms_event_roster_support_model": str(
+            ms_params["event_roster_support_model"]
+        ),
+        "ms_event_roster_support_mz": float(
+            support_event["pc34_760_mz_at_apex"]
+        ),
+        "ms_event_roster_support_ratio": float(
+            support_event["ratio_760_782_max_pseudo1"]
+        ),
     }
 
 

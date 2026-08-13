@@ -3,7 +3,8 @@
 
 The app loads first-principles preprocessing tables, slices synchronized LIF/MS
 windows, records human review decisions in SQLite, and exports accepted
-annotations. A coordinate source is restricted to three whitelisted columns;
+annotations. An event source is restricted to the time column and optional
+UMAP coordinate pair;
 author labels, h5ad, manual labels, and V2 outputs never enter candidate
 generation or export.
 """
@@ -44,14 +45,23 @@ import numpy as np
 import pandas as pd
 
 from annotation_app.cell_event_map import (
+    CELL_EVENT_MAP_LEGACY_REQUIRED_SOURCE_COLUMNS,
     CELL_EVENT_MAP_RELATIVE_PATH,
+    CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS,
+    CELL_EVENT_MAP_SUPPORTED_SCHEMA_VERSIONS,
     DEFAULT_MATCH_TOLERANCE_SEC,
+    MAX_PEAK_SHAPE_APEX_OFFSET_SEC,
+    PRIMARY_EVENT_STRATEGY,
+    PRIMARY_SIGNAL_COLUMN,
+    ROSTER_SUPPORTED_EVENT_STRATEGY,
     CellEventMapError,
     cell_event_map_manifest_entry,
     import_cell_event_map,
     match_source_to_events,
     project_annotation_state,
     read_canonical_map,
+    read_source_coordinates,
+    source_event_candidates,
     state_revision,
     write_canonical_map,
 )
@@ -102,7 +112,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.4"
+APP_VERSION = "lma_studio_v0.4.5"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -2490,7 +2500,8 @@ def load_project_cell_event_map(
     entry = manifest.get("cell_event_map")
     if not isinstance(entry, dict):
         raise BadRequest(f"{PROJECT_MANIFEST_FILENAME} cell_event_map 必须是对象")
-    if int(entry.get("schema_version", 0)) != 1:
+    schema_version = int(entry.get("schema_version", 0))
+    if schema_version not in CELL_EVENT_MAP_SUPPORTED_SCHEMA_VERSIONS:
         raise BadRequest("cell_event_map schema_version 不受支持")
     raw_path = Path(str(entry.get("path") or "")).expanduser()
     if raw_path.is_absolute():
@@ -2500,23 +2511,58 @@ def load_project_cell_event_map(
         resolved.relative_to(project_dir.resolve())
     except ValueError as exc:
         raise BadRequest("cell_event_map 路径越出项目目录") from exc
-    expected_required = ["scan_start_time", "UMAP1", "UMAP2"]
+    expected_required = list(
+        CELL_EVENT_MAP_LEGACY_REQUIRED_SOURCE_COLUMNS
+        if schema_version == 1
+        else CELL_EVENT_MAP_REQUIRED_SOURCE_COLUMNS
+    )
     if entry.get("required_source_columns") != expected_required:
         raise BadRequest("cell_event_map required_source_columns 与当前契约不一致")
+    if schema_version == 1:
+        coordinates_available = True
+    else:
+        if not isinstance(entry.get("coordinates_available"), bool):
+            raise BadRequest("cell_event_map 缺少有效的坐标可用状态")
+        coordinates_available = bool(entry["coordinates_available"])
+        source_coordinate_columns = entry.get("source_coordinate_columns")
+        if not isinstance(source_coordinate_columns, dict):
+            raise BadRequest("cell_event_map 缺少有效的源坐标列记录")
+        valid_mappings = (
+            {},
+            {"UMAP1": "UMAP1", "UMAP2": "UMAP2"},
+            {"UMAP1": "UMAP", "UMAP2": "UMAP2"},
+        )
+        if source_coordinate_columns not in valid_mappings:
+            raise BadRequest("cell_event_map 的源坐标列记录无效")
+        if coordinates_available != bool(source_coordinate_columns):
+            raise BadRequest("cell_event_map 的坐标状态与源坐标列记录不一致")
     try:
         frame = read_canonical_map(
             resolved,
             expected_sha256=str(entry.get("sha256") or ""),
+            allow_missing_coordinates=(schema_version >= 2),
         )
         rebound = match_source_to_events(
-            frame[expected_required],
+            frame[["scan_start_time", "UMAP1", "UMAP2"]],
             ms_events,
             tolerance_sec=float(
                 entry.get("match_tolerance_sec", DEFAULT_MATCH_TOLERANCE_SEC)
             ),
+            # v0.4 schema-1 projects were originally bound by strict apex
+            # tolerance followed by an uncapped half-height support interval.
+            # Re-open them under that exact read-only meaning; the newer
+            # bounded support/basin policy applies only to schema-2 imports.
+            include_peak_basin=(schema_version >= 2),
+            max_peak_shape_apex_offset_sec=(
+                None
+                if schema_version == 1
+                else MAX_PEAK_SHAPE_APEX_OFFSET_SEC
+            ),
         )
     except CellEventMapError as exc:
         raise BadRequest(str(exc)) from exc
+    if bool(frame.attrs.get("coordinates_available", True)) != coordinates_available:
+        raise BadRequest("cell_event_map 的坐标状态与 canonical 文件不一致")
     if int(entry.get("row_count", -1)) != len(frame):
         raise BadRequest("cell_event_map row_count 与 canonical 文件不一致")
     if int(entry.get("matched_event_count", -1)) != frame["ms_event_id"].nunique():
@@ -2536,7 +2582,9 @@ def load_project_cell_event_map(
     rebound_scan_ids = [normalized_scan_id(value) for value in rebound["scan_id"]]
     if expected_scan_ids != rebound_scan_ids:
         raise BadRequest("cell_event_map 的 scan_id 绑定与当前 MS event 表不一致")
-    return frame, copy.deepcopy(entry)
+    loaded_entry = copy.deepcopy(entry)
+    loaded_entry["coordinates_available"] = coordinates_available
+    return frame, loaded_entry
 
 
 def atomic_replace_bytes(path: Path, payload: bytes) -> None:
@@ -4440,6 +4488,9 @@ def estimate_channel_shift(
     qc_calibration_end_min: float = QC_SHIFT_WINDOW_MIN,
 ) -> dict[str, Any]:
     lif_peaks = automatic_lif_peak_evidence(lif_peaks)
+    # Roster-supported events are for manual Cell pairing only.  They must
+    # never influence the physical LIF-to-MS calibration model.
+    ms_events = primary_pc34_events(ms_events)
     qc_end = float(qc_calibration_end_min)
     lif = lif_peaks[
         lif_peaks["channel"].eq(channel)
@@ -4584,6 +4635,9 @@ def estimate_axis_shift(
     channels: list[str],
     qc_calibration_end_min: float,
 ) -> dict[str, Any]:
+    # Keep the same core-only invariant as the single-channel estimator.
+    # Legacy tables without strategy metadata remain unchanged in memory.
+    ms_events = primary_pc34_events(ms_events)
     if len(channels) == 1:
         single = estimate_channel_shift(lif_peaks, ms_events, channels[0], qc_calibration_end_min)
         return {
@@ -5436,6 +5490,90 @@ def is_primary_pc34_event(row: pd.Series) -> bool:
     if "primary_signal_col" in row.index and str(row.get("primary_signal_col")) != "pc34_760_max_intensity":
         return False
     return True
+
+
+def is_manual_cell_ms_event(row: pd.Series) -> bool:
+    """Return whether an MS760 event may be used for a manual Cell pair.
+
+    Roster-supported events are intentionally excluded from every automatic
+    QC, delta, and Cell-pairing path.  They are nevertheless real, locally
+    resolved MS peaks tied to an explicit event-roster row, so the user must
+    be able to pair them manually after the event-map whitelist check.  Rows
+    from older projects do not carry ``event_strategy`` and retain their
+    historical primary-event interpretation.
+    """
+
+    if "event_strategy" not in row.index or pd.isna(row.get("event_strategy")):
+        return is_primary_pc34_event(row)
+    strategy = str(row.get("event_strategy") or "").strip()
+    if strategy not in {"pc34_primary", "pc34_roster_supported"}:
+        return False
+    if "primary_signal_col" in row.index:
+        signal_col = str(row.get("primary_signal_col") or "").strip()
+        if signal_col and signal_col != "pc34_760_max_intensity":
+            return False
+    return True
+
+
+def ms760_review_trace(
+    scan_window: pd.DataFrame,
+    events_window: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build the plotted MS760 trace without changing scientific inputs.
+
+    The conservative 12-ppm trace remains the default everywhere.  A
+    roster-supported event may exceptionally be backed by the separately
+    parsed 12--15-ppm review lane.  For those already selected events only,
+    expose that measured peak shape between its prominence bases so the
+    marker is visually auditable instead of floating over a zero core trace.
+    No caller, matcher, QC model, or candidate generator consumes this display
+    column.
+    """
+
+    output = scan_window.copy()
+    display_col = "pc34_760_display_intensity"
+    core = pd.to_numeric(
+        output.get("pc34_760_max_intensity", pd.Series(0.0, index=output.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    output[display_col] = core
+    support_col = "pc34_760_roster_support_max_intensity"
+    if (
+        output.empty
+        or events_window.empty
+        or support_col not in output.columns
+        or "scan_start_time_sec" not in output.columns
+        or "event_strategy" not in events_window.columns
+        or "roster_support_signal_col" not in events_window.columns
+    ):
+        return output
+
+    review_events = events_window[
+        events_window["event_strategy"].astype(str).eq(ROSTER_SUPPORTED_EVENT_STRATEGY)
+        & events_window["roster_support_signal_col"].astype(str).eq(support_col)
+    ]
+    if review_events.empty:
+        return output
+    scan_time = pd.to_numeric(output["scan_start_time_sec"], errors="coerce")
+    support = pd.to_numeric(output[support_col], errors="coerce").fillna(0.0)
+    for _, event in review_events.iterrows():
+        # The half-height footprint is the smallest faithful review trace.
+        # Prominence bases are a fallback for older/newly sparse event rows.
+        left = clean_value(event.get("left_sec"))
+        right = clean_value(event.get("right_sec"))
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            left = clean_value(event.get("left_base_sec"))
+            right = clean_value(event.get("right_base_sec"))
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            apex = clean_value(event.get("time_sec"))
+            if not isinstance(apex, (int, float)):
+                continue
+            left = float(apex)
+            right = float(apex)
+        lo, hi = sorted((float(left), float(right)))
+        mask = scan_time.between(lo, hi, inclusive="both")
+        output.loc[mask, display_col] = np.maximum(core[mask], support[mask])
+    return output
 
 
 def qc_triplets_for_range(
@@ -6972,6 +7110,371 @@ def apply_qc_alignment_model(
     return alignment
 
 
+def reconcile_event_roster_supported_ms_events(
+    source_path: Path,
+    ms_events: pd.DataFrame,
+    ms_scan: pd.DataFrame,
+    *,
+    tolerance_sec: float = DEFAULT_MATCH_TOLERANCE_SEC,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], pd.DataFrame]:
+    """Bind the event roster while preserving the conservative core caller.
+
+    The generic MS caller remains the only source of automatic QC/alignment
+    evidence.  If (and only if) its selected background is demonstrably
+    zero-inflated, an independently supplied ``scan_start_time`` roster may
+    rescue a missing row when that exact time has a locally resolved MS760
+    maximum above a robust upper bound of the measured positive-noise body.
+    UMAP coordinates and author labels never enter this decision.
+    """
+
+    from scripts.v3 import run_v3_02_ms_event_calling as ms_qc
+
+    source_path = Path(source_path).expanduser().resolve()
+    source = read_source_coordinates(source_path)
+    events = ms_events.copy()
+    if events.empty:
+        core_relations: list[dict[str, Any]] = []
+        unmatched_lines = set(range(2, len(source) + 2))
+    else:
+        core_relations = source_event_candidates(
+            source,
+            events,
+            tolerance_sec=float(tolerance_sec),
+            include_peak_basin=False,
+        )
+        unmatched_lines = {
+            int(row["source_line"])
+            for row in core_relations
+            if not row["candidate_event_ids"]
+        }
+
+    core_primary_mask = pd.Series(False, index=events.index, dtype=bool)
+    if {"event_strategy", "primary_signal_col"}.issubset(events.columns):
+        core_primary_mask = (
+            events["event_strategy"].astype(str).eq(PRIMARY_EVENT_STRATEGY)
+            & events["primary_signal_col"].astype(str).eq(PRIMARY_SIGNAL_COLUMN)
+        )
+    core_primary_count = int(core_primary_mask.sum())
+    if "event_tier" not in events.columns:
+        events["event_tier"] = "core"
+    else:
+        events["event_tier"] = events["event_tier"].fillna("core").astype(str)
+    if "selection_reason" not in events.columns:
+        events["selection_reason"] = "generic_conservative_caller"
+    else:
+        events["selection_reason"] = (
+            events["selection_reason"]
+            .fillna("generic_conservative_caller")
+            .astype(str)
+        )
+
+    selected_support = pd.DataFrame()
+    support_params: dict[str, Any] = {}
+    support_source_line_by_event_id: dict[str, int] = {}
+    if unmatched_lines:
+        required_scan_columns = {
+            "scan_start_time_sec",
+            "scan_start_time_min",
+            PRIMARY_SIGNAL_COLUMN,
+        }
+        missing_scan = sorted(required_scan_columns - set(ms_scan.columns))
+        if missing_scan:
+            raise CellEventMapError(
+                "MS scan 表缺少事件复核所需列: " + ", ".join(missing_scan)
+            )
+        scan = ms_scan.sort_values("scan_start_time_sec", kind="stable").reset_index(
+            drop=True
+        )
+        scan_times = pd.to_numeric(
+            scan["scan_start_time_sec"], errors="coerce"
+        ).to_numpy(dtype=float)
+        positive_steps = np.diff(scan_times)
+        positive_steps = positive_steps[
+            np.isfinite(positive_steps) & (positive_steps > 0)
+        ]
+        if not len(positive_steps):
+            raise CellEventMapError("MS scan 时间轴不足以估计采样间隔")
+        dt_sec = float(np.median(positive_steps))
+        core_scan_ids = set(
+            pd.to_numeric(
+                events.loc[core_primary_mask, "scan_id"], errors="coerce"
+            )
+            .dropna()
+            .astype(int)
+            .tolist()
+        )
+        support_lanes = [(PRIMARY_SIGNAL_COLUMN, float(ms_qc.TOLERANCE_PPM))]
+        if {
+            ms_qc.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN,
+            ms_qc.EVENT_ROSTER_SUPPORT_PPM_COLUMN,
+        }.issubset(scan.columns):
+            support_lanes.append(
+                (
+                    ms_qc.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN,
+                    float(ms_qc.EVENT_ROSTER_SUPPORT_TOLERANCE_PPM),
+                )
+            )
+        support_frames: list[pd.DataFrame] = []
+        remaining_unmatched_lines = set(unmatched_lines)
+        for lane_index, (support_signal_col, support_tolerance_ppm) in enumerate(
+            support_lanes,
+            start=1,
+        ):
+            bins, localmax = ms_qc.build_bin_summary(
+                scan,
+                support_signal_col,
+                dt_sec,
+            )
+            lane_params, _background = ms_qc.estimate_parameters(
+                scan,
+                support_signal_col,
+                bins,
+                localmax,
+                dt_sec,
+            )
+            if support_signal_col == PRIMARY_SIGNAL_COLUMN:
+                support_params = dict(lane_params)
+            support_model = str(
+                lane_params.get("event_roster_support_model") or ""
+            )
+            zero_fraction = float(lane_params.get("quiet_zero_fraction", 0.0))
+            minimum_zero_fraction = float(
+                lane_params.get("zero_inflated_min_zero_fraction", 1.0)
+            )
+            support_height = float(
+                lane_params.get(
+                    "event_roster_support_height",
+                    lane_params.get("peak_height", math.inf),
+                )
+            )
+            support_prominence = float(
+                lane_params.get(
+                    "event_roster_support_prominence",
+                    lane_params.get("peak_prominence", math.inf),
+                )
+            )
+            core_height = float(lane_params.get("peak_height", math.inf))
+            core_prominence = float(lane_params.get("peak_prominence", math.inf))
+            support_gate_active = (
+                support_model == "zero_inflated_height_and_shoulder_gate"
+                and zero_fraction >= minimum_zero_fraction
+                and math.isfinite(support_height)
+                and math.isfinite(support_prominence)
+                and (
+                    support_height < core_height - 1e-12
+                    or support_prominence < core_prominence - 1e-12
+                )
+            )
+            if not support_gate_active:
+                continue
+            support_call_params = dict(lane_params)
+            support_call_params["peak_height"] = support_height
+            support_call_params["peak_prominence"] = support_prominence
+            support_indices = ms_qc.call_peak_indices(
+                scan,
+                support_signal_col,
+                support_height,
+                support_prominence,
+                float(lane_params["min_distance_sec"]),
+                dt_sec,
+            )
+            lane_events = ms_qc.build_event_table(
+                scan,
+                support_indices,
+                support_call_params,
+                ROSTER_SUPPORTED_EVENT_STRATEGY,
+            )
+            if lane_events.empty:
+                continue
+            if support_signal_col == ms_qc.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN:
+                # The extended lane is only evidence for an ion actually in
+                # the 12--15 ppm edge band.  Peaks inside the core window are
+                # judged against the core trace's own background population.
+                lane_events = lane_events[
+                    pd.to_numeric(
+                        lane_events["pc34_760_ppm_error_at_apex"], errors="coerce"
+                    ).abs()
+                    > float(ms_qc.TOLERANCE_PPM) + 1e-12
+                ].copy()
+            if lane_events.empty:
+                continue
+            lane_events = lane_events[
+                ~pd.to_numeric(lane_events["scan_id"], errors="coerce")
+                .astype("Int64")
+                .isin(core_scan_ids)
+            ].copy()
+            if lane_events.empty:
+                continue
+            lane_events["event_strategy"] = ROSTER_SUPPORTED_EVENT_STRATEGY
+            lane_events["primary_signal_col"] = PRIMARY_SIGNAL_COLUMN
+            lane_events["roster_support_signal_col"] = support_signal_col
+            lane_events["roster_support_tolerance_ppm"] = support_tolerance_ppm
+            lane_events["event_roster_support_height"] = support_height
+            lane_events["event_roster_support_prominence"] = support_prominence
+            lane_events["event_roster_support_model"] = support_model
+            lane_events["event_tier"] = "roster_supported"
+            lane_events["selection_reason"] = (
+                "event_roster_time_plus_robust_ms_peak"
+            )
+            lane_events = lane_events.sort_values(
+                ["time_min", "scan_id"], kind="stable"
+            ).reset_index(drop=True)
+            lane_events["event_id"] = [
+                f"MS_{ROSTER_SUPPORTED_EVENT_STRATEGY}_lane{lane_index}_{index:06d}"
+                for index in range(1, len(lane_events) + 1)
+            ]
+            lane_relations = source_event_candidates(
+                source,
+                lane_events,
+                tolerance_sec=float(tolerance_sec),
+                include_peak_basin=False,
+            )
+            selected_lane_ids: set[str] = set()
+            for relation in lane_relations:
+                source_line = int(relation["source_line"])
+                if source_line not in remaining_unmatched_lines:
+                    continue
+                # Roster-supported events must have an apex at the supplied
+                # scan time.  Half-height/base support is reserved for binding
+                # a roster row to an already established core event; it must
+                # not create a new event from a neighbouring peak.
+                if str(relation.get("match_method")) != "apex_tolerance":
+                    continue
+                candidate_ids = [
+                    str(value) for value in relation["candidate_event_ids"]
+                ]
+                if len(candidate_ids) > 1:
+                    raise CellEventMapError(
+                        "事件表行 "
+                        f"{source_line} 在同一 MS 证据层存在多个峰，无法安全选择: "
+                        + ", ".join(candidate_ids)
+                    )
+                if len(candidate_ids) == 1:
+                    selected_id = candidate_ids[0]
+                    selected_lane_ids.add(selected_id)
+                    support_source_line_by_event_id[selected_id] = source_line
+                    remaining_unmatched_lines.discard(source_line)
+            if selected_lane_ids:
+                support_frames.append(
+                    lane_events[
+                        lane_events["event_id"].astype(str).isin(selected_lane_ids)
+                    ].copy()
+                )
+
+        if support_frames:
+            selected_support = pd.concat(
+                support_frames, ignore_index=True, sort=False
+            ).sort_values(
+                ["time_min", "scan_id", "roster_support_signal_col"],
+                kind="stable",
+            ).reset_index(drop=True)
+
+    if not selected_support.empty:
+        events = pd.concat([events, selected_support], ignore_index=True, sort=False)
+    events = events.sort_values(["time_min", "event_id"], kind="stable").reset_index(
+        drop=True
+    )
+
+    # The final importer remains authoritative: it rejects missing,
+    # ambiguous, and reused relations after both evidence tiers are present.
+    canonical, metadata = import_cell_event_map(
+        source_path,
+        events,
+        tolerance_sec=float(tolerance_sec),
+    )
+    selected_ids = set(canonical["ms_event_id"].astype(str))
+    if not selected_support.empty:
+        selected_support = selected_support[
+            selected_support["event_id"].astype(str).isin(selected_ids)
+        ].copy()
+        selected_support_ids = set(selected_support["event_id"].astype(str))
+        events = events[
+            ~events["event_strategy"].astype(str).eq(ROSTER_SUPPORTED_EVENT_STRATEGY)
+            | events["event_id"].astype(str).isin(selected_support_ids)
+        ].copy()
+        events = events.sort_values(
+            ["time_min", "event_id"], kind="stable"
+        ).reset_index(drop=True)
+
+    roster_supported_count = int(len(selected_support))
+    metadata.update(
+        {
+            "core_event_count": core_primary_count,
+            "roster_supported_event_count": roster_supported_count,
+            "event_roster_support_model": str(
+                support_params.get("event_roster_support_model") or "core_only"
+            ),
+            "event_roster_support_tolerance_ppm": float(
+                ms_qc.EVENT_ROSTER_SUPPORT_TOLERANCE_PPM
+                if ms_qc.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN in ms_scan.columns
+                else ms_qc.TOLERANCE_PPM
+            ),
+        }
+    )
+    for key in (
+        "event_roster_support_height",
+        "event_roster_support_prominence",
+    ):
+        value = support_params.get(key)
+        if value is not None and math.isfinite(float(value)):
+            metadata[key] = float(value)
+    audit_columns = [
+        "source_line",
+        "event_id",
+        "scan_id",
+        "time_min",
+        "time_sec",
+        "apex_intensity",
+        "peak_prominence",
+        "pc34_760_mz_at_apex",
+        "pc34_760_ppm_error_at_apex",
+        "roster_support_signal_col",
+        "roster_support_tolerance_ppm",
+        "event_roster_support_height",
+        "event_roster_support_prominence",
+        "event_roster_support_model",
+    ]
+    if selected_support.empty:
+        audit = pd.DataFrame(columns=audit_columns)
+    else:
+        audit = selected_support[
+            [
+                "event_id",
+                "scan_id",
+                "time_min",
+                "time_sec",
+                "apex_intensity",
+                "peak_prominence",
+                "pc34_760_mz_at_apex",
+                "pc34_760_ppm_error_at_apex",
+                "roster_support_signal_col",
+                "roster_support_tolerance_ppm",
+                "event_roster_support_height",
+                "event_roster_support_prominence",
+                "event_roster_support_model",
+            ]
+        ].copy()
+        audit.insert(
+            0,
+            "source_line",
+            audit["event_id"]
+            .astype(str)
+            .map(support_source_line_by_event_id)
+            .astype("Int64"),
+        )
+        for key in (
+            "event_roster_support_height",
+            "event_roster_support_prominence",
+            "event_roster_support_model",
+        ):
+            if key not in audit.columns:
+                audit[key] = metadata.get(key)
+        audit = audit.loc[:, audit_columns].sort_values(
+            ["time_min", "event_id"], kind="stable"
+        )
+    return events, canonical, metadata, audit.reset_index(drop=True)
+
+
 @dataclass(frozen=True)
 class AppData:
     project: ProjectPaths
@@ -7252,6 +7755,7 @@ class AppData:
             ),
             "cell_event_map": {
                 "available": self.cell_event_map is not None,
+                "coordinates_available": self.cell_event_map_coordinates_available(),
                 "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
                 "sha256": str((self.cell_event_map_info or {}).get("sha256") or ""),
                 "source_name": str((self.cell_event_map_info or {}).get("source_name") or ""),
@@ -7324,6 +7828,16 @@ class AppData:
     def cell_event_map_sha256(self) -> str:
         return str((self.cell_event_map_info or {}).get("sha256") or "")
 
+    def cell_event_map_coordinates_available(self) -> bool:
+        if self.cell_event_map is None:
+            return False
+        configured = (self.cell_event_map_info or {}).get("coordinates_available")
+        if isinstance(configured, bool):
+            return configured
+        # v0.4.x schema-1 projects predate the explicit capability flag and
+        # always contain a complete UMAP1/UMAP2 pair.
+        return True
+
     def cell_event_map_event_ids(self) -> set[str] | None:
         if self.cell_event_map is None:
             return None
@@ -7361,6 +7875,7 @@ class AppData:
             {
                 "project_id": self.project_identity(),
                 "map_sha256": self.cell_event_map_sha256(),
+                "coordinates_available": self.cell_event_map_coordinates_available(),
                 "channel_identity_prior": self.channel_identity_prior,
             }
         )
@@ -7474,6 +7989,10 @@ class AppData:
             )
         except CellEventMapError as exc:
             raise BadRequest(str(exc)) from exc
+        if not bool(import_metadata.get("coordinates_available")):
+            raise BadRequest(
+                "用于启用或切换 UMAP 的 CSV 必须同时包含 UMAP1（也可命名为 UMAP）和 UMAP2"
+            )
         allowed_ids = set(canonical["ms_event_id"].astype(str))
         if replacing and self.cell_event_map is not None:
             current_ids = set(self.cell_event_map["ms_event_id"].astype(str))
@@ -7559,6 +8078,8 @@ class AppData:
                         "apex_tolerance_match_count",
                         "peak_support_match_count",
                         "max_apex_offset_sec",
+                        "coordinates_available",
+                        "source_coordinate_columns",
                     )
                     if key in current_entry
                 }
@@ -7888,8 +8409,11 @@ class AppData:
                 self.cell_event_map["ms_event_id"].astype(str).eq(event_id)
             ]
             if not coordinate_rows.empty:
-                umap1 = float(coordinate_rows.iloc[0]["UMAP1"])
-                umap2 = float(coordinate_rows.iloc[0]["UMAP2"])
+                coordinate_umap1 = float(coordinate_rows.iloc[0]["UMAP1"])
+                coordinate_umap2 = float(coordinate_rows.iloc[0]["UMAP2"])
+                if math.isfinite(coordinate_umap1) and math.isfinite(coordinate_umap2):
+                    umap1 = coordinate_umap1
+                    umap2 = coordinate_umap2
                 event_positions = np.flatnonzero(
                     self.cell_event_map["ms_event_id"].astype(str).eq(event_id).to_numpy()
                 )
@@ -7919,6 +8443,11 @@ class AppData:
                 self.ms_scan["scan_id"].astype(str).eq(str(scan_id_value))
             ]
         scan_row = scan_rows.iloc[0] if not scan_rows.empty else pd.Series(dtype=object)
+        event_pc34_mz = clean_value(event_row.get("pc34_760_mz_at_apex"))
+        if event_pc34_mz is None:
+            event_pc34_mz = clean_value(
+                scan_row.get("pc34_760_mz_at_max_intensity")
+            )
         output_channels = lif_channel
         output_peak_ids = lif_peak_id
         if not is_cell:
@@ -7945,9 +8474,7 @@ class AppData:
                 if event_row.get("tic_apex") is not None
                 else scan_row.get("tic")
             ),
-            "PC(34:1)_mz": clean_value(
-                scan_row.get("pc34_760_mz_at_max_intensity")
-            ),
+            "PC(34:1)_mz": event_pc34_mz,
             "PC(34:1)_intensity": clean_value(event_row.get("pc34_760_apex")),
             "Type": type_value,
             "LIF_channel": output_channels,
@@ -8135,7 +8662,7 @@ class AppData:
         if not _staging_build:
             if cell_event_map_path is None:
                 raise BadRequest(
-                    "新项目必须选择单细胞事件坐标 CSV（scan_start_time / UMAP1 / UMAP2）"
+                    "新项目必须选择事件表 CSV（scan_start_time 必需；UMAP1/UMAP2 可稍后附加）"
                 )
             cell_event_map_path = cell_event_map_path.expanduser().resolve()
             raw_file_fingerprint(cell_event_map_path, full_hash_limit_bytes=None)
@@ -8491,20 +9018,28 @@ class AppData:
                 "LIF 原始文件在前处理期间发生变化，请确认文件不再被写入后重新创建项目: "
                 + ", ".join(changed_channels)
             )
-        intermediate_tables = {
-            "lif_traces": {"path": project_relative_or_absolute(existing_outputs[0], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[0], full_hash_limit_bytes=None)},
-            "lif_peaks": {"path": project_relative_or_absolute(existing_outputs[1], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[1], full_hash_limit_bytes=None)},
-            "ms_events": {"path": project_relative_or_absolute(existing_outputs[2], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[2], full_hash_limit_bytes=None)},
-            "ms_scan_summary": {"path": project_relative_or_absolute(existing_outputs[3], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[3], full_hash_limit_bytes=None)},
-        }
         if cell_event_map_path is None:
             raise BadRequest("内部错误：staging 项目缺少 cell event map source")
         try:
-            canonical_map, map_import_metadata = import_cell_event_map(
+            (
+                reconciled_ms_events,
+                canonical_map,
+                map_import_metadata,
+                roster_support_audit,
+            ) = reconcile_event_roster_supported_ms_events(
                 cell_event_map_path,
                 pd.read_parquet(existing_outputs[2]),
+                pd.read_parquet(existing_outputs[3]),
                 tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
             )
+            reconciled_ms_events.to_parquet(existing_outputs[2], index=False)
+            if not roster_support_audit.empty:
+                roster_support_audit.to_csv(
+                    project_dir
+                    / CANONICAL_MS_DIAGNOSTICS_DIR
+                    / "event_roster_supported_events.csv",
+                    index=False,
+                )
             canonical_path = project_dir / CANONICAL_CELL_EVENT_MAP_PATH
             write_canonical_map(canonical_map, canonical_path)
             map_manifest_entry = cell_event_map_manifest_entry(
@@ -8514,6 +9049,12 @@ class AppData:
             )
         except CellEventMapError as exc:
             raise BadRequest(f"单细胞 event map 导入失败: {exc}") from exc
+        intermediate_tables = {
+            "lif_traces": {"path": project_relative_or_absolute(existing_outputs[0], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[0], full_hash_limit_bytes=None)},
+            "lif_peaks": {"path": project_relative_or_absolute(existing_outputs[1], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[1], full_hash_limit_bytes=None)},
+            "ms_events": {"path": project_relative_or_absolute(existing_outputs[2], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[2], full_hash_limit_bytes=None)},
+            "ms_scan_summary": {"path": project_relative_or_absolute(existing_outputs[3], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[3], full_hash_limit_bytes=None)},
+        }
         write_project_manifest(
             project_dir=project_dir,
             raw_input_mode=mode,
@@ -9498,8 +10039,8 @@ class AppData:
             raise BadRequest(f"Unknown MS event_id: {ms_event_id}")
         lif_row = lif.iloc[0]
         ms_row = ms.iloc[0]
-        if not is_primary_pc34_event(ms_row):
-            raise BadRequest("Cell annotation requires an MS760 PC34 primary event")
+        if not is_manual_cell_ms_event(ms_row):
+            raise BadRequest("人工 Cell pair 需要当前事件名单中的 MS760 峰")
         self.require_third_stage_event_in_map(ms_event_id)
         if (
             enforce_acceptance_conflicts
@@ -11151,7 +11692,8 @@ class AppData:
             peaks_window = peaks_window.copy()
             peaks_window["display_y"] = peaks_window[lif_peak_y_col]
 
-        ms_760 = scan_window[["plot_time_min", "pc34_760_max_intensity"]].copy()
+        ms_display = ms760_review_trace(scan_window, events_window)
+        ms_760 = ms_display[["plot_time_min", "pc34_760_display_intensity"]].copy()
         ms_782 = scan_window[["plot_time_min", "qc_782_max_intensity"]].copy()
 
         peak_cols = [
@@ -11370,7 +11912,7 @@ class AppData:
             "lif_traces": lif_traces,
             "lif_peaks": records(peaks_window, peak_cols),
             "ms_traces": {
-                "pc34_760_linear": xy_records(ms_760, "plot_time_min", "pc34_760_max_intensity"),
+                "pc34_760_linear": xy_records(ms_760, "plot_time_min", "pc34_760_display_intensity"),
                 "qc_782_linear": xy_records(ms_782, "plot_time_min", "qc_782_max_intensity"),
             },
             "ms_events": records(events_window, event_cols),
@@ -11436,7 +11978,7 @@ class BootstrapAppData:
                 "ms_events": display_path(self.project.ms_events_path, self.project.project_dir),
                 "ms_scan_summary": display_path(self.project.ms_scan_path, self.project.project_dir),
             },
-            "input_policy": "等待导入 2-4 个 LIF 原始文件、1 个 MS 原始文件和事件坐标 CSV；坐标源只读取白名单三列，不读取作者标签/h5ad/manual/V2/archive 输入。",
+            "input_policy": "等待导入 2-4 个 LIF 原始文件、1 个 MS 原始文件和事件 CSV；事件源只读取 scan_start_time 与可选 UMAP 坐标对，不读取作者标签/h5ad/manual/archive 输入。",
             "alignment": {"green_to_ms_shift_sec": 0.0, "red_to_ms_shift_sec": 0.0, "ms_shift_sec": 0.0},
             "project_config": self.project_config(),
             "time_model": self.active_time_model(),
@@ -12945,10 +13487,10 @@ HTML = r"""<!doctype html>
         <label for="importCellEventMap">事件坐标 CSV</label>
         <div>
           <div class="path-picker-row">
-            <input id="importCellEventMap" type="text" placeholder="选择包含三列必需坐标的 CSV" />
+            <input id="importCellEventMap" type="text" placeholder="选择包含 scan_start_time 的 CSV" />
             <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
           </div>
-          <div class="coordinate-source-help">必须包含 scan_start_time、UMAP1、UMAP2；CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
+          <div class="coordinate-source-help">必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
         </div>
         <span>LIF 峰识别方式</span>
         <div id="importLifPeakDetectorStandard" class="detector-standard-card">
@@ -13084,7 +13626,7 @@ HTML = r"""<!doctype html>
           <button class="small-button secondary path-picker-button" aria-label="选择 UMAP 坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择 UMAP 坐标 CSV">选择 CSV</button>
         </div>
         <div id="attachMapRequirements" class="attach-map-requirements">
-          必需列：<code>scan_start_time</code>、<code>UMAP1</code>、<code>UMAP2</code>；
+          启用 UMAP 需要：<code>scan_start_time</code>、<code>UMAP1</code>（也可命名为 <code>UMAP</code>）、<code>UMAP2</code>；
           其他列忽略。软件保存项目内副本，不依赖原 CSV 路径。<span id="attachMapProjectName"></span>
         </div>
         <div class="attach-map-actions">
@@ -13566,7 +14108,8 @@ HTML = r"""<!doctype html>
 
     function syncUmapButtonState() {
       const button = el('openUmap');
-      const available = Boolean(state.meta?.cell_event_map?.available);
+      const eventMapAvailable = Boolean(state.meta?.cell_event_map?.available);
+      const coordinatesAvailable = Boolean(state.meta?.cell_event_map?.coordinates_available);
       if (button.dataset.opening === 'true') {
         button.disabled = true;
         button.textContent = '正在打开 UMAP…';
@@ -13574,11 +14117,13 @@ HTML = r"""<!doctype html>
         return;
       }
       button.disabled = false;
-      button.dataset.unavailable = available ? 'false' : 'true';
-      button.textContent = available ? 'UMAP' : 'UMAP（未配置）';
-      button.title = available
+      button.dataset.unavailable = coordinatesAvailable ? 'false' : 'true';
+      button.textContent = coordinatesAvailable ? 'UMAP' : 'UMAP（未配置）';
+      button.title = coordinatesAvailable
         ? '打开独立 UMAP 事件地图'
-        : '当前项目尚未附加事件坐标 CSV；点击查看配置说明';
+        : (eventMapAvailable
+            ? '事件时间表已启用，但尚未附加二维 UMAP 坐标；点击打开配置'
+            : '当前项目尚未附加事件表；点击查看配置说明');
     }
 
     function applyLoadedProjectMeta(projectMeta) {
@@ -14116,11 +14661,13 @@ HTML = r"""<!doctype html>
     }
 
     async function openUmapWindow() {
-      if (!state.meta?.cell_event_map?.available) {
+      if (!state.meta?.cell_event_map?.coordinates_available) {
         setProjectConfigModal(true);
         if (state.meta?.cell_event_map?.manage_allowed) {
           setConfigSaveStatus(
-            '当前项目尚未启用 UMAP 坐标。请在上方选择 CSV，再点击“Validate & enable”。',
+            state.meta?.cell_event_map?.available
+              ? '事件列表已经可用于 Track 标注；如需 UMAP，请选择含成对二维坐标的 CSV，再点击“Validate & enable”。'
+              : '当前项目尚未启用事件列表和 UMAP 坐标。请选择 CSV，再点击“Validate & enable”。',
             'warning'
           );
           window.setTimeout(() => el('attachCellEventMap').focus(), 0);
@@ -14915,19 +15462,22 @@ HTML = r"""<!doctype html>
       const value = input.value.trim();
       const filename = value.split(/[\\/]/).filter(Boolean).pop() || '';
       const mapInfo = state.meta?.cell_event_map || {};
-      const active = Boolean(mapInfo.available);
+      const eventMapActive = Boolean(mapInfo.available);
+      const active = Boolean(mapInfo.coordinates_available);
       const activeSourceName = String(mapInfo.source_name || '').trim();
       input.title = value;
       el('attachMap').disabled = Boolean(state.actionBusy) || !value;
       el('attachMap').textContent = active ? 'Validate & switch' : 'Validate & enable';
       el('attachMapBadge').textContent = active
         ? `Active · ${Number(mapInfo.row_count || 0).toLocaleString()} points`
-        : 'Not set';
+        : (eventMapActive
+            ? `Events · ${Number(mapInfo.row_count || 0).toLocaleString()} · UMAP not set`
+            : 'Not set');
       el('attachMapReady').textContent = value
         ? `已选择：${filename}`
         : (active
             ? `${activeSourceName ? `当前：${activeSourceName}；` : ''}选择新 CSV 可切换坐标视图`
-            : '尚未选择文件');
+            : (eventMapActive ? '事件列表已启用；尚未配置二维坐标' : '尚未选择文件'));
     }
 
     async function saveProjectConfig() {

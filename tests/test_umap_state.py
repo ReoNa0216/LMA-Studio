@@ -13,9 +13,11 @@ from annotation_app.app import (
     AppData,
     AnnotationStore,
     BadRequest,
+    HTML,
     ProjectPaths,
     acquisition_layout_hash,
 )
+from annotation_app.cell_event_map import MATCH_POLICY
 from annotation_app.umap_page import UMAP_HTML
 
 
@@ -45,7 +47,12 @@ def frozen_store(path: Path, layout: dict) -> AnnotationStore:
     return store
 
 
-def make_app(root: Path, *, with_map: bool) -> AppData:
+def make_app(
+    root: Path,
+    *,
+    with_map: bool,
+    coordinates_available: bool = True,
+) -> AppData:
     layout = {
         "layout_version": 3,
         "lif_channels": [
@@ -75,8 +82,8 @@ def make_app(root: Path, *, with_map: bool) -> AppData:
                     "ms_event_id": "ms-1",
                     "scan_id": "scan-1",
                     "scan_start_time": 41.0,
-                    "UMAP1": 1.25,
-                    "UMAP2": -2.5,
+                    "UMAP1": 1.25 if coordinates_available else float("nan"),
+                    "UMAP2": -2.5 if coordinates_available else float("nan"),
                 }
             ]
         )
@@ -99,7 +106,18 @@ def make_app(root: Path, *, with_map: bool) -> AppData:
             project_dir=str(root),
             annotation_db=str(root / "annotation.sqlite"),
         ),
-        lif_traces=pd.DataFrame(),
+        lif_traces=pd.DataFrame(
+            [
+                {
+                    "channel": "G1",
+                    "label": "LK",
+                    "detector": "green",
+                    "time_min": 41.0,
+                    "time_sec": 2460.0,
+                    "rfu": 1.0,
+                }
+            ]
+        ),
         lif_peaks=pd.DataFrame(
             [
                 {
@@ -162,7 +180,12 @@ def make_app(root: Path, *, with_map: bool) -> AppData:
         manifest=manifest,
         cell_event_map=event_map,
         cell_event_map_info=(
-            {"sha256": "map-sha", "row_count": 1}
+            {
+                "schema_version": 2,
+                "sha256": "map-sha",
+                "row_count": 1,
+                "coordinates_available": coordinates_available,
+            }
             if with_map
             else None
         ),
@@ -170,6 +193,33 @@ def make_app(root: Path, *, with_map: bool) -> AppData:
 
 
 class UmapAppStateTest(unittest.TestCase):
+    def test_time_only_event_map_keeps_track_whitelist_but_disables_umap(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            app = make_app(
+                Path(tmp),
+                with_map=True,
+                coordinates_available=False,
+            )
+
+            meta = app.meta()["cell_event_map"]
+            projected = app.projected_cell_event_map_state()
+
+        self.assertTrue(meta["available"])
+        self.assertFalse(meta["coordinates_available"])
+        self.assertEqual(app.cell_event_map_event_ids(), {"ms-1"})
+        self.assertFalse(projected["coordinates_available"])
+        self.assertIsNone(projected["points"][0]["UMAP1"])
+        self.assertIsNone(projected["points"][0]["UMAP2"])
+
+    def test_umap_button_uses_coordinate_capability_not_event_whitelist_only(self):
+        self.assertIn(
+            "const coordinatesAvailable = Boolean(state.meta?.cell_event_map?.coordinates_available);",
+            HTML,
+        )
+        self.assertIn("data-unavailable", HTML)
+        self.assertIn("data.coordinates_available === false", UMAP_HTML)
+        self.assertIn("尚未配置二维 UMAP 坐标", UMAP_HTML)
+
     def test_umap_page_exposes_responsive_axes_and_plain_language_controls(self):
         self.assertIn(">显示全部点</button>", UMAP_HTML)
         self.assertIn("不会修改任何标注", UMAP_HTML)
@@ -404,7 +454,7 @@ class UmapAppStateTest(unittest.TestCase):
             )
             self.assertEqual(
                 replaced_manifest["cell_event_map_history"][-1]["match_policy"],
-                "apex_tolerance_then_unique_peak_support_v1",
+                MATCH_POLICY,
             )
             self.assertEqual(
                 replaced_manifest["cell_event_map_history"][-1]["apex_tolerance_match_count"],

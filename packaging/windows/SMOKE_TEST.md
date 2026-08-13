@@ -1,4 +1,4 @@
-# Windows v0.4.4 Release Smoke Test
+# Windows v0.4.5 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -6,8 +6,8 @@ Goal: verify that the packaged LMA Studio release can create and open current-st
 
 - Run this smoke test against the exact commit intended for the formal Release.
 - Formal publication remains tag-triggered and must follow the automated release gates.
-- Open existing projects only through temporary copies. Never point a write test at `HSC1_data` or an existing user project.
-- `HSC1_data` raw files may be selected only as read-only external references; save the generated project in a separate new directory. The existing current-standard project is named `Lin-_LSK`.
+- Open existing projects only through temporary copies. Never point a write test at an original experimental-data directory or an existing user project.
+- Raw files may be selected only as read-only external references; save every generated project in a separate new directory.
 - Keep the entire `dist/LMAStudio` directory together.
 
 ## 1. Build
@@ -39,13 +39,13 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4.4 project
+## 3. Create a v0.4.5 project
 
 Create only in a new empty project directory. Configure:
 
 - Two to four distinct LIF raw files and one MS raw file.
 - One automatically configured adaptive two-tier LIF peak standard. The UI must not expose detector version choices or internal configuration keys.
-- One event-coordinate CSV in which `scan_start_time`, `UMAP1`, and `UMAP2` can be found; unrelated columns are allowed.
+- One event-list CSV containing `scan_start_time`; `UMAP1` and `UMAP2` are optional but must be supplied together. Unrelated columns are allowed and ignored.
 - For every LIF channel: channel name, signal color, scientific identity/sample label, and cell-annotation role. The shared acquisition-time group is assigned automatically from the signal color.
 - One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
 - A project-specific event annotation start and unlabeled-delta seed window.

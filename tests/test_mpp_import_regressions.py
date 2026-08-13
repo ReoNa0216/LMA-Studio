@@ -308,6 +308,73 @@ class MppImportRegressionTest(unittest.TestCase):
             9.9,
             places=3,
         )
+        self.assertEqual(summary["event_roster_support_tolerance_ppm"], 15.0)
+        self.assertEqual(
+            int(scan.iloc[0]["pc34_760_roster_support_n_mz"]),
+            2,
+        )
+        self.assertAlmostEqual(
+            float(scan.iloc[0]["pc34_760_roster_support_max_intensity"]),
+            9999.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(
+                scan.iloc[0][
+                    "pc34_760_roster_support_ppm_error_at_max_intensity"
+                ]
+            ),
+            12.1,
+            places=3,
+        )
+
+    def test_event_roster_support_mass_window_is_capped_at_15ppm(self):
+        target_mz = 760.5851
+        inside_support_mz = target_mz * (1.0 - 12.3e-6)
+        outside_support_mz = target_mz * (1.0 + 15.1e-6)
+        payload = "\n".join(
+            [
+                "spectrumList (1 spectra)",
+                "spectrum:",
+                "  index: 0",
+                "  id: scanId=2",
+                "  defaultArrayLength: 4",
+                "  cvParam: total ion current, 1000, number of detector counts",
+                "  cvParam: scan start time, 1.0, minute",
+                "  cvParam: m/z array, m/z",
+                f"  binary: [4] 100.0 {inside_support_mz:.12f} {outside_support_mz:.12f} 800.0",
+                "  cvParam: intensity array, number of detector counts",
+                "  binary: [4] 0.0 1700.0 9999.0 0.0",
+                "",
+            ]
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            source = Path(tmp) / "support-mass-window.txt"
+            source.write_text(payload, encoding="ascii")
+            scan, summary = ms_qc.parse_ms_scan_summary(source)
+
+        self.assertEqual(summary["tolerance_ppm"], 12.0)
+        self.assertEqual(summary["event_roster_support_tolerance_ppm"], 15.0)
+        self.assertEqual(int(scan.iloc[0]["pc34_760_n_mz"]), 0)
+        self.assertEqual(float(scan.iloc[0]["pc34_760_max_intensity"]), 0.0)
+        self.assertEqual(
+            int(scan.iloc[0]["pc34_760_roster_support_n_mz"]),
+            1,
+        )
+        self.assertAlmostEqual(
+            float(scan.iloc[0]["pc34_760_roster_support_max_intensity"]),
+            1700.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(
+                scan.iloc[0][
+                    "pc34_760_roster_support_ppm_error_at_max_intensity"
+                ]
+            ),
+            -12.3,
+            places=3,
+        )
 
     def test_event_map_error_explains_detector_under_call_instead_of_blaming_csv(self):
         source = pd.DataFrame(
