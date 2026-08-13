@@ -346,8 +346,130 @@ class ProjectDrivenPreprocessingPhaseTest(unittest.TestCase):
             params["peak_height_model"],
             "positive_background_tail_cap",
         )
+        self.assertLess(params["quiet_zero_fraction"], 0.5)
         self.assertGreater(params["peak_height_body_candidate"], 1000.0)
         self.assertLess(params["peak_height_positive_noise_candidate"], 1000.0)
+
+    def test_pc34_zero_inflated_variable_noise_uses_localmax_fence_without_losing_events(self):
+        """Sparse cells must not contaminate the zero-background height estimate.
+
+        A zero-inflated trace can still contain a broad, variable population of
+        electronic local maxima.  Multiplying its upper quartile by four puts
+        the height threshold above the real 1,000-count impulses even though
+        every noise maximum remains below 500.  The detector must estimate an
+        upper fence from the local-maximum body and keep prominence as an
+        independent gate; no expected event count or coordinate table is used.
+        """
+
+        rng = np.random.default_rng(20260814)
+        signal_col = "pc34_760_max_intensity"
+        dt_sec = 0.1
+        scan_count = 24_000
+        signal = np.zeros(scan_count, dtype=float)
+        noise_indices = np.arange(10, scan_count - 10, 20)
+        signal[noise_indices] = rng.uniform(100.0, 500.0, len(noise_indices))
+        true_peak_indices = np.arange(1_000, scan_count - 1_000, 2_000)
+        signal[true_peak_indices] = 1_000.0
+        time_sec = np.arange(scan_count, dtype=float) * dt_sec
+        scan = pd.DataFrame(
+            {
+                "scan_start_time_sec": time_sec,
+                "scan_start_time_min": time_sec / 60.0,
+                signal_col: signal,
+            }
+        )
+        bins, localmax = ms_qc.build_bin_summary(scan, signal_col, dt_sec)
+
+        params, _background = ms_qc.estimate_parameters(
+            scan,
+            signal_col,
+            bins,
+            localmax,
+            dt_sec,
+        )
+        called = ms_qc.call_peak_indices(
+            scan,
+            signal_col,
+            params["event_roster_support_height"],
+            params["event_roster_support_prominence"],
+            params["min_distance_sec"],
+            dt_sec,
+        )
+
+        recalled = sum(
+            np.any(np.abs(called - index) <= 1) for index in true_peak_indices
+        )
+        extras = sum(
+            not np.any(np.abs(true_peak_indices - index) <= 1) for index in called
+        )
+        self.assertEqual(recalled, len(true_peak_indices))
+        self.assertEqual(extras, 0)
+        self.assertGreater(params["peak_height"], 1_000.0)
+        self.assertLess(params["event_roster_support_height"], 1_000.0)
+        self.assertGreater(params["event_roster_support_height"], 500.0)
+        self.assertEqual(
+            params["peak_height_model"],
+            "background_body_multiplier",
+        )
+        self.assertEqual(
+            params["event_roster_support_model"],
+            "zero_inflated_height_and_shoulder_gate",
+        )
+        self.assertGreaterEqual(params["quiet_zero_fraction"], 0.5)
+        self.assertEqual(params["zero_inflated_min_zero_fraction"], 0.5)
+
+    def test_zero_inflated_height_significance_keeps_a_resolved_shoulder_event(self):
+        """A high, scan-resolved shoulder is an event even on a prior tail.
+
+        Absolute height already has to clear the robust ~4-sigma local-maximum
+        fence.  Requiring the same upper-quartile prominence again would
+        reject a second cell pulse merely because it lands on the descending
+        tail of the first one.
+        """
+
+        rng = np.random.default_rng(76020260814)
+        signal_col = "pc34_760_max_intensity"
+        dt_sec = 0.1
+        scan_count = 24_000
+        signal = np.zeros(scan_count, dtype=float)
+        noise_indices = np.arange(10, scan_count - 10, 20)
+        signal[noise_indices] = rng.uniform(80.0, 420.0, len(noise_indices))
+        # Two independently resolved maxima, four scans / 0.4 sec apart.  The
+        # second clears the noise height fence but has only 180 counts of
+        # prominence because it is superimposed on the first event's tail.
+        signal[1000:1007] = [5_000.0, 2_500.0, 1_100.0, 920.0, 1_100.0, 980.0, 700.0]
+        time_sec = np.arange(scan_count, dtype=float) * dt_sec
+        scan = pd.DataFrame(
+            {
+                "scan_start_time_sec": time_sec,
+                "scan_start_time_min": time_sec / 60.0,
+                signal_col: signal,
+            }
+        )
+        bins, localmax = ms_qc.build_bin_summary(scan, signal_col, dt_sec)
+
+        params, _background = ms_qc.estimate_parameters(
+            scan,
+            signal_col,
+            bins,
+            localmax,
+            dt_sec,
+        )
+        called = ms_qc.call_peak_indices(
+            scan,
+            signal_col,
+            params["event_roster_support_height"],
+            params["event_roster_support_prominence"],
+            params["min_distance_sec"],
+            dt_sec,
+        )
+
+        self.assertIn(1000, called.tolist())
+        self.assertIn(1004, called.tolist())
+        self.assertEqual(
+            params["event_roster_support_model"],
+            "zero_inflated_height_and_shoulder_gate",
+        )
 
 
 if __name__ == "__main__":

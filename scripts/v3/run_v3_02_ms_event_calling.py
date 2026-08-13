@@ -58,6 +58,18 @@ CANONICAL_STORAGE = False
 EXPECTED_ALLOWED_STAGE = "V3-01~V3-06 main workflow"
 
 TOLERANCE_PPM = 12.0
+# The generic/core caller deliberately remains on the established +/-12 ppm
+# trace.  A separately stored, bounded review trace is available only when an
+# independently supplied event roster has no core event at that time.  This
+# keeps old automatic candidates stable while allowing a real target-ion apex
+# near the edge of the acquisition mass error to be reviewed rather than
+# silently discarded.
+EVENT_ROSTER_SUPPORT_TOLERANCE_PPM = 15.0
+EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN = "pc34_760_roster_support_max_intensity"
+EVENT_ROSTER_SUPPORT_MZ_COLUMN = "pc34_760_roster_support_mz_at_max_intensity"
+EVENT_ROSTER_SUPPORT_PPM_COLUMN = (
+    "pc34_760_roster_support_ppm_error_at_max_intensity"
+)
 PSEUDOCOUNT = 1.0
 BIN_SIZE_MIN = 2.0
 COLLISION_GAP_SEC = 0.60
@@ -68,6 +80,12 @@ LOW_ARRAY_LENGTH_SEVERE = 1000
 TIC_SUPPORT_TOL_SEC = 0.75
 PC34_FALLBACK_HEIGHT_FRACTION = 0.10
 PC34_FALLBACK_PROMINENCE_FRACTION = 0.10
+# Q3 + 2.35*IQR is about 3.84 sigma above the center for a symmetric normal
+# body.  It is used only by the roster-supported review tier, never by the
+# generic/core event caller.
+PC34_ZERO_INFLATED_LOCALMAX_IQR_MULTIPLIER = 2.35
+PC34_ZERO_INFLATED_MIN_LOCALMAX_COUNT = 30
+PC34_ZERO_INFLATED_MIN_ZERO_FRACTION = 0.50
 PROJECT_PHASE_POLICY = load_project_protocol(
     ROOT,
     allow_unbound_module_default=True,
@@ -342,6 +360,14 @@ def init_marker_fields(current: dict) -> None:
         current[f"{prefix}_sum_intensity"] = 0.0
         current[f"{prefix}_mz_at_max_intensity"] = np.nan
         current[f"{prefix}_ppm_error_at_max_intensity"] = np.nan
+    support_prefix = "pc34_760_roster_support"
+    current[f"{support_prefix}_n_mz"] = 0
+    current[f"{support_prefix}_closest_mz"] = np.nan
+    current[f"{support_prefix}_closest_ppm_error"] = np.nan
+    current[f"{support_prefix}_max_intensity"] = 0.0
+    current[f"{support_prefix}_sum_intensity"] = 0.0
+    current[f"{support_prefix}_mz_at_max_intensity"] = np.nan
+    current[f"{support_prefix}_ppm_error_at_max_intensity"] = np.nan
 
 
 def parse_ms_scan_summary(path: Path, progress_every: int = 10000) -> tuple[pd.DataFrame, dict]:
@@ -355,6 +381,14 @@ def parse_ms_scan_summary(path: Path, progress_every: int = 10000) -> tuple[pd.D
     for marker in MARKERS:
         tol_mz = marker.mz * TOLERANCE_PPM * 1e-6
         bounds[marker.prefix] = (marker.mz, marker.mz - tol_mz, marker.mz + tol_mz)
+    pc34_marker = MARKERS[0]
+    support_tol_mz = pc34_marker.mz * EVENT_ROSTER_SUPPORT_TOLERANCE_PPM * 1e-6
+    support_prefix = "pc34_760_roster_support"
+    bounds[support_prefix] = (
+        pc34_marker.mz,
+        pc34_marker.mz - support_tol_mz,
+        pc34_marker.mz + support_tol_mz,
+    )
 
     in_spectrum = False
     current: dict = {}
@@ -436,6 +470,21 @@ def parse_ms_scan_summary(path: Path, progress_every: int = 10000) -> tuple[pd.D
                         closest_mz = float(mz_values[closest_pos])
                         current[f"{marker.prefix}_closest_mz"] = closest_mz
                         current[f"{marker.prefix}_closest_ppm_error"] = (closest_mz - target_mz) / target_mz * 1e6
+                target_mz, lower_mz, upper_mz = bounds[support_prefix]
+                left = int(np.searchsorted(mz_array, lower_mz, side="left"))
+                right = int(np.searchsorted(mz_array, upper_mz, side="right"))
+                indices = np.arange(left, right, dtype=int)
+                mz_values = mz_array[left:right]
+                target_indices[support_prefix] = indices
+                target_mz_values[support_prefix] = mz_values
+                current[f"{support_prefix}_n_mz"] = int(len(mz_values))
+                if len(mz_values) > 0:
+                    closest_pos = int(np.argmin(np.abs(mz_values - target_mz)))
+                    closest_mz = float(mz_values[closest_pos])
+                    current[f"{support_prefix}_closest_mz"] = closest_mz
+                    current[f"{support_prefix}_closest_ppm_error"] = (
+                        (closest_mz - target_mz) / target_mz * 1e6
+                    )
                 array_mode = None
                 continue
 
@@ -458,6 +507,26 @@ def parse_ms_scan_summary(path: Path, progress_every: int = 10000) -> tuple[pd.D
                         current[f"{marker.prefix}_ppm_error_at_max_intensity"] = (
                             mz_at_max - marker.mz
                         ) / marker.mz * 1e6
+                    support_indices = target_indices.get(
+                        support_prefix, np.asarray([], dtype=int)
+                    )
+                    support_mz_values = target_mz_values.get(
+                        support_prefix, np.asarray([], dtype=float)
+                    )
+                    if len(support_indices) > 0:
+                        selected = intensity_array[support_indices]
+                        max_pos = int(np.argmax(selected))
+                        mz_at_max = float(support_mz_values[max_pos])
+                        current[f"{support_prefix}_max_intensity"] = float(
+                            selected[max_pos]
+                        )
+                        current[f"{support_prefix}_sum_intensity"] = float(
+                            selected.sum()
+                        )
+                        current[f"{support_prefix}_mz_at_max_intensity"] = mz_at_max
+                        current[
+                            f"{support_prefix}_ppm_error_at_max_intensity"
+                        ] = (mz_at_max - pc34_marker.mz) / pc34_marker.mz * 1e6
                 else:
                     current["intensity_array_length_parsed_if_marker_hit"] = np.nan
 
@@ -483,6 +552,9 @@ def parse_ms_scan_summary(path: Path, progress_every: int = 10000) -> tuple[pd.D
         "historical_label_seen_in_ms_header": historical_label_seen,
         "correct_label_seen_in_file_or_path": correct_label_seen,
         "tolerance_ppm": TOLERANCE_PPM,
+        "event_roster_support_tolerance_ppm": (
+            EVENT_ROSTER_SUPPORT_TOLERANCE_PPM
+        ),
         "elapsed_sec": time.time() - started,
     }
     for marker in MARKERS:
@@ -499,6 +571,9 @@ def add_derived_columns(scan: pd.DataFrame) -> pd.DataFrame:
     out["scan_row_index"] = np.arange(len(out), dtype=int)
     out["scan_step_sec"] = out["scan_start_time_sec"].diff()
     out["has_pc34_760"] = out["pc34_760_n_mz"] > 0
+    out["has_pc34_760_roster_support"] = (
+        out["pc34_760_roster_support_n_mz"] > 0
+    )
     out["has_qc_782"] = out["qc_782_n_mz"] > 0
     out["has_both_markers"] = out["has_pc34_760"] & out["has_qc_782"]
     out["ratio_760_782_max_pseudo1"] = (out["pc34_760_max_intensity"] + PSEUDOCOUNT) / (
@@ -593,6 +668,10 @@ def select_quiet_platform(bin_summary: pd.DataFrame) -> tuple[pd.DataFrame, str]
 
 
 def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.DataFrame, localmax: pd.DataFrame, dt_sec: float) -> tuple[dict, pd.DataFrame]:
+    pc34_signal = signal_col in {
+        "pc34_760_max_intensity",
+        EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN,
+    }
     quiet_bins, quiet_method = select_quiet_platform(bin_summary)
     quiet_scan_parts = []
     quiet_peak_parts = []
@@ -612,11 +691,24 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
     )
     quiet_localmax_p99 = float(quiet_peaks.quantile(0.99))
     quiet_mad_sigma = float(1.4826 * np.median(np.abs(quiet_scans - quiet_scans.median())))
+    quiet_zero_fraction = float(
+        np.mean(np.isclose(quiet_scans.to_numpy(float), 0.0, rtol=0.0, atol=0.0))
+    )
 
     peak_height_body_candidate = np.nan
     peak_height_positive_noise_candidate = np.nan
+    peak_height_zero_inflated_localmax_candidate = np.nan
+    peak_prominence_zero_inflated_shoulder_candidate = np.nan
+    quiet_localmax_p25 = (
+        float(quiet_peaks.quantile(0.25)) if not quiet_peaks.empty else 0.0
+    )
+    quiet_localmax_iqr = float(quiet_localmax_p75 - quiet_localmax_p25)
     peak_height_model = "default"
-    if signal_col == "pc34_760_max_intensity":
+    peak_prominence_model = "default"
+    roster_support_height = np.nan
+    roster_support_prominence = np.nan
+    roster_support_model = "core_only"
+    if pc34_signal:
         # Cell events are sparse positive impulses on a continuously sampled
         # background.  The former q99/q99 rule let even a small number of real
         # events contaminate the selected background interval; one extreme
@@ -628,6 +720,38 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         )
         height = peak_height_body_candidate
         peak_height_model = "background_body_multiplier"
+        if (
+            quiet_zero_fraction >= PC34_ZERO_INFLATED_MIN_ZERO_FRACTION
+            and len(quiet_peaks) >= PC34_ZERO_INFLATED_MIN_LOCALMAX_COUNT
+            and np.isfinite(quiet_localmax_iqr)
+            and quiet_localmax_iqr > np.finfo(float).eps
+        ):
+            # Target-ion extraction has a structural point mass at zero when
+            # the ion is absent from a scan.  Once at least half of the
+            # selected background scans are exactly zero, a continuous
+            # median/MAD model is no longer identifiable.  Its positive local
+            # maxima still form a broad, measurable electronic-noise body.
+            # Multiplying an upper quantile by a fixed factor then scales with
+            # sparse real impulses that leaked into the selected background
+            # bins and can raise the threshold above genuine low events.
+            #
+            # Use a conservative upper fence of the local-maximum body as a
+            # secondary threshold for an independently supplied event roster.
+            # It is deliberately not applied to the generic caller: doing so
+            # would populate automatic QC/alignment with every low peak.
+            # Degenerate spike trains (IQR=0) retain core-only behavior.
+            peak_height_zero_inflated_localmax_candidate = float(
+                quiet_localmax_p75
+                + PC34_ZERO_INFLATED_LOCALMAX_IQR_MULTIPLIER
+                * quiet_localmax_iqr
+            )
+            if (
+                np.isfinite(peak_height_zero_inflated_localmax_candidate)
+                and peak_height_zero_inflated_localmax_candidate > 0
+                and peak_height_zero_inflated_localmax_candidate < height
+            ):
+                roster_support_height = peak_height_zero_inflated_localmax_candidate
+                roster_support_model = "zero_inflated_localmax_fence"
         if quiet_mad_sigma > np.finfo(float).eps:
             # A positive continuous background has a measurable robust noise
             # scale.  In that regime, multiplying the absolute p90 can reject
@@ -647,11 +771,33 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
                 height = peak_height_positive_noise_candidate
                 peak_height_model = "positive_background_tail_cap"
         prominence = float(max(0.8 * quiet_localmax_p75, 3.0 * quiet_mad_sigma))
+        peak_prominence_model = "background_upper_quartile"
+        if (
+            roster_support_model == "zero_inflated_localmax_fence"
+            and np.isfinite(quiet_localmax_p25)
+            and quiet_localmax_p25 > np.finfo(float).eps
+        ):
+            # The robust height fence already establishes that the absolute
+            # apex is far outside the positive background population.  A
+            # second pulse on the descending tail of a larger cell event can
+            # therefore be physically resolved while having modest standard
+            # prominence.  Require a real local excursion at least as large
+            # as the lower quartile of positive background maxima, rather
+            # than applying the upper-quartile gate a second time.
+            peak_prominence_zero_inflated_shoulder_candidate = float(
+                quiet_localmax_p25
+            )
+            roster_support_prominence = min(
+                prominence,
+                peak_prominence_zero_inflated_shoulder_candidate,
+            )
+            roster_support_model = "zero_inflated_height_and_shoulder_gate"
     else:
         quiet_median = float(quiet_scans.median())
         localmax_excess_p99 = max(0.0, quiet_localmax_p99 - quiet_median)
         height = float(max(quiet_scan_p99 + 3.0 * quiet_mad_sigma, quiet_localmax_p99))
         prominence = float(max(0.25 * localmax_excess_p99, 3.0 * quiet_mad_sigma, 0.02))
+        peak_prominence_model = "continuous_background_tail"
 
     y = scan[signal_col].to_numpy(float)
     t = scan["scan_start_time_sec"].to_numpy(float)
@@ -659,7 +805,7 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
     signal_max = float(np.nanmax(y)) if len(y) else 0.0
     sparse_high_contrast_trace = 2 <= len(quiet_peaks) <= 5
     if (
-        signal_col == "pc34_760_max_intensity"
+        pc34_signal
         and signal_max > 0
         and (not np.isfinite(height) or height >= signal_max)
         and sparse_high_contrast_trace
@@ -685,7 +831,19 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         )
         threshold_fallback_reason = "quiet_threshold_exceeded_signal_range"
         peak_height_model = "sparse_high_contrast_range_fallback"
-    prelim_distance_points = 2 if signal_col == "pc34_760_max_intensity" else 3
+        peak_prominence_model = "sparse_high_contrast_range_fallback"
+    if not np.isfinite(roster_support_height):
+        roster_support_height = float(height)
+    else:
+        roster_support_height = min(float(roster_support_height), float(height))
+    if not np.isfinite(roster_support_prominence):
+        roster_support_prominence = float(prominence)
+    else:
+        roster_support_prominence = min(
+            float(roster_support_prominence),
+            float(prominence),
+        )
+    prelim_distance_points = 2 if pc34_signal else 3
     prelim_idx, _ = find_peaks(
         y,
         height=height,
@@ -696,13 +854,13 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         gap_q10 = float(np.quantile(np.diff(t[prelim_idx]), 0.10))
         min_distance_sec = (
             float(2.0 * dt_sec)
-            if signal_col == "pc34_760_max_intensity"
+            if pc34_signal
             else float(np.clip(gap_q10, 6.0 * dt_sec, 15.0 * dt_sec))
         )
     else:
         gap_q10 = np.nan
         min_distance_sec = float(
-            (2.0 if signal_col == "pc34_760_max_intensity" else 6.0) * dt_sec
+            (2.0 if pc34_signal else 6.0) * dt_sec
         )
 
     params = {
@@ -714,14 +872,26 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         "quiet_scan_p90": quiet_scan_p90,
         "quiet_scan_p99": quiet_scan_p99,
         "quiet_localmax_p75": quiet_localmax_p75,
+        "quiet_localmax_p25": quiet_localmax_p25,
+        "quiet_localmax_iqr": quiet_localmax_iqr,
         "quiet_localmax_p99": quiet_localmax_p99,
         "quiet_median": float(quiet_scans.median()),
         "quiet_mad_sigma": quiet_mad_sigma,
+        "quiet_zero_fraction": quiet_zero_fraction,
+        "zero_inflated_min_zero_fraction": PC34_ZERO_INFLATED_MIN_ZERO_FRACTION,
         "peak_height": height,
         "peak_height_model": peak_height_model,
         "peak_height_body_candidate": peak_height_body_candidate,
         "peak_height_positive_noise_candidate": peak_height_positive_noise_candidate,
+        "peak_height_zero_inflated_localmax_candidate": peak_height_zero_inflated_localmax_candidate,
         "peak_prominence": prominence,
+        "peak_prominence_model": peak_prominence_model,
+        "peak_prominence_zero_inflated_shoulder_candidate": (
+            peak_prominence_zero_inflated_shoulder_candidate
+        ),
+        "event_roster_support_height": roster_support_height,
+        "event_roster_support_prominence": roster_support_prominence,
+        "event_roster_support_model": roster_support_model,
         "threshold_fallback_reason": threshold_fallback_reason,
         "signal_max": signal_max,
         "preliminary_peak_count": int(len(prelim_idx)),
@@ -745,14 +915,34 @@ def build_event_table(scan: pd.DataFrame, peaks: np.ndarray, params: dict, strat
     y = scan[signal_col].to_numpy(float)
     t = scan["scan_start_time_sec"].to_numpy(float)
     dt_sec = float(params["scan_step_sec"])
+    support_signal = signal_col == EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN
+    pc34_apex_col = (
+        EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN
+        if support_signal
+        else "pc34_760_max_intensity"
+    )
+    pc34_ppm_col = (
+        EVENT_ROSTER_SUPPORT_PPM_COLUMN
+        if support_signal
+        else "pc34_760_ppm_error_at_max_intensity"
+    )
+    pc34_mz_col = (
+        EVENT_ROSTER_SUPPORT_MZ_COLUMN
+        if support_signal
+        else "pc34_760_mz_at_max_intensity"
+    )
     if len(peaks):
-        prominences = peak_prominences(y, peaks)[0]
+        prominence_result = peak_prominences(y, peaks)
+        prominences = prominence_result[0]
+        left_bases = prominence_result[1]
+        right_bases = prominence_result[2]
         width_result = peak_widths(y, peaks, rel_height=0.5)
         width_points = width_result[0]
         left_ips = width_result[2]
         right_ips = width_result[3]
     else:
-        prominences = width_points = left_ips = right_ips = np.asarray([])
+        prominences = left_bases = right_bases = np.asarray([])
+        width_points = left_ips = right_ips = np.asarray([])
 
     rows = []
     for i, peak_idx in enumerate(peaks, start=1):
@@ -775,13 +965,23 @@ def build_event_table(scan: pd.DataFrame, peaks: np.ndarray, params: dict, strat
                 "peak_width_sec": float(width_points[i - 1] * dt_sec),
                 "left_sec": float(np.interp(left_ips[i - 1], np.arange(len(t)), t)),
                 "right_sec": float(np.interp(right_ips[i - 1], np.arange(len(t)), t)),
+                "left_base_sec": float(t[int(left_bases[i - 1])]),
+                "right_base_sec": float(t[int(right_bases[i - 1])]),
                 "window_scan_count": int(len(window)),
-                "pc34_760_apex": float(apex["pc34_760_max_intensity"]),
+                "pc34_760_apex": float(apex[pc34_apex_col]),
+                "pc34_760_mz_at_apex": float(apex[pc34_mz_col]),
                 "qc_782_apex": float(apex["qc_782_max_intensity"]),
-                "pc34_760_ppm_error_at_apex": float(apex["pc34_760_ppm_error_at_max_intensity"]),
+                "pc34_760_ppm_error_at_apex": float(apex[pc34_ppm_col]),
                 "qc_782_ppm_error_at_apex": float(apex["qc_782_ppm_error_at_max_intensity"]),
                 "tic_apex": float(apex["tic"]),
-                "ratio_760_782_max_pseudo1": float(apex["ratio_760_782_max_pseudo1"]),
+                # Keep the event row internally consistent with the actual
+                # MS760 evidence lane selected above.  For core events this
+                # is algebraically identical to the precomputed scan column;
+                # edge-lane roster events must not retain a zero core ratio.
+                "ratio_760_782_max_pseudo1": float(
+                    (float(apex[pc34_apex_col]) + 1.0)
+                    / (float(apex["qc_782_max_intensity"]) + 1.0)
+                ),
                 "array_length_apex": int(apex["array_length"]),
                 "base_peak_mz_apex": float(apex["base_peak_mz"]),
                 "low_array_length_lt_6000_window": bool((window["array_length"] < LOW_ARRAY_LENGTH_THRESHOLD).any()),
@@ -813,8 +1013,11 @@ def build_event_table(scan: pd.DataFrame, peaks: np.ndarray, params: dict, strat
                 "peak_width_sec",
                 "left_sec",
                 "right_sec",
+                "left_base_sec",
+                "right_base_sec",
                 "window_scan_count",
                 "pc34_760_apex",
+                "pc34_760_mz_at_apex",
                 "qc_782_apex",
                 "pc34_760_ppm_error_at_apex",
                 "qc_782_ppm_error_at_apex",

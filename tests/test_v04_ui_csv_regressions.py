@@ -106,7 +106,8 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertNotIn('<div class="preset-box">', HTML)
 
     def test_event_coordinate_picker_explains_required_columns_and_ignored_extras(self):
-        self.assertIn("必须包含 scan_start_time、UMAP1、UMAP2", HTML)
+        self.assertIn("必须包含 scan_start_time", HTML)
+        self.assertIn("UMAP1/UMAP2 可选但必须成对提供", HTML)
         self.assertRegex(HTML, r"CellNumber.*batch.*其他列.*保留.*忽略")
 
     def test_export_copy_explains_full_roster_and_unknown_rows(self):

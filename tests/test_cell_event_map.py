@@ -9,6 +9,7 @@ from annotation_app.cell_event_map import (
     CELL_EVENT_MAP_CANONICAL_COLUMNS,
     CellEventMapError,
     canonical_csv_bytes,
+    cell_event_map_manifest_entry,
     import_cell_event_map,
     match_source_to_events,
     project_annotation_state,
@@ -17,6 +18,7 @@ from annotation_app.cell_event_map import (
     state_revision,
     write_canonical_map,
 )
+from annotation_app.app import load_project_cell_event_map
 
 
 def ms_events(rows):
@@ -74,6 +76,51 @@ class CellEventMapImportTest(unittest.TestCase):
                 "UMAP2": -5.778983,
             }
         ])
+
+    def test_source_loader_accepts_event_times_without_umap_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_source(
+                Path(tmp),
+                [[24.1, "cell-1"], [24.2, "cell-2"]],
+                ["scan_start_time", "CellNumber"],
+            )
+
+            frame = read_source_coordinates(path)
+
+        self.assertEqual(frame.columns.tolist(), ["scan_start_time", "UMAP1", "UMAP2"])
+        self.assertEqual(frame["scan_start_time"].tolist(), [24.1, 24.2])
+        self.assertTrue(frame[["UMAP1", "UMAP2"]].isna().all().all())
+        self.assertFalse(frame.attrs["coordinates_available"])
+        self.assertEqual(frame.attrs["source_coordinate_columns"], {})
+
+    def test_source_loader_accepts_explicit_umap_alias_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_source(
+                Path(tmp),
+                [[24.1, -3.0, 4.0, "cluster-1"]],
+                ["scan_start_time", "UMAP", "UMAP2", "leiden"],
+            )
+
+            frame = read_source_coordinates(path)
+
+        self.assertEqual(frame.columns.tolist(), ["scan_start_time", "UMAP1", "UMAP2"])
+        self.assertEqual(frame[["UMAP1", "UMAP2"]].iloc[0].tolist(), [-3.0, 4.0])
+        self.assertTrue(frame.attrs["coordinates_available"])
+        self.assertEqual(
+            frame.attrs["source_coordinate_columns"],
+            {"UMAP1": "UMAP", "UMAP2": "UMAP2"},
+        )
+
+    def test_source_loader_rejects_partial_coordinate_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_source(
+                Path(tmp),
+                [[24.1, -3.0]],
+                ["scan_start_time", "UMAP1"],
+            )
+
+            with self.assertRaisesRegex(CellEventMapError, "UMAP1.*UMAP2.*成对"):
+                read_source_coordinates(path)
 
     def test_header_requires_each_allowed_column_exactly_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,14 +248,83 @@ class CellEventMapImportTest(unittest.TestCase):
         )
         events = ms_events(
             [
-                ("ms_left", "scan-left", 1.01, "pc34_primary", "pc34_760_max_intensity"),
-                ("ms_right", "scan-right", 1.02, "pc34_primary", "pc34_760_max_intensity"),
+                ("ms_left", "scan-left", 1.003, "pc34_primary", "pc34_760_max_intensity"),
+                ("ms_right", "scan-right", 1.004, "pc34_primary", "pc34_760_max_intensity"),
             ]
         )
         events["left_sec"] = [59.7, 59.9]
         events["right_sec"] = [60.1, 60.3]
 
         with self.assertRaisesRegex(CellEventMapError, "多个.*MS event"):
+            match_source_to_events(source, events)
+
+    def test_peak_basin_fallback_rejects_a_distant_time_inside_a_broad_basin(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                (
+                    "ms_distant_basin",
+                    "scan-distant",
+                    1.0 + 1.0 / 60.0,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                )
+            ]
+        )
+        events["left_sec"] = [60.8]
+        events["right_sec"] = [61.2]
+        events["left_base_sec"] = [0.0]
+        events["right_base_sec"] = [120.0]
+
+        with self.assertRaises(CellEventMapError):
+            match_source_to_events(source, events)
+
+    def test_peak_basin_fallback_accepts_the_observed_two_scan_offset(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                (
+                    "ms_near_basin",
+                    "scan-near",
+                    1.0 + 0.207 / 60.0,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                )
+            ]
+        )
+        events["left_sec"] = [60.19]
+        events["right_sec"] = [60.30]
+        events["left_base_sec"] = [59.9]
+        events["right_base_sec"] = [60.5]
+
+        canonical = match_source_to_events(source, events)
+
+        self.assertEqual(canonical["ms_event_id"].tolist(), ["ms_near_basin"])
+        self.assertEqual(
+            canonical.attrs["match_diagnostics"]["peak_basin_match_count"],
+            1,
+        )
+
+    def test_overlapping_near_peak_basins_remain_ambiguous(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                ("ms_left_basin", "scan-left", 1.003, "pc34_primary", "pc34_760_max_intensity"),
+                ("ms_right_basin", "scan-right", 1.004, "pc34_primary", "pc34_760_max_intensity"),
+            ]
+        )
+        events["left_sec"] = [60.17, 60.23]
+        events["right_sec"] = [60.22, 60.29]
+        events["left_base_sec"] = [59.9, 59.9]
+        events["right_base_sec"] = [60.4, 60.4]
+
+        with self.assertRaises(CellEventMapError):
             match_source_to_events(source, events)
 
     def test_legacy_event_table_without_peak_support_keeps_strict_tolerance(self):
@@ -229,6 +345,39 @@ class CellEventMapImportTest(unittest.TestCase):
 
         with self.assertRaisesRegex(CellEventMapError, "CSV"):
             match_source_to_events(source, events)
+
+    def test_legacy_schema_one_can_replay_its_uncapped_halfheight_binding(self):
+        source = pd.DataFrame(
+            {"scan_start_time": [1.0], "UMAP1": [0.0], "UMAP2": [0.0]}
+        )
+        events = ms_events(
+            [
+                (
+                    "ms_legacy_wide",
+                    "scan-legacy",
+                    1.0 + 0.5 / 60.0,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                )
+            ]
+        )
+        events["left_sec"] = [59.8]
+        events["right_sec"] = [60.7]
+
+        with self.assertRaises(CellEventMapError):
+            match_source_to_events(source, events)
+        replayed = match_source_to_events(
+            source,
+            events,
+            include_peak_basin=False,
+            max_peak_shape_apex_offset_sec=None,
+        )
+
+        self.assertEqual(replayed["ms_event_id"].tolist(), ["ms_legacy_wide"])
+        self.assertEqual(
+            replayed.attrs["match_diagnostics"]["peak_support_match_count"],
+            1,
+        )
 
     def test_unmatched_ambiguous_and_reused_events_fail_the_whole_import(self):
         base = ms_events(
@@ -292,6 +441,81 @@ class CellEventMapImportTest(unittest.TestCase):
         self.assertEqual(loaded["ms_event_id"].tolist(), ["ms_1"])
         self.assertEqual(binding["size_bytes"], len(canonical_csv_bytes(frame)))
 
+    def test_schema_two_canonical_map_round_trips_without_coordinates(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "ms_event_id": "ms_1",
+                    "scan_id": "scan-1",
+                    "scan_start_time": 1.0,
+                    "UMAP1": float("nan"),
+                    "UMAP2": float("nan"),
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data" / "map.csv"
+            binding = write_canonical_map(frame, path)
+            with self.assertRaisesRegex(CellEventMapError, "UMAP1"):
+                read_canonical_map(path, expected_sha256=binding["sha256"])
+            loaded = read_canonical_map(
+                path,
+                expected_sha256=binding["sha256"],
+                allow_missing_coordinates=True,
+            )
+
+        self.assertTrue(loaded[["UMAP1", "UMAP2"]].isna().all().all())
+
+    def test_full_import_records_coordinate_capability_and_column_mapping(self):
+        events = ms_events(
+            [("ms_1", "scan-1", 1.0, "pc34_primary", "pc34_760_max_intensity")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            time_only = self.write_source(
+                root,
+                [[1.0, "cell-1"]],
+                ["scan_start_time", "CellNumber"],
+            )
+            canonical, metadata = import_cell_event_map(time_only, events)
+
+        self.assertFalse(metadata["coordinates_available"])
+        self.assertEqual(metadata["required_source_columns"], ["scan_start_time"])
+        self.assertEqual(metadata["source_coordinate_columns"], {})
+        self.assertTrue(canonical[["UMAP1", "UMAP2"]].isna().all().all())
+
+    def test_schema_two_time_only_manifest_rebinds_without_mutation(self):
+        events = ms_events(
+            [("ms_1", "scan-1", 1.0, "pc34_primary", "pc34_760_max_intensity")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self.write_source(
+                root,
+                [[1.0, "cell-1"]],
+                ["scan_start_time", "CellNumber"],
+            )
+            canonical, metadata = import_cell_event_map(source, events)
+            destination = root / "data" / "cell_event_map.csv"
+            write_canonical_map(canonical, destination)
+            entry = cell_event_map_manifest_entry(
+                canonical_path=destination,
+                project_dir=root,
+                import_metadata=metadata,
+            )
+            before = destination.read_bytes()
+
+            loaded, loaded_entry = load_project_cell_event_map(
+                root,
+                {"cell_event_map": entry},
+                events,
+            )
+
+            self.assertEqual(destination.read_bytes(), before)
+        self.assertEqual(entry["schema_version"], 2)
+        self.assertFalse(loaded_entry["coordinates_available"])
+        self.assertTrue(loaded[["UMAP1", "UMAP2"]].isna().all().all())
+
     def test_full_import_records_source_identity_without_extra_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_source(
@@ -320,7 +544,7 @@ class CellEventMapImportTest(unittest.TestCase):
         self.assertAlmostEqual(metadata["max_apex_offset_sec"], 0.0)
         self.assertEqual(
             metadata["match_policy"],
-            "apex_tolerance_then_unique_peak_support_v1",
+            "apex_tolerance_then_unique_near_peak_shape_v3",
         )
         self.assertEqual(len(metadata["source_sha256"]), 64)
         self.assertNotIn("must-not-copy", canonical_csv_bytes(canonical).decode("utf-8"))

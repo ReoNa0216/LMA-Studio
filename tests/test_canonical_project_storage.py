@@ -36,7 +36,17 @@ from scripts.v3.project_storage import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = REPOSITORY_ROOT.parent
-REAL_V04_PROJECT = WORKSPACE_ROOT / "Lin-_LSK"
+REAL_V04_PROJECT = next(
+    (
+        candidate
+        for candidate in (
+            WORKSPACE_ROOT / "Lin-_LSK_LMA",
+            WORKSPACE_ROOT / "Lin-_LSK",
+        )
+        if (candidate / "lifms_project.json").is_file()
+    ),
+    WORKSPACE_ROOT / "Lin-_LSK_LMA",
+)
 
 CANONICAL_TABLE_PATHS = {
     "lif_traces": Path("data/lif_traces.parquet"),
@@ -287,7 +297,7 @@ class CanonicalProjectStorageTest(unittest.TestCase):
             self.assertEqual(len(created.cell_event_map), 1)
             self.assertEqual(
                 created.cell_event_map_info["match_policy"],
-                "apex_tolerance_then_unique_peak_support_v1",
+                "apex_tolerance_then_unique_near_peak_shape_v3",
             )
             self.assertEqual(
                 created.cell_event_map_info["peak_support_match_count"],

@@ -560,6 +560,15 @@ UMAP_HTML = r"""<!doctype html>
         }
         projectKey = nextKey;
         payload = data;
+        if (data.coordinates_available === false) {
+          points = [];
+          revision = String(data.revision || '');
+          identity.textContent = 'UMAP 尚未配置';
+          legend.innerHTML = '';
+          setEmpty('事件列表可用于 Track 标注，但尚未配置二维 UMAP 坐标。可在主窗口的配置中附加坐标 CSV。');
+          draw();
+          return;
+        }
         points = Array.isArray(data.points) ? data.points : [];
         revision = String(data.revision || '');
         identity.textContent = `${points.length.toLocaleString()} 个事件点`;
