@@ -40,6 +40,8 @@ MyProject/
 
 UMAP 坐标可以在项目“配置”中切换，例如比较批次校正前后的坐标。新建时事件 CSV 只强制要求 `scan_start_time`；`UMAP1`/`UMAP2` 可选且必须成对提供。软件只接受能映射到同一批 MS event 的 CSV，并把规范化事件表写入项目自己的 `cell_event_map.csv`；不会把创建电脑上的外部 CSV 绝对路径作为运行依赖。切换不改变标注、峰表或时间模型，校验失败时保留原坐标。
 
+如果新建时有任一事件名单行无法唯一匹配，整个 staging 目录会回滚，不会形成上述项目结构。此时可从新建窗口下载逐行诊断 CSV；该报告是用户下载文件，不会被误放进失败项目，也不包含源 CSV 的身份或作者标签列。
+
 ## 哪些文件必须一起保留
 
 软件运行边界由 `lifms_project.json` 声明，至少包括四张 parquet、`data/cell_event_map.csv` 和 `annotations/annotation.sqlite`。这些文件的路径和内容摘要绑定在一起，不能单独移动、替换或重新命名。

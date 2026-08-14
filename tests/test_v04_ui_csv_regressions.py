@@ -28,6 +28,18 @@ def javascript_function_body(name: str, next_name: str) -> str:
 
 
 class V04UiRegressionTest(unittest.TestCase):
+    def test_failed_event_map_import_exposes_a_downloadable_row_report(self):
+        self.assertIn('id="importEventMapDiagnostic"', HTML)
+        self.assertIn('id="downloadImportEventMapDiagnostic"', HTML)
+        self.assertIn("eventMapDiagnostic: null", HTML)
+        self.assertIn("function renderImportEventMapDiagnostic", HTML)
+        self.assertIn("event_map_diagnostic", HTML)
+        self.assertRegex(
+            HTML,
+            r"downloadImportEventMapDiagnostic[\s\S]*downloadTextFile\([\s\S]*\\ufeff",
+        )
+        self.assertRegex(HTML, r"项目未创建|不会创建半成品项目")
+
     def test_umap_button_reports_progress_without_replacing_the_main_window(self):
         body = javascript_function_body("openUmapWindow", "selectedRawInputMode")
         bridge = javascript_function_body("waitForNativeUmapBridge", "openUmapWindow")

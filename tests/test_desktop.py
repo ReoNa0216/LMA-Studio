@@ -6,11 +6,18 @@ import sys
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 import uuid
 
 import annotation_app.desktop as desktop_module
-from annotation_app.app import BootstrapAppData, ProjectPaths, RequestActivity
+from annotation_app.app import (
+    WRITE_TOKEN,
+    BadRequest,
+    BootstrapAppData,
+    ProjectPaths,
+    RequestActivity,
+)
 from annotation_app.desktop import (
     DesktopApi,
     DesktopServer,
@@ -141,6 +148,61 @@ class DesktopServerTest(unittest.TestCase):
             self.assertNotEqual(probe.connect_ex((host, port)), 0)
         finally:
             probe.close()
+
+    def test_import_failure_response_preserves_safe_event_map_diagnostics(self):
+        diagnostic = {
+            "filename": "event-map-import-diagnostics.csv",
+            "summary": {
+                "total_rows": 2,
+                "matched_rows": 1,
+                "unmatched_rows": 1,
+                "ambiguous_rows": 0,
+                "conflict_rows": 0,
+            },
+            "rows": [],
+            "csv_text": "CSVLine,Status,ReasonCode\n2,unmatched,no_eligible_event\n",
+        }
+        failure = BadRequest(
+            "单细胞 event map 导入失败: 未匹配 CSV 行 2",
+            code="cell_event_map_import_failed",
+            details={"event_map_diagnostic": diagnostic},
+        )
+        payload = {
+            "project_dir": "unused-project",
+            "ms_path": "unused-ms.txt",
+            "cell_event_map_path": "unused-map.csv",
+            "lif_inputs": [
+                {
+                    "path": "unused-lif.csv",
+                    "channel": "G1",
+                    "identity_prior": "cell",
+                    "time_axis": "green_axis",
+                    "detector": "green",
+                    "use_for_cell_annotation": True,
+                }
+            ],
+            "calibration_protocol": {},
+        }
+        request = Request(
+            f"{self.server.url}api/import-project",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Annotation-Write-Token": WRITE_TOKEN,
+            },
+        )
+
+        with mock.patch(
+            "annotation_app.app.AppData.create_project_from_raw_inputs",
+            side_effect=failure,
+        ), self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=5)
+
+        self.assertEqual(raised.exception.code, 400)
+        response = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(response["code"], "cell_event_map_import_failed")
+        self.assertEqual(response["details"]["event_map_diagnostic"], diagnostic)
 
 
 class FakeEvent:
