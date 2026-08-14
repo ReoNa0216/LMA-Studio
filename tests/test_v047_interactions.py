@@ -18,6 +18,11 @@ class V047InteractionContractTest(unittest.TestCase):
         self.assertIn('aria-keyshortcuts="S"', HTML)
         self.assertIn('aria-keyshortcuts="Control+Enter Meta+Enter"', HTML)
         self.assertIn("Keys: S Select", HTML)
+        self.assertIn('class="shortcut-line"', HTML)
+        self.assertIn(
+            "Keys: S Select</span><span class=\"shortcut-line\">Ctrl/⌘+Enter Save pair",
+            HTML,
+        )
         body = function_body(
             HTML,
             "handleManualKeyboardShortcut",
@@ -59,9 +64,12 @@ class V047InteractionContractTest(unittest.TestCase):
             "findTimePoints",
         )
         self.assertIn("matchedTimeEventIds = new Set", umap_body)
-        self.assertIn("centerPointWithoutZoom", umap_body)
         self.assertIn("draw();", umap_body)
         self.assertNotIn("fitPointSet", umap_body)
+        self.assertNotIn("centerPointWithoutZoom", umap_body)
+        self.assertNotIn("view.scale", umap_body)
+        self.assertNotIn("view.tx", umap_body)
+        self.assertNotIn("view.ty", umap_body)
         self.assertIn("message.type === 'highlight-event'", UMAP_HTML)
         self.assertIn("type: 'umap-ready'", UMAP_HTML)
 

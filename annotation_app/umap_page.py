@@ -299,13 +299,6 @@ UMAP_HTML = r"""<!doctype html>
       };
     }
 
-    function centerPointWithoutZoom(point) {
-      const screen = screenPoint(point);
-      const area = plotArea();
-      view.tx += (area.left + area.right) / 2 - screen.x;
-      view.ty += (area.top + area.bottom) / 2 - screen.y;
-    }
-
     function niceTickStep(span, targetCount = 6) {
       const rough = Math.max(Math.abs(span), 1e-12) / Math.max(targetCount, 1);
       const magnitude = 10 ** Math.floor(Math.log10(rough));
@@ -618,7 +611,6 @@ UMAP_HTML = r"""<!doctype html>
       const eventTime = pointMs760Time(point);
       if (Number.isFinite(eventTime)) timeQuery.value = String(Number(eventTime.toFixed(6)));
       timeStatus.textContent = 'Track · 1 point';
-      centerPointWithoutZoom(point);
       draw();
     }
 

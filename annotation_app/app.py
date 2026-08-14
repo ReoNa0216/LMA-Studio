@@ -12306,6 +12306,10 @@ HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 12px;
     }
+    .shortcut-line {
+      display: block;
+      white-space: nowrap;
+    }
     .status-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
@@ -13440,7 +13444,7 @@ HTML = r"""<!doctype html>
             <button id="createManual" class="small-button" aria-keyshortcuts="Control+Enter Meta+Enter" title="Shortcut: Ctrl/⌘+Enter in Cell pair">Save pair</button>
             <button id="createManualPending" class="small-button secondary" style="display:none;">Save pending</button>
           </div>
-        <div id="manualShortcutHint" class="empty" style="margin-top:6px;">Keys: S Select</div>
+        <div id="manualShortcutHint" class="empty" style="margin-top:6px;"><span class="shortcut-line">Keys: S Select</span></div>
         <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的 LIF 参考峰和对应的 MS760 峰。</div>
         </div>
       </div>
@@ -15598,9 +15602,9 @@ HTML = r"""<!doctype html>
       el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动参考峰关系';
       el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
       el('createManualPending').style.display = cellMode ? 'block' : 'none';
-      el('manualShortcutHint').textContent = cellMode
-        ? 'Keys: S Select · Ctrl/⌘+Enter Save pair'
-        : 'Key: S Select';
+      el('manualShortcutHint').innerHTML = cellMode
+        ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">Ctrl/⌘+Enter Save pair</span>'
+        : '<span class="shortcut-line">Key: S Select</span>';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
