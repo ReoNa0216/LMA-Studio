@@ -318,7 +318,7 @@ class DetectorV2OnlyPreprocessingContractTest(unittest.TestCase):
 
 class DetectorV2OnlyUiContractTest(unittest.TestCase):
     def test_candidate_version_and_new_project_ui_expose_one_standard(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.5")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.6")
         visible_markup = HTML.split("</style>", 1)[1].split("<script>", 1)[0]
         self.assertNotIn('id="importLifPeakDetectorVersion"', HTML)
         self.assertNotRegex(HTML, r"detector_version\s*:\s*1")

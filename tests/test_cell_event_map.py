@@ -1,4 +1,5 @@
 import csv
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -420,6 +421,96 @@ class CellEventMapImportTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(CellEventMapError, "复用同一 MS event"):
             match_source_to_events(reused, base)
+
+    def test_failed_binding_provides_a_complete_row_diagnostic_csv(self):
+        source = pd.DataFrame(
+            {
+                "scan_start_time": [1.0, 2.0, 4.0],
+                "UMAP1": [10.0, 20.0, 30.0],
+                "UMAP2": [-10.0, -20.0, -30.0],
+            }
+        )
+        events = ms_events(
+            [
+                ("ms_exact", "scan-exact", 1.0, "pc34_primary", "pc34_760_max_intensity"),
+                ("ms_ambiguous_a", "scan-a", 2.0, "pc34_primary", "pc34_760_max_intensity"),
+                (
+                    "ms_ambiguous_b",
+                    "scan-b",
+                    2.0 + 0.01 / 60.0,
+                    "pc34_primary",
+                    "pc34_760_max_intensity",
+                ),
+            ]
+        )
+
+        with self.assertRaises(CellEventMapError) as raised:
+            match_source_to_events(source, events)
+
+        payload = raised.exception.diagnostic_payload()
+        self.assertEqual(payload["filename"], "event-map-import-diagnostics.csv")
+        self.assertEqual(
+            payload["summary"],
+            {
+                "total_rows": 3,
+                "matched_rows": 1,
+                "unmatched_rows": 1,
+                "ambiguous_rows": 1,
+                "conflict_rows": 0,
+            },
+        )
+        report = pd.read_csv(io.StringIO(payload["csv_text"]))
+        self.assertEqual(
+            report.columns.tolist(),
+            [
+                "CSVLine",
+                "scan_start_time",
+                "Status",
+                "ReasonCode",
+                "Reason",
+                "MatchMethod",
+                "MatchedEventID",
+                "MatchedEventTimeMin",
+                "ApexOffsetSec",
+                "CandidateEventIDs",
+                "NearestEventID",
+                "NearestEventTimeMin",
+                "NearestOffsetSec",
+            ],
+        )
+        self.assertEqual(report["CSVLine"].tolist(), [2, 3, 4])
+        self.assertEqual(
+            report["ReasonCode"].tolist(),
+            ["matched_apex", "ambiguous_multiple_events", "outside_recognized_event_range"],
+        )
+        self.assertNotIn("UMAP1", payload["csv_text"])
+        self.assertNotIn("UMAP2", payload["csv_text"])
+        self.assertNotIn("CellNumber", payload["csv_text"])
+        self.assertNotIn("Type", payload["csv_text"])
+
+    def test_reused_event_marks_every_conflicting_row_in_the_diagnostic(self):
+        source = pd.DataFrame(
+            {
+                "scan_start_time": [1.0 - 0.004 / 60.0, 1.0 + 0.004 / 60.0],
+                "UMAP1": [0.0, 1.0],
+                "UMAP2": [0.0, 1.0],
+            }
+        )
+        events = ms_events(
+            [("ms_1", "scan-1", 1.0, "pc34_primary", "pc34_760_max_intensity")]
+        )
+
+        with self.assertRaises(CellEventMapError) as raised:
+            match_source_to_events(source, events)
+
+        payload = raised.exception.diagnostic_payload()
+        report = pd.read_csv(io.StringIO(payload["csv_text"]))
+        self.assertEqual(report["Status"].tolist(), ["conflict", "conflict"])
+        self.assertEqual(
+            report["ReasonCode"].tolist(),
+            ["reused_event", "reused_event"],
+        )
+        self.assertEqual(payload["summary"]["conflict_rows"], 2)
 
     def test_canonical_write_is_stable_and_strict(self):
         frame = pd.DataFrame(

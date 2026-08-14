@@ -112,7 +112,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.5"
+APP_VERSION = "lma_studio_v0.4.6"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -4147,7 +4147,16 @@ class AnnotationStore:
 
 
 class BadRequest(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "bad_request",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code or "bad_request")
+        self.details = copy.deepcopy(details or {})
 
 
 _PUBLIC_ERROR_FALLBACK = (
@@ -4251,6 +4260,18 @@ def user_facing_error_message(error: Any) -> str:
     if forbidden.search(translated) or re.search(r"\b[A-Za-z]+_[A-Za-z0-9_]+\b", translated):
         return _PUBLIC_ERROR_FALLBACK
     return translated
+
+
+def bad_request_response_payload(error: BadRequest) -> dict[str, Any]:
+    """Serialize only explicitly safe details at the local HTTP boundary."""
+
+    payload: dict[str, Any] = {
+        "error": user_facing_error_message(error),
+        "code": error.code,
+    }
+    if error.details:
+        payload["details"] = copy.deepcopy(error.details)
+    return payload
 
 
 def display_phase_from_time_min(
@@ -7344,11 +7365,14 @@ def reconcile_event_roster_supported_ms_events(
                     str(value) for value in relation["candidate_event_ids"]
                 ]
                 if len(candidate_ids) > 1:
-                    raise CellEventMapError(
-                        "事件表行 "
-                        f"{source_line} 在同一 MS 证据层存在多个峰，无法安全选择: "
-                        + ", ".join(candidate_ids)
-                    )
+                    # Preserve every candidate in staging so the authoritative
+                    # one-to-one importer can return a complete row report.
+                    # No candidate is published because ambiguity still aborts
+                    # the atomic project creation below.
+                    selected_lane_ids.update(candidate_ids)
+                    for candidate_id in candidate_ids:
+                        support_source_line_by_event_id[candidate_id] = source_line
+                    continue
                 if len(candidate_ids) == 1:
                     selected_id = candidate_ids[0]
                     selected_lane_ids.add(selected_id)
@@ -7377,11 +7401,24 @@ def reconcile_event_roster_supported_ms_events(
 
     # The final importer remains authoritative: it rejects missing,
     # ambiguous, and reused relations after both evidence tiers are present.
-    canonical, metadata = import_cell_event_map(
-        source_path,
-        events,
-        tolerance_sec=float(tolerance_sec),
-    )
+    try:
+        canonical, metadata = import_cell_event_map(
+            source_path,
+            events,
+            tolerance_sec=float(tolerance_sec),
+        )
+    except CellEventMapError as exc:
+        for diagnostic in exc.diagnostic_rows:
+            source_line = int(diagnostic.get("CSVLine") or 0)
+            if (
+                source_line in unmatched_lines
+                and diagnostic.get("Status") == "unmatched"
+            ):
+                diagnostic["ReasonCode"] = "no_eligible_event_after_roster_support"
+                diagnostic["Reason"] = (
+                    "常规事件识别与事件名单补充检查均未找到满足条件的唯一 MS760 峰。"
+                )
+        raise
     selected_ids = set(canonical["ms_event_id"].astype(str))
     if not selected_support.empty:
         selected_support = selected_support[
@@ -9048,7 +9085,16 @@ class AppData:
                 import_metadata=map_import_metadata,
             )
         except CellEventMapError as exc:
-            raise BadRequest(f"单细胞 event map 导入失败: {exc}") from exc
+            diagnostic = exc.diagnostic_payload()
+            raise BadRequest(
+                f"单细胞 event map 导入失败: {exc}",
+                code="cell_event_map_import_failed",
+                details=(
+                    {"event_map_diagnostic": diagnostic}
+                    if diagnostic is not None
+                    else {}
+                ),
+            ) from exc
         intermediate_tables = {
             "lif_traces": {"path": project_relative_or_absolute(existing_outputs[0], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[0], full_hash_limit_bytes=None)},
             "lif_peaks": {"path": project_relative_or_absolute(existing_outputs[1], project_dir).replace("\\", "/"), **raw_file_fingerprint(existing_outputs[1], full_hash_limit_bytes=None)},
@@ -13060,6 +13106,22 @@ HTML = r"""<!doctype html>
       font-size: 11px;
       line-height: 1.35;
     }
+    .import-diagnostic {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+      padding: 9px 10px;
+      border: 1px solid #f0b7b2;
+      border-radius: 7px;
+      background: #fff6f5;
+      color: #7a271a;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .import-diagnostic[hidden] { display: none; }
+    .import-diagnostic .small-button { flex: 0 0 auto; }
     .mode-options {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -13540,6 +13602,10 @@ HTML = r"""<!doctype html>
         </div>
       </section>
       <div id="importHint" class="empty" style="margin-top:10px;"></div>
+      <div id="importEventMapDiagnostic" class="import-diagnostic" hidden>
+        <span id="importEventMapDiagnosticSummary"></span>
+        <button id="downloadImportEventMapDiagnostic" type="button" class="small-button secondary">下载逐行诊断 CSV</button>
+      </div>
       <div class="modal-actions">
         <button id="runImportProject" class="small-button">生成草稿并进入项目</button>
       </div>
@@ -13665,6 +13731,7 @@ HTML = r"""<!doctype html>
       requestSeq: 0,
       actionBusy: false,
       importCreating: false,
+      eventMapDiagnostic: null,
       configSaveBusy: false,
       importRows: [],
       nextImportRowId: 1,
@@ -14020,7 +14087,7 @@ HTML = r"""<!doctype html>
         },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) throw new Error(await responseErrorMessage(res));
+      if (!res.ok) throw await responseError(res);
       return res.json();
     }
 
@@ -14089,6 +14156,25 @@ HTML = r"""<!doctype html>
         return '操作未完成。请检查当前页面中的项目设置和所选记录；如果刚修改过设置，请重新生成预览后再试。';
       }
       return translated;
+    }
+
+    async function responseError(res) {
+      const text = await res.text();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        // Fall back to raw response text below.
+      }
+      const message = user_facing_error_message(
+        parsed?.error || text || `${res.status} ${res.statusText}`
+      );
+      const error = new Error(message);
+      error.code = String(parsed?.code || 'request_failed');
+      error.details = (parsed?.details && typeof parsed.details === 'object')
+        ? parsed.details
+        : {};
+      return error;
     }
 
     async function responseErrorMessage(res) {
@@ -14184,6 +14270,26 @@ HTML = r"""<!doctype html>
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+    }
+
+    function renderImportEventMapDiagnostic() {
+      const panel = el('importEventMapDiagnostic');
+      const diagnostic = state.eventMapDiagnostic;
+      if (!diagnostic || !diagnostic.summary || !diagnostic.csv_text) {
+        panel.hidden = true;
+        el('importEventMapDiagnosticSummary').textContent = '';
+        return;
+      }
+      const summary = diagnostic.summary;
+      el('importEventMapDiagnosticSummary').textContent = [
+        `逐行检查：共 ${Number(summary.total_rows || 0).toLocaleString()} 行`,
+        `已匹配 ${Number(summary.matched_rows || 0).toLocaleString()}`,
+        `未匹配 ${Number(summary.unmatched_rows || 0).toLocaleString()}`,
+        `歧义 ${Number(summary.ambiguous_rows || 0).toLocaleString()}`,
+        `冲突 ${Number(summary.conflict_rows || 0).toLocaleString()}`,
+        '项目未创建。'
+      ].join('；');
+      panel.hidden = false;
     }
 
     function automaticTimeAxisForDetector(detector) {
@@ -14571,6 +14677,8 @@ HTML = r"""<!doctype html>
     function setImportModal(open) {
       if (!open && state.importCreating) return;
       if (open) {
+        state.eventMapDiagnostic = null;
+        renderImportEventMapDiagnostic();
         state.importSuggestionRevision += 1;
         [
           'importProjectDir',
@@ -16041,6 +16149,8 @@ HTML = r"""<!doctype html>
       if (state.actionBusy) return;
       state.actionBusy = true;
       state.importCreating = true;
+      state.eventMapDiagnostic = null;
+      renderImportEventMapDiagnostic();
       const button = el('runImportProject');
       const closeButton = el('closeImportProject');
       const startedAt = Date.now();
@@ -16135,7 +16245,14 @@ HTML = r"""<!doctype html>
         state.importCreating = false;
         setImportModal(false);
       } catch (err) {
-        el('importHint').textContent = `导入失败: ${err.message}`;
+        const diagnostic = err.details?.event_map_diagnostic;
+        state.eventMapDiagnostic = (diagnostic && typeof diagnostic === 'object')
+          ? diagnostic
+          : null;
+        renderImportEventMapDiagnostic();
+        el('importHint').textContent = state.eventMapDiagnostic
+          ? `导入失败: ${err.message}。已完成逐行检查；项目未创建，可下载诊断 CSV。`
+          : `导入失败: ${err.message}`;
         alert(`导入失败: ${err.message}`);
       } finally {
         if (progressTimer !== null) window.clearInterval(progressTimer);
@@ -17603,6 +17720,15 @@ HTML = r"""<!doctype html>
       });
     });
     el('runImportProject').addEventListener('click', importProject);
+    el('downloadImportEventMapDiagnostic').addEventListener('click', () => {
+      const diagnostic = state.eventMapDiagnostic;
+      if (!diagnostic?.csv_text) return;
+      downloadTextFile(
+        diagnostic.filename || 'event-map-import-diagnostics.csv',
+        '\ufeff' + diagnostic.csv_text,
+        'text/csv;charset=utf-8'
+      );
+    });
     el('runOpenProject').addEventListener('click', openExistingProject);
     el('acceptWindow').addEventListener('click', acceptWindowPendingAutoCandidates);
     el('saveConfig').addEventListener('click', saveProjectConfig);
@@ -17852,7 +17978,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "未找到请求的页面或操作。"}, HTTPStatus.NOT_FOUND)
         except BadRequest as exc:
             self.send_json(
-                {"error": user_facing_error_message(exc)},
+                bad_request_response_payload(exc),
                 HTTPStatus.BAD_REQUEST,
             )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -18165,7 +18291,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "未找到请求的页面或操作。"}, HTTPStatus.NOT_FOUND)
         except BadRequest as exc:
             self.send_json(
-                {"error": user_facing_error_message(exc)},
+                bad_request_response_payload(exc),
                 HTTPStatus.BAD_REQUEST,
             )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

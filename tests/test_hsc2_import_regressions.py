@@ -153,8 +153,15 @@ class Hsc2EventRosterRegressionTest(unittest.TestCase):
         self.assertLess(float(scan.iloc[noise_index]["pc34_760_max_intensity"]), 420.0)
         with tempfile.TemporaryDirectory() as tmp:
             source = self.write_roster(Path(tmp), scan, noise_index)
-            with self.assertRaisesRegex(CellEventMapError, "未匹配 CSV 行 2"):
+            with self.assertRaisesRegex(CellEventMapError, "未匹配 CSV 行 2") as raised:
                 reconcile_event_roster_supported_ms_events(source, events, scan)
+
+        diagnostic = raised.exception.diagnostic_payload()
+        self.assertEqual(
+            diagnostic["rows"][0]["ReasonCode"],
+            "no_eligible_event_after_roster_support",
+        )
+        self.assertIn("补充检查", diagnostic["rows"][0]["Reason"])
 
     def test_roster_support_can_rescue_a_real_peak_just_outside_core_mass_window(self):
         scan = synthetic_zero_inflated_scan()

@@ -50,10 +50,119 @@ EVENT_MAP_EVENT_STRATEGIES = (
     ROSTER_SUPPORTED_EVENT_STRATEGY,
 )
 PRIMARY_SIGNAL_COLUMN = "pc34_760_max_intensity"
+EVENT_MAP_DIAGNOSTIC_FILENAME = "event-map-import-diagnostics.csv"
+EVENT_MAP_DIAGNOSTIC_COLUMNS = (
+    "CSVLine",
+    "scan_start_time",
+    "Status",
+    "ReasonCode",
+    "Reason",
+    "MatchMethod",
+    "MatchedEventID",
+    "MatchedEventTimeMin",
+    "ApexOffsetSec",
+    "CandidateEventIDs",
+    "NearestEventID",
+    "NearestEventTimeMin",
+    "NearestOffsetSec",
+)
 
 
 class CellEventMapError(ValueError):
     """The source map or its project binding is invalid."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic_rows: Iterable[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic_rows = [
+            {column: row.get(column, "") for column in EVENT_MAP_DIAGNOSTIC_COLUMNS}
+            for row in (diagnostic_rows or [])
+        ]
+
+    def diagnostic_payload(self) -> dict[str, Any] | None:
+        """Return the safe, serializable report exposed after a failed import."""
+
+        if not self.diagnostic_rows:
+            return None
+        rows = [dict(row) for row in self.diagnostic_rows]
+        status_counts = {
+            status: sum(1 for row in rows if row["Status"] == status)
+            for status in ("matched", "unmatched", "ambiguous", "conflict")
+        }
+        report = pd.DataFrame(rows, columns=list(EVENT_MAP_DIAGNOSTIC_COLUMNS))
+        csv_text = report.to_csv(
+            index=False,
+            lineterminator="\n",
+            float_format="%.15g",
+            na_rep="",
+        )
+        return {
+            "filename": EVENT_MAP_DIAGNOSTIC_FILENAME,
+            "columns": list(EVENT_MAP_DIAGNOSTIC_COLUMNS),
+            "summary": {
+                "total_rows": len(rows),
+                "matched_rows": status_counts["matched"],
+                "unmatched_rows": status_counts["unmatched"],
+                "ambiguous_rows": status_counts["ambiguous"],
+                "conflict_rows": status_counts["conflict"],
+            },
+            "rows": rows,
+            "csv_text": csv_text,
+        }
+
+
+def _event_map_diagnostic_row(
+    *,
+    source_line: int,
+    source_time: float,
+    status: str,
+    reason_code: str,
+    reason: str,
+    match_method: str = "",
+    matched_event_id: str = "",
+    matched_event_time: float | str = "",
+    apex_offset_sec: float | str = "",
+    candidate_event_ids: Iterable[str] = (),
+    nearest_event_id: str = "",
+    nearest_event_time: float | str = "",
+    nearest_offset_sec: float | str = "",
+) -> dict[str, Any]:
+    return {
+        "CSVLine": int(source_line),
+        "scan_start_time": float(source_time),
+        "Status": str(status),
+        "ReasonCode": str(reason_code),
+        "Reason": str(reason),
+        "MatchMethod": str(match_method),
+        "MatchedEventID": str(matched_event_id),
+        "MatchedEventTimeMin": matched_event_time,
+        "ApexOffsetSec": apex_offset_sec,
+        "CandidateEventIDs": ";".join(str(value) for value in candidate_event_ids),
+        "NearestEventID": str(nearest_event_id),
+        "NearestEventTimeMin": nearest_event_time,
+        "NearestOffsetSec": nearest_offset_sec,
+    }
+
+
+def _nearest_event_diagnostic(
+    events: pd.DataFrame,
+    source_time: float,
+) -> tuple[str, float | str, float | str]:
+    if events.empty:
+        return "", "", ""
+    event_times = events["time_min"].to_numpy(dtype=float)
+    nearest_index = int(np.argmin(np.abs(event_times - float(source_time))))
+    event = events.iloc[nearest_index]
+    event_time = float(event["time_min"])
+    return (
+        str(event["event_id"]),
+        event_time,
+        abs(event_time - float(source_time)) * 60.0,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -379,10 +488,33 @@ def match_source_to_events(
     if not coordinates_available and not coordinates_missing:
         raise CellEventMapError("UMAP1 与 UMAP2 必须为完整有限坐标，或整表同时留空")
     source_coordinates[["UMAP1", "UMAP2"]] = coordinate_values
-    events = primary_ms_events(ms_events)
+    try:
+        events = primary_ms_events(ms_events)
+    except CellEventMapError as exc:
+        required_event_columns = {
+            "event_id",
+            "event_strategy",
+            "primary_signal_col",
+            "scan_id",
+            "time_min",
+        }
+        if required_event_columns.issubset(ms_events.columns):
+            diagnostics = [
+                _event_map_diagnostic_row(
+                    source_line=int(index) + 2,
+                    source_time=float(row["scan_start_time"]),
+                    status="unmatched",
+                    reason_code="no_recognized_ms760_events",
+                    reason="没有识别到可用于事件名单绑定的 MS760 峰。",
+                )
+                for index, row in source_coordinates.reset_index(drop=True).iterrows()
+            ]
+            raise CellEventMapError(str(exc), diagnostic_rows=diagnostics) from exc
+        raise
     matches: list[dict[str, Any]] = []
     unmatched_rows: list[int] = []
     ambiguous_rows: list[tuple[int, list[str]]] = []
+    diagnostics_by_line: dict[int, dict[str, Any]] = {}
     apex_tolerance_match_count = 0
     peak_support_match_count = 0
     peak_basin_match_count = 0
@@ -398,22 +530,103 @@ def match_source_to_events(
             include_peak_basin=bool(include_peak_basin),
             max_peak_shape_apex_offset_sec=max_peak_shape_apex_offset_sec,
         )
+        nearest_event_id, nearest_event_time, nearest_offset_sec = (
+            _nearest_event_diagnostic(events, source_time)
+        )
         if not candidate_indices:
             unmatched_rows.append(source_line)
+            reason_code = "no_eligible_event"
+            reason = "附近没有满足时间与峰形约束的唯一 MS760 峰。"
+            diagnostic_method = match_method
+            diagnostic_candidate_ids: list[str] = []
+            if max_peak_shape_apex_offset_sec is not None:
+                uncapped_indices, uncapped_method = _candidate_indices_for_source_time(
+                    events,
+                    source_time,
+                    tolerance_sec=float(tolerance_sec),
+                    include_peak_basin=bool(include_peak_basin),
+                    max_peak_shape_apex_offset_sec=None,
+                )
+                if uncapped_indices:
+                    reason_code = "peak_shape_too_far"
+                    reason = (
+                        "该时间落在较宽峰形范围内，但与峰顶距离超过安全上限，"
+                        "因此未自动绑定。"
+                    )
+                    diagnostic_method = uncapped_method
+                    diagnostic_candidate_ids = (
+                        events.iloc[uncapped_indices]["event_id"].astype(str).tolist()
+                    )
+            tolerance_min = float(tolerance_sec) / 60.0
+            if (
+                source_time < float(events["time_min"].min()) - tolerance_min
+                or source_time > float(events["time_min"].max()) + tolerance_min
+            ):
+                reason_code = "outside_recognized_event_range"
+                reason = "该时间超出当前已识别 MS760 事件的时间范围。"
+            diagnostics_by_line[source_line] = _event_map_diagnostic_row(
+                source_line=source_line,
+                source_time=source_time,
+                status="unmatched",
+                reason_code=reason_code,
+                reason=reason,
+                match_method=diagnostic_method,
+                candidate_event_ids=diagnostic_candidate_ids,
+                nearest_event_id=nearest_event_id,
+                nearest_event_time=nearest_event_time,
+                nearest_offset_sec=nearest_offset_sec,
+            )
             continue
         if len(candidate_indices) > 1:
+            candidate_ids = (
+                events.iloc[candidate_indices]["event_id"].astype(str).tolist()
+            )
             ambiguous_rows.append(
-                (source_line, events.iloc[candidate_indices]["event_id"].astype(str).tolist())
+                (source_line, candidate_ids)
+            )
+            diagnostics_by_line[source_line] = _event_map_diagnostic_row(
+                source_line=source_line,
+                source_time=source_time,
+                status="ambiguous",
+                reason_code="ambiguous_multiple_events",
+                reason="同一 CSV 行附近存在多个合格 MS760 峰，软件不会猜测。",
+                match_method=match_method,
+                candidate_event_ids=candidate_ids,
+                nearest_event_id=nearest_event_id,
+                nearest_event_time=nearest_event_time,
+                nearest_offset_sec=nearest_offset_sec,
             )
             continue
         event = events.iloc[candidate_indices[0]]
-        apex_offsets_sec.append(abs(float(event["time_min"]) - source_time) * 60.0)
+        apex_offset_sec = abs(float(event["time_min"]) - source_time) * 60.0
+        apex_offsets_sec.append(apex_offset_sec)
         if match_method == "peak_basin":
             peak_basin_match_count += 1
+            matched_reason_code = "matched_peak_basin"
+            matched_reason = "通过唯一且邻近的峰底范围匹配。"
         elif match_method == "peak_support":
             peak_support_match_count += 1
+            matched_reason_code = "matched_peak_support"
+            matched_reason = "通过唯一且邻近的半峰高范围匹配。"
         else:
             apex_tolerance_match_count += 1
+            matched_reason_code = "matched_apex"
+            matched_reason = "峰顶时间在允许误差内唯一匹配。"
+        diagnostics_by_line[source_line] = _event_map_diagnostic_row(
+            source_line=source_line,
+            source_time=source_time,
+            status="matched",
+            reason_code=matched_reason_code,
+            reason=matched_reason,
+            match_method=match_method,
+            matched_event_id=str(event["event_id"]),
+            matched_event_time=float(event["time_min"]),
+            apex_offset_sec=apex_offset_sec,
+            candidate_event_ids=[str(event["event_id"])],
+            nearest_event_id=nearest_event_id,
+            nearest_event_time=nearest_event_time,
+            nearest_offset_sec=nearest_offset_sec,
+        )
         matches.append(
             {
                 "source_line": source_line,
@@ -429,6 +642,33 @@ def match_source_to_events(
             }
         )
 
+    matched = pd.DataFrame(
+        matches,
+        columns=[
+            "source_line",
+            "ms_event_id",
+            "scan_id",
+            "scan_start_time",
+            "UMAP1",
+            "UMAP2",
+        ],
+    )
+    reused = matched[matched["ms_event_id"].duplicated(keep=False)]
+    reused_details: list[str] = []
+    if not reused.empty:
+        for event_id, rows in reused.groupby("ms_event_id", sort=True):
+            source_lines = [int(value) for value in rows["source_line"]]
+            reused_details.append(
+                f"{event_id} <- CSV 行 {','.join(str(value) for value in source_lines)}"
+            )
+            for source_line in source_lines:
+                diagnostic = diagnostics_by_line[source_line]
+                diagnostic["Status"] = "conflict"
+                diagnostic["ReasonCode"] = "reused_event"
+                diagnostic["Reason"] = (
+                    "多个 CSV 行指向同一 MS760 事件；一对一绑定要求禁止复用。"
+                )
+
     failures: list[str] = []
     if unmatched_rows:
         if len(events) < len(source_coordinates):
@@ -442,20 +682,22 @@ def match_source_to_events(
             f"{line} -> {','.join(event_ids)}" for line, event_ids in ambiguous_rows[:10]
         )
         failures.append("存在多个 MS event 可匹配: " + preview)
+    if reused_details:
+        failures.append("两个 CSV 行不能复用同一 MS event: " + "; ".join(reused_details[:10]))
     if failures:
-        raise CellEventMapError("；".join(failures))
-
-    matched = pd.DataFrame(matches)
-    reused = matched[matched["ms_event_id"].duplicated(keep=False)]
-    if not reused.empty:
-        details = []
-        for event_id, rows in reused.groupby("ms_event_id", sort=True):
-            details.append(
-                f"{event_id} <- CSV 行 {','.join(str(int(value)) for value in rows['source_line'])}"
-            )
-        raise CellEventMapError("两个 CSV 行不能复用同一 MS event: " + "; ".join(details[:10]))
+        raise CellEventMapError(
+            "；".join(failures),
+            diagnostic_rows=[
+                diagnostics_by_line[line] for line in sorted(diagnostics_by_line)
+            ],
+        )
     if len(matched) != len(source_coordinates):
-        raise CellEventMapError("事件坐标 CSV 未能整体一对一匹配")
+        raise CellEventMapError(
+            "事件坐标 CSV 未能整体一对一匹配",
+            diagnostic_rows=[
+                diagnostics_by_line[line] for line in sorted(diagnostics_by_line)
+            ],
+        )
     canonical = matched.loc[:, ["ms_event_id", "scan_id", "scan_start_time", "UMAP1", "UMAP2"]]
     canonical = canonical.sort_values(["scan_start_time", "ms_event_id"], kind="stable").reset_index(drop=True)
     canonical.attrs["match_diagnostics"] = {

@@ -13,6 +13,7 @@ from unittest import mock
 import pandas as pd
 
 import annotation_app.app as app_module
+from annotation_app.cell_event_map import CellEventMapError, match_source_to_events
 from annotation_app.app import (
     AppData,
     AnnotationStore,
@@ -270,6 +271,50 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
 
 
 class CanonicalProjectStorageTest(unittest.TestCase):
+    def test_failed_event_map_import_returns_diagnostics_without_publishing_project(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            request = _new_project_request(root, "failed-map-project")
+            request["cell_event_map_path"].write_text(
+                "scan_start_time,UMAP1,UMAP2,Type,CellNumber\n"
+                "99.0,1.0,2.0,AUTHOR_LABEL,Cell99999\n",
+                encoding="utf-8",
+            )
+            diagnostic_source = pd.DataFrame(
+                {"scan_start_time": [99.0], "UMAP1": [1.0], "UMAP2": [2.0]}
+            )
+            diagnostic_events = pd.DataFrame(
+                [
+                    {
+                        "event_id": "ms760_24_001",
+                        "scan_id": "scan_1",
+                        "time_min": 24.001,
+                        "event_strategy": "pc34_primary",
+                        "primary_signal_col": "pc34_760_max_intensity",
+                    }
+                ]
+            )
+            with self.assertRaises(CellEventMapError) as diagnostic_raised:
+                match_source_to_events(diagnostic_source, diagnostic_events)
+
+            with mock.patch(
+                "annotation_app.app.run_preprocessing_script",
+                side_effect=_write_synthetic_preprocessor_outputs,
+            ), mock.patch(
+                "annotation_app.app.reconcile_event_roster_supported_ms_events",
+                side_effect=diagnostic_raised.exception,
+            ), self.assertRaises(BadRequest) as raised:
+                AppData.create_project_from_raw_inputs(**request)
+
+            self.assertEqual(raised.exception.code, "cell_event_map_import_failed")
+            diagnostic = raised.exception.details["event_map_diagnostic"]
+            self.assertEqual(diagnostic["summary"]["unmatched_rows"], 1)
+            self.assertIn("outside_recognized_event_range", diagnostic["csv_text"])
+            self.assertNotIn("AUTHOR_LABEL", diagnostic["csv_text"])
+            self.assertNotIn("Cell99999", diagnostic["csv_text"])
+            self.assertFalse(request["project_dir"].exists())
+            self.assertEqual(list(root.glob(".*.lma-building-*")), [])
+
     def test_staging_recheck_preserves_unique_peak_support_event_map_binding(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)

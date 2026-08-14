@@ -15,7 +15,7 @@ on:
       version:
         description: Artifact version for a manual candidate build
         required: true
-        default: v0.4.5-rc1
+        default: v0.4.6-rc1
         type: string
       publish_prerelease:
         description: Publish successful manual-build artifacts as a public candidate prerelease
