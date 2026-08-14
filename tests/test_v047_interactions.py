@@ -1,4 +1,4 @@
-"""Focused UI contracts for the v0.4.7 interaction changes."""
+"""Focused UI contracts for the v0.4.7 interactions and v0.4.8 shortcut hotfix."""
 
 import unittest
 
@@ -14,13 +14,13 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V047InteractionContractTest(unittest.TestCase):
     def test_manual_shortcuts_are_discoverable_and_guarded(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.7")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.8")
         self.assertIn('aria-keyshortcuts="S"', HTML)
-        self.assertIn('aria-keyshortcuts="Control+Enter Meta+Enter"', HTML)
+        self.assertIn('aria-keyshortcuts="A"', HTML)
         self.assertIn("Keys: S Select", HTML)
         self.assertIn('class="shortcut-line"', HTML)
         self.assertIn(
-            "Keys: S Select</span><span class=\"shortcut-line\">Ctrl/⌘+Enter Save pair",
+            "Keys: S Select</span><span class=\"shortcut-line\">A Save pair",
             HTML,
         )
         body = function_body(
@@ -33,6 +33,8 @@ class V047InteractionContractTest(unittest.TestCase):
         self.assertIn("toggleManualMode()", body)
         self.assertIn("createManualTriplet('accepted')", body)
         self.assertIn("state.manualAnnotationKind !== 'cell'", body)
+        self.assertIn("key === 'a'", body)
+        self.assertNotIn("ev.key === 'Enter'", body)
         self.assertIn(
             "document.addEventListener('keydown', handleManualKeyboardShortcut)",
             HTML,
