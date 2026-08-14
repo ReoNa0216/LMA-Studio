@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 
 repo_root = Path(SPECPATH).parents[1]
-release_version = os.environ.get("LMA_STUDIO_VERSION", "0.4.7").lstrip("v")
+release_version = os.environ.get("LMA_STUDIO_VERSION", "0.4.8").lstrip("v")
 bundle_version = release_version.split("-", 1)[0]
 
 

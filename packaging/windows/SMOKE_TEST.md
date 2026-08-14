@@ -1,4 +1,4 @@
-# Windows v0.4.7 Release Smoke Test
+# Windows v0.4.8 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -39,7 +39,7 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4.7 project
+## 3. Create a v0.4.8 project
 
 Create only in a new empty project directory. Configure:
 
@@ -161,7 +161,7 @@ On a project with a canonical event map:
 - `UMAP` opens one resizable window; repeated clicks restore it rather than creating duplicates.
 - Entering an MS760 time outlines matching points in red without changing the current zoom or pan.
 - Double-clicking a coordinate-mapped MS760 peak in Track outlines the same `ms_event_id` in UMAP without changing its view.
-- `S` toggles `Select peaks`; `Ctrl+Enter` runs `Save pair` only in `Events > Cell pair`. Neither shortcut fires while typing in a form field or using a modal.
+- `S` toggles `Select peaks`; `A` runs `Save pair` only in `Events > Cell pair`. Neither shortcut fires while typing in a form field or using a modal.
 - Unknown points are gray and accepted cells use the selected LIF channel color. Accepted current QC is black, but the QC legend is omitted when its current count is zero; conflicts remain explicit.
 - Accept/revoke in Track updates UMAP without reloading.
 - Clicking a UMAP point opens the same canonical `ms_event_id` in its containing 2.5-minute Track window.

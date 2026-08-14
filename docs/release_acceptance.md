@@ -1,6 +1,6 @@
 # LMA Studio 当前版本验收指南
 
-本指南用于当前正式桌面版本（v0.4.7）。版本历史由 Git tag 和 `README_RELEASE.md` 保存，不再为每个补丁版本复制一份 UAT 文档。
+本指南用于当前正式桌面版本（v0.4.8）。版本历史由 Git tag 和 `README_RELEASE.md` 保存，不再为每个补丁版本复制一份 UAT 文档。
 
 ## 安全边界
 
@@ -66,7 +66,7 @@
 - 查询框应完整显示类似 `e.g. 49.001` 的提示；窄窗口下控件自动换行，不溢出工具栏。
 - 输入 MS760 时间后，命中点显示红色轮廓；缩放和平移保持不变；清除查询后轮廓消失。
 - 在 Track 双击事件坐标表内的 MS760 峰，UMAP 应打开或唤回并用红圈标出同一 `ms_event_id`，但不缩放、不平移。
-- 按 `S` 开关 `Select peaks`；在 `Events > Cell pair` 中按 `Ctrl+Enter`（Windows）或 `Command+Enter`（macOS）执行 `Save pair`。输入框、下拉框和弹窗中不得误触发。
+- 按 `S` 开关 `Select peaks`；在 `Events > Cell pair` 中按 `A` 执行 `Save pair`。输入框、下拉框和弹窗中不得误触发。
 - 查询只定位点，不修改标注。
 - 正式标注段没有当前有效 QC 时，UMAP 不显示 QC 图例。
 

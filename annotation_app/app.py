@@ -112,7 +112,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.7"
+APP_VERSION = "lma_studio_v0.4.8"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -13441,7 +13441,7 @@ HTML = r"""<!doctype html>
             <div>MS760: <strong id="manualMS">-</strong></div>
           </div>
           <div class="manual-save-actions">
-            <button id="createManual" class="small-button" aria-keyshortcuts="Control+Enter Meta+Enter" title="Shortcut: Ctrl/⌘+Enter in Cell pair">Save pair</button>
+            <button id="createManual" class="small-button" aria-keyshortcuts="A" title="Shortcut: A in Cell pair">Save pair</button>
             <button id="createManualPending" class="small-button secondary" style="display:none;">Save pending</button>
           </div>
         <div id="manualShortcutHint" class="empty" style="margin-top:6px;"><span class="shortcut-line">Keys: S Select</span></div>
@@ -14211,9 +14211,8 @@ HTML = r"""<!doctype html>
         showInteractionHint(state.manualMode ? 'Select peaks on' : 'Select peaks off');
         return;
       }
-      const savePairShortcut = ev.key === 'Enter'
-        && (ev.ctrlKey || ev.metaKey)
-        && !ev.altKey;
+      const savePairShortcut = key === 'a'
+        && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
       if (!savePairShortcut) return;
       if (
         state.stage !== 'event_annotation'
@@ -15603,7 +15602,7 @@ HTML = r"""<!doctype html>
       el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
       el('createManualPending').style.display = cellMode ? 'block' : 'none';
       el('manualShortcutHint').innerHTML = cellMode
-        ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">Ctrl/⌘+Enter Save pair</span>'
+        ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">A Save pair</span>'
         : '<span class="shortcut-line">Key: S Select</span>';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
