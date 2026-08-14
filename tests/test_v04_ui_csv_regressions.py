@@ -380,9 +380,9 @@ class V04UiRegressionTest(unittest.TestCase):
             "Manual Cell-pair mode must not be limited to peaks already present in automatic candidates",
         )
 
-        manual_mode_handler = HTML.rsplit("el('manualMode').addEventListener", 1)[1].split(
-            "el('clearManual')", 1
-        )[0]
+        manual_mode_handler = javascript_function_body(
+            "toggleManualMode", "renderManualSelection"
+        )
         self.assertIn("draw();", manual_mode_handler)
 
     def test_unmapped_ms_peaks_remain_explainable_but_not_selectable(self):

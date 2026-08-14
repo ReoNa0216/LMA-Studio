@@ -112,7 +112,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.6"
+APP_VERSION = "lma_studio_v0.4.7"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -13429,7 +13429,7 @@ HTML = r"""<!doctype html>
             <button type="button" class="active" data-manual-kind="qc">QC anchor</button>
             <button type="button" data-manual-kind="cell">Cell pair</button>
           </div>
-          <button id="manualMode" class="small-button secondary">Select peaks</button>
+          <button id="manualMode" class="small-button secondary" aria-keyshortcuts="S" title="Shortcut: S">Select peaks</button>
           <button id="clearManual" class="small-button secondary">Clear</button>
           <div class="manual-selection">
             <div id="manualLifRow" style="display:none;">LIF: <strong id="manualLIF">-</strong></div>
@@ -13437,9 +13437,10 @@ HTML = r"""<!doctype html>
             <div>MS760: <strong id="manualMS">-</strong></div>
           </div>
           <div class="manual-save-actions">
-            <button id="createManual" class="small-button">Save pair</button>
+            <button id="createManual" class="small-button" aria-keyshortcuts="Control+Enter Meta+Enter" title="Shortcut: Ctrl/⌘+Enter in Cell pair">Save pair</button>
             <button id="createManualPending" class="small-button secondary" style="display:none;">Save pending</button>
           </div>
+        <div id="manualShortcutHint" class="empty" style="margin-top:6px;">Keys: S Select</div>
         <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的 LIF 参考峰和对应的 MS760 峰。</div>
         </div>
       </div>
@@ -13742,7 +13743,8 @@ HTML = r"""<!doctype html>
       importSignatureChannels: [],
       importSuggestionRevision: 0,
       configProtocolDraft: null,
-      configPostQcDraft: null
+      configPostQcDraft: null,
+      pendingUmapHighlight: null
     };
     const stateChannel = ('BroadcastChannel' in window)
       ? new BroadcastChannel('lma-studio-state-v1')
@@ -14186,6 +14188,39 @@ HTML = r"""<!doctype html>
         // Fall back to raw response text below.
       }
       return user_facing_error_message(text || `${res.status} ${res.statusText}`);
+    }
+
+    function handleManualKeyboardShortcut(ev) {
+      if (
+        ev.defaultPrevented || ev.repeat || activeModal || state.actionBusy
+        || state.meta?.bootstrap
+      ) return;
+      const target = ev.target;
+      if (
+        target instanceof Element
+        && target.closest('input, textarea, select, [contenteditable="true"]')
+      ) return;
+      const key = String(ev.key || '').toLowerCase();
+      if (key === 's' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        ev.preventDefault();
+        toggleManualMode();
+        showInteractionHint(state.manualMode ? 'Select peaks on' : 'Select peaks off');
+        return;
+      }
+      const savePairShortcut = ev.key === 'Enter'
+        && (ev.ctrlKey || ev.metaKey)
+        && !ev.altKey;
+      if (!savePairShortcut) return;
+      if (
+        state.stage !== 'event_annotation'
+        || state.manualAnnotationKind !== 'cell'
+      ) return;
+      ev.preventDefault();
+      if (!state.manualMode) {
+        showInteractionHint('请先开启 Select peaks');
+        return;
+      }
+      createManualTriplet('accepted');
     }
 
     function syncBootstrapMode() {
@@ -14785,14 +14820,15 @@ HTML = r"""<!doctype html>
             'warning'
           );
         }
-        return;
+        return null;
       }
       const button = el('openUmap');
-      if (button.dataset.opening === 'true') return;
+      if (button.dataset.opening === 'true') return null;
       button.dataset.opening = 'true';
       button.disabled = true;
       button.setAttribute('aria-busy', 'true');
       button.textContent = '正在打开 UMAP…';
+      let openedResult = null;
       try {
         const umapUrl = `${window.location.origin}/umap`;
         await waitForNativeUmapBridge();
@@ -14808,6 +14844,7 @@ HTML = r"""<!doctype html>
             }),
           ]);
           if (!result?.ok) throw new Error('独立 UMAP 窗口没有成功创建，请重试');
+          openedResult = result;
         } finally {
           if (timeoutId !== null) window.clearTimeout(timeoutId);
         }
@@ -14819,6 +14856,39 @@ HTML = r"""<!doctype html>
         button.disabled = false;
         syncUmapButtonState();
       }
+      return openedResult;
+    }
+
+    async function locateMsEventInUmap(row) {
+      if (!row || row.in_cell_event_map !== true) {
+        showInteractionHint('该 MS760 峰不在事件坐标表，无法在 UMAP 定位');
+        return;
+      }
+      if (!state.meta?.cell_event_map?.coordinates_available) {
+        showInteractionHint('请先配置 UMAP 坐标');
+        await openUmapWindow();
+        return;
+      }
+      if (!stateChannel) {
+        showInteractionHint('当前系统不支持 Track / UMAP 同步');
+        return;
+      }
+      const message = {
+        type: 'highlight-event',
+        project_id: state.meta?.project_id || '',
+        map_sha256: state.meta?.cell_event_map?.sha256 || '',
+        ms_event_id: row.event_id,
+        scan_start_time: row.raw_time_min ?? row.time_min,
+      };
+      state.pendingUmapHighlight = message;
+      stateChannel.postMessage(message);
+      const opened = await openUmapWindow();
+      if (!opened) return;
+      stateChannel.postMessage(message);
+      showInteractionHint('已在 UMAP 中用红圈定位');
+      window.setTimeout(() => {
+        if (state.pendingUmapHighlight === message) state.pendingUmapHighlight = null;
+      }, 5000);
     }
 
     function selectedRawInputMode() {
@@ -15528,6 +15598,9 @@ HTML = r"""<!doctype html>
       el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动参考峰关系';
       el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
       el('createManualPending').style.display = cellMode ? 'block' : 'none';
+      el('manualShortcutHint').textContent = cellMode
+        ? 'Keys: S Select · Ctrl/⌘+Enter Save pair'
+        : 'Key: S Select';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
@@ -16428,6 +16501,14 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function toggleManualMode() {
+      if (state.meta?.bootstrap || state.actionBusy) return;
+      hideLineContextMenu();
+      state.manualMode = !state.manualMode;
+      renderManualSelection();
+      draw();
+    }
+
     function renderManualSelection() {
       const cell = state.stage === 'event_annotation' && state.manualAnnotationKind === 'cell';
       const anchors = qcAnchorChannels();
@@ -16901,6 +16982,11 @@ HTML = r"""<!doctype html>
               attachHover(c);
               if (track.trace === 'pc34_760_linear') {
                 c.addEventListener('click', () => selectManualPeak('MS760', e));
+                c.addEventListener('dblclick', ev => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  locateMsEventInUmap(e);
+                });
               }
             } else {
               c.setAttribute('opacity', '.38');
@@ -17458,12 +17544,7 @@ HTML = r"""<!doctype html>
       state.showWeakLifPeaks = el('showWeakLifPeaks').checked;
       await loadWindow();
     });
-    el('manualMode').addEventListener('click', () => {
-      hideLineContextMenu();
-      state.manualMode = !state.manualMode;
-      renderManualSelection();
-      draw();
-    });
+    el('manualMode').addEventListener('click', toggleManualMode);
     el('clearManual').addEventListener('click', () => {
       resetManualSelection();
       renderManualSelection();
@@ -17742,6 +17823,7 @@ HTML = r"""<!doctype html>
     el('deltaPlus').addEventListener('click', () => updateDeltaPreview(Number(el('deltaSlider').value || 0) + 0.25));
     el('deltaSlider').addEventListener('change', () => updateDeltaPreview(Number(el('deltaSlider').value || 0)));
     document.addEventListener('click', hideLineContextMenu);
+    document.addEventListener('keydown', handleManualKeyboardShortcut);
     document.addEventListener('keydown', (ev) => {
       if (ev.key === 'Escape') {
         if (activeModal) {
@@ -17773,6 +17855,15 @@ HTML = r"""<!doctype html>
     if (stateChannel) {
       stateChannel.addEventListener('message', async event => {
         const message = event.data || {};
+        if (message.type === 'umap-ready') {
+          const pending = state.pendingUmapHighlight;
+          if (!pending) return;
+          if (String(message.project_id || '') !== String(pending.project_id || '')) return;
+          if (String(message.map_sha256 || '') !== String(pending.map_sha256 || '')) return;
+          stateChannel.postMessage(pending);
+          state.pendingUmapHighlight = null;
+          return;
+        }
         if (message.type !== 'focus-event') return;
         if (String(message.project_id || '') !== String(state.meta?.project_id || '')) return;
         if (String(message.map_sha256 || '') !== String(state.meta?.cell_event_map?.sha256 || '')) return;
