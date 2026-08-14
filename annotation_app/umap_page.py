@@ -601,6 +601,28 @@ UMAP_HTML = r"""<!doctype html>
       }
     }
 
+    function highlightTrackEvent(message) {
+      if (String(message.project_id || '') !== String(payload?.project_id || '')) return;
+      if (String(message.map_sha256 || '') !== String(payload?.map_sha256 || '')) return;
+      const eventId = String(message.ms_event_id || '');
+      const point = points.find(row => String(row.ms_event_id || '') === eventId);
+      if (!point) return;
+      matchedTimeEventIds = new Set([eventId]);
+      const eventTime = pointMs760Time(point);
+      if (Number.isFinite(eventTime)) timeQuery.value = String(Number(eventTime.toFixed(6)));
+      timeStatus.textContent = 'Track · 1 point';
+      draw();
+    }
+
+    function announceUmapReady() {
+      if (!channel || !payload) return;
+      channel.postMessage({
+        type: 'umap-ready',
+        project_id: payload.project_id || '',
+        map_sha256: payload.map_sha256 || '',
+      });
+    }
+
     function findTimePoints() {
       const targetText = String(timeQuery.value).trim();
       const toleranceText = String(timeTolerance.value).trim();
@@ -627,7 +649,7 @@ UMAP_HTML = r"""<!doctype html>
         return;
       }
       timeStatus.textContent = `${matches.length} point${matches.length === 1 ? '' : 's'}`;
-      fitPointSet(matches);
+      draw();
     }
 
     function clearTimeSearch() {
@@ -704,6 +726,10 @@ UMAP_HTML = r"""<!doctype html>
     if (channel) {
       channel.addEventListener('message', event => {
         const message = event.data || {};
+        if (message.type === 'highlight-event') {
+          highlightTrackEvent(message);
+          return;
+        }
         if (['annotation-changed', 'project-changed', 'map-attached', 'map-replaced'].includes(message.type)) {
           pollRevision();
         }
@@ -711,7 +737,7 @@ UMAP_HTML = r"""<!doctype html>
     }
 
     new ResizeObserver(resizeCanvas).observe(plot);
-    loadFullState({ forceFit: true });
+    loadFullState({ forceFit: true }).then(announceUmapReady);
     setInterval(pollRevision, 2000);
   </script>
 </body>
