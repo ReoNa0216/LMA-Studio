@@ -1,5 +1,7 @@
 """Standalone high-DPI Canvas page for the project cell-event UMAP."""
 
+from annotation_app.visual_palette import signal_palette_json
+
 UMAP_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -166,16 +168,12 @@ UMAP_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
+    const SIGNAL_COLORS = __LMA_SIGNAL_COLORS__;
     const COLORS = {
       unknown: '#98A2B3',
       qc: '#111827',
       conflict: '#ffffff',
-      G1: '#2f6fed',
-      G2: '#176b45',
-      R1: '#6f4bb8',
-      R2: '#b95d18',
     };
-    const FALLBACK = ['#0e7490','#be123c','#a16207','#7c3aed','#047857','#c2410c','#4338ca','#9f1239'];
     const channel = ('BroadcastChannel' in window) ? new BroadcastChannel('lma-studio-state-v1') : null;
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
@@ -216,13 +214,7 @@ UMAP_HTML = r"""<!doctype html>
 
     function stableColor(channelName) {
       const name = String(channelName || '').toUpperCase();
-      if (COLORS[name]) return COLORS[name];
-      let hash = 2166136261;
-      for (const char of name) {
-        hash ^= char.charCodeAt(0);
-        hash = Math.imul(hash, 16777619);
-      }
-      return FALLBACK[Math.abs(hash >>> 0) % FALLBACK.length];
+      return SIGNAL_COLORS[name] || COLORS.unknown;
     }
 
     function pointColor(point) {
@@ -743,3 +735,5 @@ UMAP_HTML = r"""<!doctype html>
 </body>
 </html>
 """
+
+UMAP_HTML = UMAP_HTML.replace("__LMA_SIGNAL_COLORS__", signal_palette_json())

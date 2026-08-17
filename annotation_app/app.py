@@ -66,6 +66,7 @@ from annotation_app.cell_event_map import (
     write_canonical_map,
 )
 from annotation_app.umap_page import UMAP_HTML
+from annotation_app.visual_palette import signal_palette_json
 from scripts.v3.lif_peak_detection import (
     lif_peak_detection_hash,
     normalize_lif_peak_detection,
@@ -112,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.8"
+APP_VERSION = "lma_studio_v0.4.9"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -12114,8 +12115,6 @@ HTML = r"""<!doctype html>
       --muted: #667085;
       --line: #d7dce3;
       --axis: #8a94a6;
-      --ms760: #1f5f99;
-      --ms782: #2a7d67;
       --warn: #b42318;
       --shadow: 0 10px 26px rgba(20, 26, 36, 0.08);
     }
@@ -13442,7 +13441,7 @@ HTML = r"""<!doctype html>
           </div>
           <div class="manual-save-actions">
             <button id="createManual" class="small-button" aria-keyshortcuts="A" title="Shortcut: A in Cell pair">Save pair</button>
-            <button id="createManualPending" class="small-button secondary" style="display:none;">Save pending</button>
+            <button id="createManualPending" class="small-button secondary" style="display:none;" aria-keyshortcuts="D" title="Shortcut: D in Cell pair">Save pending</button>
           </div>
         <div id="manualShortcutHint" class="empty" style="margin-top:6px;"><span class="shortcut-line">Keys: S Select</span></div>
         <div id="manualHelp" class="empty" style="margin-top:6px;">开启后依次点击项目配置的 LIF 参考峰和对应的 MS760 峰。</div>
@@ -13755,7 +13754,7 @@ HTML = r"""<!doctype html>
       : null;
     const MIN_WINDOW_MIN = 0.25;
     const MAX_WINDOW_MIN = 15.0;
-    const colors = { G1: '#2f6fed', G2: '#176b45', R2: '#b95d18', R1: '#6f4bb8', ms760: '#1f5f99', ms782: '#2a7d67' };
+    const SIGNAL_COLORS = __LMA_SIGNAL_COLORS__;
     const fallbackLifTracks = [
       { key: 'lif_g2', label: 'LIF G2 / Day0', kind: 'lif', channels: ['G2'] },
       { key: 'lif_r1', label: 'LIF R1 / Day9', kind: 'lif', channels: ['R1'] },
@@ -13763,11 +13762,7 @@ HTML = r"""<!doctype html>
     ];
 
     function colorForChannel(channel) {
-      if (colors[channel]) return colors[channel];
-      const palette = ['#0f766e', '#7c3aed', '#b45309', '#be123c', '#0369a1', '#4d7c0f'];
-      let hash = 0;
-      String(channel || '').split('').forEach(ch => { hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0; });
-      return palette[hash % palette.length];
+      return SIGNAL_COLORS[channel] || '#667085';
     }
 
     function tracksForCurrentProject() {
@@ -13805,7 +13800,7 @@ HTML = r"""<!doctype html>
 
     function colorForTrack(track) {
       if (track.kind === 'lif') return colorForChannel(track.channels[0]);
-      return track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782;
+      return track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782;
     }
 
     function renderTrackLegend() {
@@ -14211,7 +14206,7 @@ HTML = r"""<!doctype html>
         showInteractionHint(state.manualMode ? 'Select peaks on' : 'Select peaks off');
         return;
       }
-      const savePairShortcut = key === 'a'
+      const savePairShortcut = (key === 'a' || key === 'd')
         && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
       if (!savePairShortcut) return;
       if (
@@ -14221,6 +14216,10 @@ HTML = r"""<!doctype html>
       ev.preventDefault();
       if (!state.manualMode) {
         showInteractionHint('请先开启 Select peaks');
+        return;
+      }
+      if (key === 'd') {
+        createManualTriplet('pending');
         return;
       }
       createManualTriplet('accepted');
@@ -15602,7 +15601,7 @@ HTML = r"""<!doctype html>
       el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
       el('createManualPending').style.display = cellMode ? 'block' : 'none';
       el('manualShortcutHint').innerHTML = cellMode
-        ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">A Save pair</span>'
+        ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">A Save pair</span><span class="shortcut-line">D Save pending</span>'
         : '<span class="shortcut-line">Key: S Select</span>';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
@@ -16946,7 +16945,7 @@ HTML = r"""<!doctype html>
           svg.appendChild(svgEl('path', {
             d: linePath(trace, xScale, yScale),
             fill: 'none',
-            stroke: track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782,
+            stroke: track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782,
             'stroke-width': 1.15,
             'vector-effect': 'non-scaling-stroke'
           }));
@@ -16970,7 +16969,7 @@ HTML = r"""<!doctype html>
               cx: xScale(e.plot_time_min),
               cy: yScale(y),
               r: e.low_quality_scan_window || e.collision_risk_high ? 4.7 : 3.5,
-              fill: track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782,
+              fill: track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782,
               stroke: e.low_quality_scan_window || e.collision_risk_high ? '#b42318' : '#fff',
               'stroke-width': 1.3,
               class: 'peak-marker'
@@ -17019,7 +17018,7 @@ HTML = r"""<!doctype html>
               markerPositions[`ms760:${e.event_id}`] = { x: xScale(e.plot_time_min), y: yScale(y) };
             }
             if (interactive && labelIds.has(String(e.event_id))) {
-              addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? colors.ms760 : colors.ms782, labelBoxes, state.peakLabelMode === 'all');
+              addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782, labelBoxes, state.peakLabelMode === 'all');
             }
           });
         }
@@ -17897,6 +17896,8 @@ HTML = r"""<!doctype html>
 </body>
 </html>
 """
+
+HTML = HTML.replace("__LMA_SIGNAL_COLORS__", signal_palette_json())
 
 
 class AnnotationHandler(BaseHTTPRequestHandler):

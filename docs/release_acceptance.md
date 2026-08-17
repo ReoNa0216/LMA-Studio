@@ -1,6 +1,6 @@
 # LMA Studio 当前版本验收指南
 
-本指南用于当前正式桌面版本（v0.4.8）。版本历史由 Git tag 和 `README_RELEASE.md` 保存，不再为每个补丁版本复制一份 UAT 文档。
+本指南用于当前正式桌面版本（v0.4.9）。版本历史由 Git tag 和 `README_RELEASE.md` 保存，不再为每个补丁版本复制一份 UAT 文档。
 
 ## 安全边界
 
@@ -13,7 +13,7 @@
 
 ## 现有项目兼容
 
-用当前版本打开一个 v0.4.0-v0.4.6 当前峰识别标准项目的完整副本，确认：
+用当前版本打开一个 v0.4.0-v0.4.8 当前峰识别标准项目的完整副本，确认：
 
 - 既有标注、待审关系、冻结时间模型、Track、UMAP 和导出均正常；
 - 软件按 `lifms_project.json` 中的路径打开项目，不整理或迁移旧目录；
@@ -33,12 +33,12 @@
 - 自动 MS760 core 仍使用 ±12 ppm 和既有阈值。只有名单行缺少 core event 时，零膨胀信号上的独立 ±15 ppm 审核通道才可补入一个满足局部极大值、峰距、局部起伏和 robust upper-fence 的事件；
 - 补入事件只能人工 Cell pair，不得进入前段校准、时间差、后段 QC、自动 Cell 候选或模型训练；
 - MS 阈值完全来自原始 PC34 信号及其背景分布，不读取 CSV 行数、`Type`、`batch`、CellNumber 或其他身份标签；
-- 已有 v0.4.0–v0.4.6 项目仅按 manifest 打开既有事件表，schema-1 项目按原 half-height 语义回放，不会因升级而重新运行 MS event 识别。
+- 已有 v0.4.0–v0.4.8 项目仅按 manifest 打开既有事件表，schema-1 项目按原 half-height 语义回放，不会因升级而重新运行 MS event 识别。
 
 ## 人工 Cell pair 待审
 
 1. 在 `Events / QC` 中选择一个可用于细胞标注的 LIF 峰和一个坐标 CSV 内的 MS760 event。
-2. 点击 `Save pending`。
+2. 点击 `Save pending`，或在未编辑输入框且无弹窗时按 `D`。
 3. 关系应以待审样式保存；切换窗口或重新打开项目后仍可见。
 4. 待审关系不进入主 CSV 或 UMAP 分类，不占用 MS event，也不参与模型训练。
 5. 在审查区接受后，它才进入 CSV/UMAP，并按既有互斥规则占用该 event；拒绝后保留审计记录。
@@ -66,7 +66,8 @@
 - 查询框应完整显示类似 `e.g. 49.001` 的提示；窄窗口下控件自动换行，不溢出工具栏。
 - 输入 MS760 时间后，命中点显示红色轮廓；缩放和平移保持不变；清除查询后轮廓消失。
 - 在 Track 双击事件坐标表内的 MS760 峰，UMAP 应打开或唤回并用红圈标出同一 `ms_event_id`，但不缩放、不平移。
-- 按 `S` 开关 `Select peaks`；在 `Events > Cell pair` 中按 `A` 执行 `Save pair`。输入框、下拉框和弹窗中不得误触发。
+- 按 `S` 开关 `Select peaks`；在 `Events > Cell pair` 中按 `A` 执行 `Save pair`、按 `D` 执行 `Save pending`。输入框、下拉框和弹窗中不得误触发。
+- Track 与 UMAP 中已接受细胞的 G1/G2/R1/R2 颜色必须一致；MS760、MS782 与四个 LIF 通道应保持清晰可辨。切换到旧项目不应改写其 manifest、SQLite 或中间表。
 - 查询只定位点，不修改标注。
 - 正式标注段没有当前有效 QC 时，UMAP 不显示 QC 图例。
 

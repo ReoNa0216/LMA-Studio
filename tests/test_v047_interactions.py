@@ -1,4 +1,4 @@
-"""Focused UI contracts for the v0.4.7 interactions and v0.4.8 shortcut hotfix."""
+"""Focused UI contracts retained from the v0.4.7 interaction work."""
 
 import unittest
 
@@ -14,7 +14,7 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V047InteractionContractTest(unittest.TestCase):
     def test_manual_shortcuts_are_discoverable_and_guarded(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.8")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.9")
         self.assertIn('aria-keyshortcuts="S"', HTML)
         self.assertIn('aria-keyshortcuts="A"', HTML)
         self.assertIn("Keys: S Select", HTML)
