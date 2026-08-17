@@ -34,9 +34,42 @@ codesign --force --deep --sign - "$app_path"
 codesign --verify --deep --strict "$app_path"
 plutil -lint "$app_path/Contents/Info.plist"
 file "$executable" | grep -q "arm64"
-"$executable" --help >/dev/null
-"$executable" --check-runtime >/dev/null
-"$executable" --check-umap-window >/dev/null
+
+run_packaged_probe() {
+  local label="$1"
+  local timeout_seconds="$2"
+  shift 2
+  echo "Running packaged ${label} probe (timeout ${timeout_seconds}s)..."
+  "$python_bin" - "$label" "$timeout_seconds" "$executable" "$@" <<'PY'
+import subprocess
+import sys
+
+label = sys.argv[1]
+timeout_seconds = int(sys.argv[2])
+command = sys.argv[3:]
+
+try:
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        timeout=timeout_seconds,
+    )
+except subprocess.TimeoutExpired as exc:
+    raise SystemExit(
+        f"Packaged {label} probe exceeded {timeout_seconds} seconds"
+    ) from exc
+except subprocess.CalledProcessError as exc:
+    raise SystemExit(
+        f"Packaged {label} probe failed with exit code {exc.returncode}"
+    ) from exc
+PY
+}
+
+run_packaged_probe "help" 60 --help
+run_packaged_probe "scientific runtime" 60 --check-runtime
+run_packaged_probe "independent UMAP window" 180 --check-umap-window
 
 mkdir -p release
 archive="$repo_root/release/LMA-Studio-${version}-macos-arm64.zip"

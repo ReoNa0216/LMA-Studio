@@ -478,7 +478,7 @@ class DesktopArgumentsTest(unittest.TestCase):
 
 
 class PackagedScientificRuntimeProbeTest(unittest.TestCase):
-    def test_desktop_webview_runtime_is_pinned_for_reproducible_window_lifecycle(self):
+    def test_desktop_packaging_runtime_is_pinned_for_reproducible_window_lifecycle(self):
         repository_root = Path(__file__).resolve().parents[1]
         for relative in (
             "packaging/windows/requirements-win.txt",
@@ -487,13 +487,19 @@ class PackagedScientificRuntimeProbeTest(unittest.TestCase):
             with self.subTest(requirements=relative):
                 requirements = (repository_root / relative).read_text(encoding="utf-8")
                 self.assertIn("pywebview==6.2.1", requirements)
+                self.assertIn("pyinstaller==6.22.0", requirements)
 
     def test_macos_builder_runs_the_packaged_independent_umap_window_probe(self):
         script = (
             Path(__file__).resolve().parents[1] / "packaging/macos/build_macos.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('"$executable" --check-umap-window', script)
+        self.assertIn("subprocess.run", script)
+        self.assertIn("timeout=timeout_seconds", script)
+        self.assertIn(
+            'run_packaged_probe "independent UMAP window" 180 --check-umap-window',
+            script,
+        )
 
     def test_manual_candidate_publication_is_opt_in_and_cannot_match_formal_tags(self):
         workflow = (
