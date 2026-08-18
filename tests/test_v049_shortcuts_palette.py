@@ -41,8 +41,9 @@ class V049ShortcutAndPaletteContractTest(unittest.TestCase):
         )
         self.assertIn("key === 'd'", body)
         self.assertIn("createManualTriplet('pending')", body)
-        self.assertIn("state.stage !== 'event_annotation'", body)
-        self.assertIn("state.manualAnnotationKind !== 'cell'", body)
+        self.assertIn("state.stage === 'event_annotation'", body)
+        self.assertIn("state.manualAnnotationKind === 'cell'", body)
+        self.assertIn("savePairShortcut", body)
         self.assertIn("!state.manualMode", body)
 
     def test_track_and_umap_receive_one_shared_signal_palette(self):

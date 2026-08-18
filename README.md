@@ -27,7 +27,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The current source candidate is v0.4.10; the latest formal release remains v0.4.9 until candidate acceptance. Existing v0.4.0-v0.4.9 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
+The current formal desktop release is v0.4.10. Existing v0.4.0-v0.4.9 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
 
 Windows x64:
 

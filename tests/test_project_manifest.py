@@ -1012,6 +1012,70 @@ class ProjectManifestTest(unittest.TestCase):
             self.assertEqual(row["annotation_id"], "auto_qc:g2:r1:ms")
             self.assertEqual(len(app.store.records()), 1)
 
+    def test_explicit_manual_anchor_does_not_reuse_ambiguous_auto_candidate(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            group = {
+                "anchor_a_channel": "G2",
+                "anchor_b_channel": "R1",
+                "anchor_a_peak_id": "g2",
+                "anchor_b_peak_id": "r1",
+                "g2_peak_id": "g2",
+                "r1_peak_id": "r1",
+                "ms_event_id": "ms",
+                "g2_raw_time_min": 1.0,
+                "r1_raw_time_min": 1.0,
+                "ms_time_min": 1.0,
+                "g2_plot_time_min": 1.0,
+                "r1_plot_time_min": 1.0,
+                "ms_plot_time_min": 1.0,
+                "composite_to_ms_residual_sec": 0.0,
+                "abs_composite_to_ms_residual_sec": 0.0,
+                "component_ambiguous": True,
+                "alternative_ms_event_ids": ["ms_alternative"],
+            }
+            app = AppData(
+                project=ProjectPaths.from_args(project_dir=tmp),
+                lif_traces=pd.DataFrame(),
+                lif_peaks=pd.DataFrame(
+                    [
+                        {"peak_id": "g2", "channel": "G2", "time_min": 1.0, "time_sec": 60.0},
+                        {"peak_id": "r1", "channel": "R1", "time_min": 1.0, "time_sec": 60.0},
+                    ]
+                ),
+                ms_events=pd.DataFrame(
+                    [
+                        {"event_id": "ms", "time_min": 1.0, "time_sec": 60.0, "event_strategy": "pc34_primary", "primary_signal_col": "pc34_760_max_intensity"},
+                        {"event_id": "ms_alternative", "time_min": 1.01, "time_sec": 60.6, "event_strategy": "pc34_primary", "primary_signal_col": "pc34_760_max_intensity"},
+                    ]
+                ),
+                ms_scan=pd.DataFrame(),
+                alignment={
+                    "model": "legacy",
+                    "green_to_ms_shift_sec": 0.0,
+                    "red_to_ms_shift_sec": 0.0,
+                    "axis_shifts_sec": {"green_axis": 0.0, "red_axis": 0.0},
+                    "channel_time_axes": {"G2": "green_axis", "R1": "red_axis", "R2": "red_axis"},
+                    "qc_anchor_channels": ["G2", "R1"],
+                    "qc_groups": {"groups": [group]},
+                    "acquisition_layout_hash": acquisition_layout_hash(None),
+                },
+                store=AnnotationStore(Path(tmp) / "annotation.sqlite"),
+                channel_identity_prior={},
+                acquisition_layout=None,
+            )
+
+            row = app.create_manual_triplet(
+                None,
+                None,
+                "ms",
+                lif_anchor_peak_ids={"G2": "g2", "R1": "r1"},
+            )
+
+            self.assertEqual(row["source"], "manual_created")
+            self.assertEqual(row["review_status"], "accepted")
+            self.assertNotEqual(row["annotation_id"], "auto_qc:g2:r1:ms")
+            self.assertEqual(len(app.store.records()), 1)
+
     def test_qc_survey_manual_map_without_window_reuses_dynamic_auto_candidate(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             layout = normalize_acquisition_layout(

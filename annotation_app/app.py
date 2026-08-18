@@ -178,6 +178,22 @@ QC_GROUP_MATCH_TOL_SEC = 4.00
 WINDOW_CONTEXT_MARGIN_MIN = math.ceil(((max(QC_GROUP_MATCH_TOL_SEC, LIF_PAIR_MATCH_TOL_SEC) / 60.0) + 0.005) * 100.0) / 100.0
 PRE_RUN_MAX_MIN = 40.0
 QC_COMPONENT_SELECT_EPS = 1e-9
+# Two adjacent PC34 maxima closer than the established collision-warning
+# interval are not automatically independent calibration observations unless
+# the measured trace returns to the caller's background band between them.
+# This is an inference rule, not a peak-deletion rule: every core event remains
+# in the project table and is still available for manual inspection.
+CALIBRATION_COMPLEX_MAX_GAP_SEC = 0.60
+# A second maximum is locally resolved when the saddle removes at least half
+# of the smaller peak's net height and the drop itself exceeds the caller's
+# prominence floor. This half-height criterion is dimensionless: it does not
+# depend on a dataset's absolute intensity scale.
+CALIBRATION_MIN_NORMALIZED_SADDLE_DROP = 0.50
+# Detection and calibration are different claims. A core event remains in the
+# event table, while automatic front calibration requires two independent
+# margins over the caller's own background model: height and prominence.
+CALIBRATION_MIN_EVIDENCE_STRENGTH = 2.0
+CALIBRATION_AMBIGUITY_RESIDUAL_EPS_SEC = SHIFT_SEARCH_STEP_SEC
 POST_QC_CANDIDATE_TOL_SEC = 2.50
 CELL_CANDIDATE_TOL_SEC = 0.75
 CELL_MIN_TIME_MIN = 40.0
@@ -230,13 +246,13 @@ CALIBRATION_PROTOCOL_VERSION = 1
 POST_QC_STRATEGY_VERSION = 1
 CALIBRATION_REFERENCE_MODES = {"green_only", "red_only", "red_green"}
 POST_QC_STRATEGY_MODES = {"signature", "scheduled_windows", "disabled"}
-SEGMENTED_CALIBRATION_MATCHER_VERSION = "segmented_axis_reference_v2_monotone"
+SEGMENTED_CALIBRATION_MATCHER_VERSION = "segmented_axis_reference_v4_calibration_evidence"
 PROJECT_TABLE_BINDING_SCHEMA_VERSION = 1
 MIN_LIF_INPUTS = 2
 MAX_LIF_INPUTS = 4
 MIN_QC_ANCHOR_CHANNELS = 2
 MAX_QC_ANCHOR_CHANNELS = 4
-QC_MATCHER_VERSION = "axis_aware_anchor_set_v3_monotone"
+QC_MATCHER_VERSION = "axis_aware_anchor_set_v5_calibration_evidence"
 RAW_INPUT_MODE_COPY = "copy_into_project"
 RAW_INPUT_MODE_EXTERNAL = "external_reference"
 RAW_INPUT_MODES = {RAW_INPUT_MODE_COPY, RAW_INPUT_MODE_EXTERNAL}
@@ -4523,7 +4539,7 @@ def estimate_channel_shift(
     lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     # Roster-supported events are for manual Cell pairing only.  They must
     # never influence the physical LIF-to-MS calibration model.
-    ms_events = primary_pc34_events(ms_events)
+    ms_events = automatic_calibration_ms_evidence(ms_events)
     qc_end = float(qc_calibration_end_min)
     lif = lif_peaks[
         lif_peaks["channel"].eq(channel)
@@ -4670,7 +4686,7 @@ def estimate_axis_shift(
 ) -> dict[str, Any]:
     # Keep the same core-only invariant as the single-channel estimator.
     # Legacy tables without strategy metadata remain unchanged in memory.
-    ms_events = primary_pc34_events(ms_events)
+    ms_events = automatic_calibration_ms_evidence(ms_events)
     if len(channels) == 1:
         single = estimate_channel_shift(lif_peaks, ms_events, channels[0], qc_calibration_end_min)
         return {
@@ -4764,6 +4780,7 @@ def estimate_segmented_axis_shift(
     calibration_protocol: dict[str, Any],
     channel_time_axes: dict[str, str],
 ) -> dict[str, Any]:
+    calibration_events = automatic_calibration_ms_evidence(ms_events)
     segment_inputs: list[tuple[dict[str, Any], list[str], list[dict[str, Any]], pd.DataFrame]] = []
     for segment in calibration_protocol["segments"]:
         channels = [
@@ -4779,7 +4796,7 @@ def estimate_segmented_axis_shift(
             start_min=float(segment["start_min"]),
             end_min=float(segment["end_min"]),
         )
-        ms = primary_pc34_events(ms_events)
+        ms = calibration_events
         ms = ms[
             ms["time_min"].between(
                 float(segment["start_min"]),
@@ -4916,6 +4933,7 @@ def multi_anchor_groups_for_range(
     minimum_raw_time_min: float,
     ms_shift_sec: float,
     tolerance_sec: float,
+    report_calibration_ms_ambiguity: bool = False,
 ) -> list[dict[str, Any]]:
     lif_peaks = automatic_lif_peak_evidence(lif_peaks)
     anchors = [str(channel).strip().upper() for channel in anchor_channels]
@@ -4931,6 +4949,10 @@ def multi_anchor_groups_for_range(
         return []
     ms_plot_times = ms["time_sec"].to_numpy(float) + float(ms_shift_sec)
     matched_by_ms: dict[int, dict[str, tuple[pd.Series, float, int]]] = {}
+    joint_lif_conflicts_by_ms: dict[int, int] = {}
+    # Preserve the established channel-first matcher as the primary path. It
+    # deliberately retains same-axis competitors and cross-axis incoherence as
+    # reviewable conflicts instead of silently discarding them.
     for channel in anchors:
         axis = str(channel_time_axes[channel])
         shift_sec = float(axis_shifts_sec.get(axis, 0.0))
@@ -4960,6 +4982,113 @@ def multi_anchor_groups_for_range(
                 peaks.iloc[int(peak_idx)],
                 float(residual),
                 int(ambiguous),
+            )
+
+    if report_calibration_ms_ambiguity:
+        # A narrow fallback repairs one failure mode of channel-first matching:
+        # two credible MS alternatives can attract different LIF axes, leaving
+        # two incomplete groups even though the LIF peaks form one coherent
+        # physical anchor set. Build joint LIF sets only to restore such erased
+        # evidence. Existing complete groups and their conflict accounting stay
+        # untouched.
+        shifted_frames: list[pd.DataFrame] = []
+        for channel in anchors:
+            axis = str(channel_time_axes[channel])
+            shift_sec = float(axis_shifts_sec.get(axis, 0.0))
+            peaks = lif_peaks[
+                lif_peaks["channel"].eq(channel)
+                & (lif_peaks["time_min"] >= float(minimum_raw_time_min))
+            ].copy()
+            if peaks.empty:
+                continue
+            peaks["_raw_time_sec"] = peaks["time_sec"].astype(float)
+            peaks["_raw_time_min"] = peaks["time_min"].astype(float)
+            peaks["time_sec"] = peaks["_raw_time_sec"] + shift_sec
+            peaks["time_min"] = peaks["time_sec"] / 60.0
+            peaks = peaks[
+                peaks["time_min"].between(
+                    float(context_start_min),
+                    float(context_end_min),
+                    inclusive="both",
+                )
+            ]
+            if not peaks.empty:
+                shifted_frames.append(peaks)
+        joint_peaks = (
+            pd.concat(shifted_frames, ignore_index=True)
+            if shifted_frames
+            else pd.DataFrame()
+        )
+        clusters = (
+            build_axis_peak_clusters(
+                joint_peaks,
+                anchors,
+                start_min=float(context_start_min),
+                end_min=float(context_end_min),
+                tolerance_sec=LIF_PAIR_MATCH_TOL_SEC,
+            )
+            if not joint_peaks.empty
+            else []
+        )
+        clusters = [
+            cluster
+            for cluster in clusters
+            if required_axes.issubset(
+                {
+                    str(channel_time_axes[str(channel)])
+                    for channel in cluster["members"]
+                }
+            )
+        ]
+        cluster_times = np.asarray(
+            [float(cluster["time_sec"]) for cluster in clusters], dtype=float
+        )
+        joint_matches = (
+            greedy_time_matches(
+                cluster_times,
+                ms_plot_times,
+                0.0,
+                float(tolerance_sec),
+            )
+            if len(cluster_times)
+            else []
+        )
+        for cluster_idx, ms_idx, _residual in joint_matches:
+            cluster = clusters[int(cluster_idx)]
+            existing_members = matched_by_ms.get(int(ms_idx), {})
+            existing_axes = {
+                str(channel_time_axes[channel]) for channel in existing_members
+            }
+            if required_axes.issubset(existing_axes):
+                continue
+            ms_time = float(ms_plot_times[int(ms_idx)])
+            repaired_members = dict(existing_members)
+            displaced_count = 0
+            for channel, shifted_row in cluster["members"].items():
+                original_row = shifted_row.copy()
+                original_row["time_sec"] = float(shifted_row["_raw_time_sec"])
+                original_row["time_min"] = float(shifted_row["_raw_time_min"])
+                old_match = repaired_members.get(str(channel))
+                if old_match is not None and str(old_match[0]["peak_id"]) != str(
+                    original_row["peak_id"]
+                ):
+                    displaced_count += 1
+                repaired_members[str(channel)] = (
+                    original_row,
+                    float(ms_time - float(shifted_row["time_sec"])),
+                    0,
+                )
+            repaired_axes = {
+                str(channel_time_axes[channel]) for channel in repaired_members
+            }
+            if not required_axes.issubset(repaired_axes):
+                continue
+            matched_by_ms[int(ms_idx)] = repaired_members
+            lif_competitors = int(
+                np.sum(np.abs(cluster_times - ms_time) <= float(tolerance_sec))
+            )
+            joint_lif_conflicts_by_ms[int(ms_idx)] = (
+                max(0, lif_competitors - 1) + displaced_count
             )
 
     groups: list[dict[str, Any]] = []
@@ -5007,7 +5136,9 @@ def multi_anchor_groups_for_range(
         plot_times: dict[str, float | None] = {channel: None for channel in anchors}
         axis_member_times: dict[str, list[float]] = {axis: [] for axis in required_axes}
         quality_score = 0.0
-        conflict_count = len(same_axis_dropped_channels)
+        conflict_count = len(same_axis_dropped_channels) + int(
+            joint_lif_conflicts_by_ms.get(int(ms_idx), 0)
+        )
         for channel in anchors:
             match = members.get(channel)
             if match is None:
@@ -5052,6 +5183,31 @@ def multi_anchor_groups_for_range(
         )
         if not axis_coherent:
             conflict_count += 1
+        alternative_ms_event_ids: list[str] = []
+        alternative_ms_event_times_min: list[float] = []
+        if report_calibration_ms_ambiguity:
+            selected_abs_residual = abs(float(residual_sec))
+            ambiguity_margin = max(
+                float(CALIBRATION_AMBIGUITY_RESIDUAL_EPS_SEC),
+                float(axis_span_sec),
+            )
+            for alternative_index, alternative_time in enumerate(ms_plot_times):
+                if int(alternative_index) == int(ms_idx):
+                    continue
+                alternative_abs_residual = abs(float(alternative_time) - composite_sec)
+                if (
+                    alternative_abs_residual <= float(tolerance_sec) + QC_COMPONENT_SELECT_EPS
+                    and alternative_abs_residual
+                    <= selected_abs_residual + ambiguity_margin + QC_COMPONENT_SELECT_EPS
+                ):
+                    alternative_ms_event_ids.append(
+                        str(ms.iloc[int(alternative_index)]["event_id"])
+                    )
+                    alternative_ms_event_times_min.append(
+                        float(ms.iloc[int(alternative_index)]["time_min"])
+                    )
+            conflict_count += len(alternative_ms_event_ids)
+        component_ambiguous = bool(alternative_ms_event_ids)
         missing_channels = [channel for channel in anchors if peak_ids[channel] is None]
         group: dict[str, Any] = {
             "rank": len(groups) + 1,
@@ -5088,14 +5244,19 @@ def multi_anchor_groups_for_range(
             "same_axis_conflict_count": len(same_axis_dropped_channels),
             "same_axis_dropped_channels": same_axis_dropped_channels,
             "selection_reason": (
-                "ms_centered_axis_complete_anchor_set"
+                "ambiguous_ms_evidence_requires_manual_review"
+                if component_ambiguous
+                else "ms_centered_axis_complete_anchor_set"
                 if axis_coherent
                 else "ms_centered_axis_incoherent_anchor_set"
             ),
             "match_tolerance_sec": float(tolerance_sec),
             "component_pair_count": 1,
-            "component_ms_count": 1,
-            "alternative_ms_event_ids": [],
+            "component_ms_count": 1 + len(alternative_ms_event_ids),
+            "component_ambiguous": component_ambiguous,
+            "ms_evidence_ambiguous": component_ambiguous,
+            "alternative_ms_event_ids": alternative_ms_event_ids,
+            "alternative_ms_event_times_min": alternative_ms_event_times_min,
             "skipped_pair_ids": [],
             "skipped_ms_event_ids": [],
         }
@@ -5137,11 +5298,12 @@ def build_segmented_calibration_groups(
     channel_time_axes: dict[str, str],
     axis_shifts_sec: dict[str, float],
 ) -> dict[str, Any]:
+    calibration_events = automatic_calibration_ms_evidence(ms_events)
     groups: list[dict[str, Any]] = []
     for segment in calibration_protocol["segments"]:
         segment_groups = multi_anchor_groups_for_range(
             lif_peaks,
-            ms_events,
+            calibration_events,
             anchor_channels=list(segment["reference_channels"]),
             channel_time_axes=channel_time_axes,
             axis_shifts_sec=axis_shifts_sec,
@@ -5150,6 +5312,7 @@ def build_segmented_calibration_groups(
             minimum_raw_time_min=float(segment["start_min"]),
             ms_shift_sec=0.0,
             tolerance_sec=QC_GROUP_MATCH_TOL_SEC,
+            report_calibration_ms_ambiguity=True,
         )
         for group in segment_groups:
             group.update(
@@ -5348,6 +5511,7 @@ def build_qc_alignment_groups(
     qc_anchor_channels: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     lif_peaks = automatic_lif_peak_evidence(lif_peaks)
+    ms_events = automatic_calibration_ms_evidence(ms_events)
     qc_end = float(qc_calibration_end_min)
     anchors = [str(ch).strip().upper() for ch in (qc_anchor_channels or ["G2", "R1"])]
     if len(anchors) != len(set(anchors)) or not MIN_QC_ANCHOR_CHANNELS <= len(anchors) <= MAX_QC_ANCHOR_CHANNELS:
@@ -5374,6 +5538,7 @@ def build_qc_alignment_groups(
             minimum_raw_time_min=0.0,
             ms_shift_sec=0.0,
             tolerance_sec=QC_GROUP_MATCH_TOL_SEC,
+            report_calibration_ms_ambiguity=True,
         )
         return {
             "anchor_channels": anchors,
@@ -5515,6 +5680,277 @@ def primary_pc34_events(ms_events: pd.DataFrame) -> pd.DataFrame:
     if "primary_signal_col" in ms_events.columns:
         mask &= ms_events["primary_signal_col"].eq("pc34_760_max_intensity")
     return ms_events[mask].copy()
+
+
+def annotate_calibration_ms_event_complexes(
+    ms_events: pd.DataFrame,
+    ms_scan: pd.DataFrame,
+    *,
+    max_unresolved_gap_sec: float = CALIBRATION_COMPLEX_MAX_GAP_SEC,
+) -> pd.DataFrame:
+    """Annotate independent MS evidence units without deleting event calls.
+
+    A core PC34 local maximum is a detected event candidate, but several local
+    maxima on one elevated tail are correlated observations.  For calibration
+    they must not cast several votes.  Adjacent maxima form one unresolved
+    complex only when both of the following are true:
+
+    * their apex separation is below the existing collision-warning interval;
+    * the measured PC34 trace neither returns to the event caller's background
+      band nor forms a deep local saddle relative to the smaller peak.
+
+    Close peaks whose intervening valley returns to background remain separate,
+    so genuinely resolved high-rate events are not collapsed merely because of
+    a fixed time gap.  The most prominent, non-low-quality maximum is the
+    deterministic representative of each complex.  All other rows remain in
+    ``ms_events`` for display and manual review.
+    """
+
+    output = ms_events.copy(deep=True)
+    output["calibration_complex_id"] = None
+    output["calibration_complex_size"] = 0
+    output["calibration_complex_representative"] = False
+    output["calibration_evidence_role"] = "not_calibration_evidence"
+    output["calibration_auto_eligible"] = False
+    output["calibration_evidence_strength"] = np.nan
+    output["calibration_review_reason"] = "not_calibration_evidence"
+
+    if output.empty:
+        return output
+    primary_mask = pd.Series(True, index=output.index)
+    if "event_strategy" in output.columns:
+        primary_mask &= output["event_strategy"].astype(str).eq("pc34_primary")
+    if "primary_signal_col" in output.columns:
+        primary_mask &= output["primary_signal_col"].astype(str).eq(
+            "pc34_760_max_intensity"
+        )
+    primary_positions = np.flatnonzero(primary_mask.to_numpy(dtype=bool))
+    if not len(primary_positions):
+        return output
+
+    primary = output.iloc[primary_positions].copy()
+    primary["_output_position"] = primary_positions
+    primary["_event_time_sec"] = pd.to_numeric(
+        primary.get("time_sec"), errors="coerce"
+    )
+    primary = primary[np.isfinite(primary["_event_time_sec"])].sort_values(
+        ["_event_time_sec", "event_id"], kind="stable"
+    )
+    if primary.empty:
+        return output
+
+    trace_ready = {
+        "scan_start_time_sec",
+        "pc34_760_max_intensity",
+    }.issubset(ms_scan.columns)
+    scan_time = np.asarray([], dtype=float)
+    scan_signal = np.asarray([], dtype=float)
+    if trace_ready:
+        trace = ms_scan[["scan_start_time_sec", "pc34_760_max_intensity"]].copy()
+        trace["scan_start_time_sec"] = pd.to_numeric(
+            trace["scan_start_time_sec"], errors="coerce"
+        )
+        trace["pc34_760_max_intensity"] = pd.to_numeric(
+            trace["pc34_760_max_intensity"], errors="coerce"
+        )
+        trace = trace.dropna().sort_values("scan_start_time_sec", kind="stable")
+        scan_time = trace["scan_start_time_sec"].to_numpy(float)
+        scan_signal = trace["pc34_760_max_intensity"].to_numpy(float)
+
+    def background_height(left: pd.Series, right: pd.Series) -> float | None:
+        values = pd.to_numeric(
+            pd.Series([left.get("calling_height"), right.get("calling_height")]),
+            errors="coerce",
+        ).dropna()
+        finite = values[np.isfinite(values)]
+        if finite.empty:
+            return None
+        return float(max(0.0, finite.max()))
+
+    def caller_prominence_floor(left: pd.Series, right: pd.Series) -> float | None:
+        values = pd.to_numeric(
+            pd.Series(
+                [left.get("calling_prominence"), right.get("calling_prominence")]
+            ),
+            errors="coerce",
+        ).dropna()
+        finite = values[np.isfinite(values) & (values > 0.0)]
+        if finite.empty:
+            return None
+        return float(finite.max())
+
+    def finite_number(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def remains_unresolved(left: pd.Series, right: pd.Series) -> bool:
+        gap = float(right["_event_time_sec"] - left["_event_time_sec"])
+        if gap < 0.0 or gap >= float(max_unresolved_gap_sec):
+            return False
+        if not len(scan_time):
+            return False
+        lo = int(np.searchsorted(scan_time, float(left["_event_time_sec"]), side="right"))
+        hi = int(np.searchsorted(scan_time, float(right["_event_time_sec"]), side="left"))
+        if hi <= lo:
+            # With no measured interior sample, resolution has not been
+            # demonstrated; conservatively let the close maxima cast one vote.
+            return True
+        interval = scan_signal[lo:hi]
+        interval = interval[np.isfinite(interval)]
+        ceiling = background_height(left, right)
+        if interval.size == 0 or ceiling is None:
+            return False
+        valley = float(np.min(interval))
+        if valley <= ceiling + QC_COMPONENT_SELECT_EPS:
+            return False
+        left_apex = finite_number(left.get("pc34_760_apex"))
+        right_apex = finite_number(right.get("pc34_760_apex"))
+        apex_values = [value for value in (left_apex, right_apex) if value is not None]
+        prominence_floor = caller_prominence_floor(left, right)
+        if len(apex_values) != 2 or prominence_floor is None:
+            return True
+        smaller_apex = min(apex_values)
+        new_peak_prominence = finite_number(right.get("peak_prominence"))
+        net_height = smaller_apex - ceiling
+        saddle_drop = smaller_apex - valley
+        if net_height <= QC_COMPONENT_SELECT_EPS:
+            return True
+        # The right-hand maximum is the prospective new evidence unit. Its
+        # caller prominence independently bounds how far it rises from the
+        # preceding contour. Requiring both the measured saddle and that
+        # prominence prevents tail ripples from starting a new complex, while
+        # a strong peak after a weak shoulder can still break a single-link
+        # chain.
+        effective_drop = (
+            min(saddle_drop, new_peak_prominence)
+            if new_peak_prominence is not None
+            else saddle_drop
+        )
+        normalized_drop = effective_drop / net_height
+        locally_resolved = (
+            effective_drop + QC_COMPONENT_SELECT_EPS >= prominence_floor
+            and normalized_drop + QC_COMPONENT_SELECT_EPS
+            >= CALIBRATION_MIN_NORMALIZED_SADDLE_DROP
+        )
+        return not locally_resolved
+
+    complexes: list[list[pd.Series]] = []
+    current: list[pd.Series] = []
+    for _, row in primary.iterrows():
+        if current and not remains_unresolved(current[-1], row):
+            complexes.append(current)
+            current = []
+        current.append(row)
+    if current:
+        complexes.append(current)
+
+    def representative_key(row: pd.Series) -> tuple[float, float, float, float]:
+        raw_low_quality = row.get("low_quality_scan_window", False)
+        low_quality = False if pd.isna(raw_low_quality) else bool(raw_low_quality)
+        prominence = clean_value(row.get("peak_prominence"))
+        apex = clean_value(row.get("pc34_760_apex"))
+        return (
+            0.0 if low_quality else 1.0,
+            float(prominence) if isinstance(prominence, (int, float)) else 0.0,
+            float(apex) if isinstance(apex, (int, float)) else 0.0,
+            -float(row["_event_time_sec"]),
+        )
+
+    for complex_index, members in enumerate(complexes, start=1):
+        representative = max(members, key=representative_key)
+        representative_position = int(representative["_output_position"])
+        complex_id = f"calibration_ms_complex_{complex_index:06d}"
+        size = len(members)
+        for member in members:
+            position = int(member["_output_position"])
+            output.iloc[
+                position, output.columns.get_loc("calibration_complex_id")
+            ] = complex_id
+            output.iloc[
+                position, output.columns.get_loc("calibration_complex_size")
+            ] = size
+            is_representative = position == representative_position
+            output.iloc[
+                position,
+                output.columns.get_loc("calibration_complex_representative"),
+            ] = is_representative
+            output.iloc[
+                position, output.columns.get_loc("calibration_evidence_role")
+            ] = "representative" if is_representative else "secondary_local_maximum"
+            low_quality_value = member.get("low_quality_scan_window", False)
+            low_quality = False if pd.isna(low_quality_value) else bool(low_quality_value)
+            if not is_representative:
+                output.iloc[
+                    position, output.columns.get_loc("calibration_review_reason")
+                ] = "secondary_local_maximum"
+                continue
+
+            apex = finite_number(member.get("pc34_760_apex"))
+            height = finite_number(member.get("calling_height"))
+            prominence = finite_number(member.get("peak_prominence"))
+            prominence_floor = finite_number(member.get("calling_prominence"))
+            strength: float | None = None
+            if (
+                apex is not None
+                and height is not None
+                and prominence is not None
+                and prominence_floor is not None
+                and prominence_floor > QC_COMPONENT_SELECT_EPS
+            ):
+                strength = min(
+                    (apex - height) / prominence_floor,
+                    prominence / prominence_floor,
+                )
+                output.iloc[
+                    position,
+                    output.columns.get_loc("calibration_evidence_strength"),
+                ] = float(strength)
+
+            # Older in-memory fixtures can lack caller thresholds. Preserve
+            # their historical eligibility instead of inventing a failing
+            # grade; all current project tables carry these metrics.
+            grade_passes = (
+                True
+                if strength is None
+                else strength + QC_COMPONENT_SELECT_EPS
+                >= CALIBRATION_MIN_EVIDENCE_STRENGTH
+            )
+            eligible = bool(grade_passes and not low_quality)
+            output.iloc[
+                position, output.columns.get_loc("calibration_auto_eligible")
+            ] = eligible
+            output.iloc[
+                position, output.columns.get_loc("calibration_review_reason")
+            ] = (
+                ""
+                if eligible
+                else "low_quality_scan_window"
+                if low_quality
+                else "near_background"
+            )
+    return output
+
+
+def automatic_calibration_ms_evidence(ms_events: pd.DataFrame) -> pd.DataFrame:
+    """Return independent core MS observations eligible for auto calibration."""
+
+    evidence = primary_pc34_events(ms_events)
+    if "calibration_complex_representative" in evidence.columns:
+        evidence = evidence[
+            evidence["calibration_complex_representative"].fillna(False).astype(bool)
+        ]
+    if "calibration_auto_eligible" in evidence.columns:
+        evidence = evidence[
+            evidence["calibration_auto_eligible"].fillna(False).astype(bool)
+        ]
+    if "low_quality_scan_window" in evidence.columns:
+        evidence = evidence[
+            ~evidence["low_quality_scan_window"].fillna(False).astype(bool)
+        ]
+    return evidence.copy()
 
 
 def is_primary_pc34_event(row: pd.Series) -> bool:
@@ -7632,6 +8068,7 @@ class AppData:
         )
         ms_events = pd.read_parquet(project.ms_events_path).sort_values("time_min").reset_index(drop=True)
         ms_scan = pd.read_parquet(project.ms_scan_path).sort_values("scan_start_time_min").reset_index(drop=True)
+        ms_events = annotate_calibration_ms_event_complexes(ms_events, ms_scan)
         cell_event_map, cell_event_map_info = load_project_cell_event_map(
             project.project_dir,
             manifest,
@@ -10015,6 +10452,11 @@ class AppData:
             "conflict_count",
             "same_axis_conflict_count",
             "same_axis_dropped_channels",
+            "component_ms_count",
+            "component_ambiguous",
+            "ms_evidence_ambiguous",
+            "alternative_ms_event_ids",
+            "alternative_ms_event_times_min",
             "calibration_segment_id",
             "calibration_segment_order",
             "calibration_segment_start_min",
@@ -10631,6 +11073,14 @@ class AppData:
         if str(payload.get("review_stage") or "") == "qc_calibration":
             self.require_confirmed_calibration("审核前段校准证据")
         if review_status == "accepted":
+            if (
+                str(payload.get("review_stage") or "") == "qc_calibration"
+                and bool(payload.get("component_ambiguous"))
+            ):
+                raise BadRequest(
+                    "附近有多个同等可信的 MS 峰，不能直接接受软件任取的关系；"
+                    "请使用 Select peaks 手动选择 LIF 与 MS760 后保存 QC anchor"
+                )
             self.ensure_third_stage_acceptance_allowed(
                 payload,
                 annotation_id=annotation_id,
@@ -10863,6 +11313,7 @@ class AppData:
                 if (
                     qc_anchor_peak_id_map(group) == normalized_anchor_ids
                     and str(group.get("ms_event_id")) == ms_event_id
+                    and not bool(group.get("component_ambiguous"))
                 ):
                     review_start = window_start_min
                     review_end = window_end_min
@@ -10907,6 +11358,7 @@ class AppData:
                     str(group.get("g2_peak_id")) == g2_peak_id
                     and str(group.get("r1_peak_id")) == r1_peak_id
                     and str(group.get("ms_event_id")) == ms_event_id
+                    and not bool(group.get("component_ambiguous"))
                 ):
                     return self.review_auto_candidate(
                         candidate_id_for_group(group),
@@ -11861,6 +12313,13 @@ class AppData:
             "collision_risk_high",
             "low_quality_scan_window",
             "nearest_event_gap_sec",
+            "calibration_complex_id",
+            "calibration_complex_size",
+            "calibration_complex_representative",
+            "calibration_evidence_role",
+            "calibration_auto_eligible",
+            "calibration_evidence_strength",
+            "calibration_review_reason",
             "array_length_apex",
             "in_cell_event_map",
         ]
@@ -14269,19 +14728,20 @@ HTML = r"""<!doctype html>
         && target.closest('input, textarea, select, [contenteditable="true"]')
       ) return;
       const key = String(ev.key || '').toLowerCase();
-      if (key === 's' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+      const noModifier = !ev.ctrlKey && !ev.metaKey && !ev.altKey;
+      if (key === 's' && noModifier) {
         ev.preventDefault();
         toggleManualMode();
         showInteractionHint(state.manualMode ? 'Select peaks on' : 'Select peaks off');
         return;
       }
-      const savePairShortcut = (key === 'a' || key === 'd')
-        && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
-      if (!savePairShortcut) return;
-      if (
-        state.stage !== 'event_annotation'
-        || state.manualAnnotationKind !== 'cell'
-      ) return;
+      const cellMode = state.stage === 'event_annotation'
+        && state.manualAnnotationKind === 'cell';
+      const anchorMode = state.stage === 'qc_calibration'
+        || (state.stage === 'event_annotation' && state.manualAnnotationKind === 'qc');
+      const savePairShortcut = (key === 'a' || key === 'd') && noModifier && cellMode;
+      const saveAnchorShortcut = key === 'f' && noModifier && anchorMode;
+      if (!savePairShortcut && !saveAnchorShortcut) return;
       ev.preventDefault();
       if (!state.manualMode) {
         showInteractionHint('请先开启 Select peaks');
@@ -15668,10 +16128,12 @@ HTML = r"""<!doctype html>
       el('manualLifRow').style.display = cellMode ? 'block' : 'none';
       el('manualPanelTitle').textContent = eventAnnotation ? '手动事件关系' : '手动参考峰关系';
       el('createManual').textContent = cellMode ? 'Save pair' : 'Save anchor';
+      el('createManual').setAttribute('aria-keyshortcuts', cellMode ? 'A' : 'F');
+      el('createManual').title = cellMode ? 'Shortcut: A' : 'Shortcut: F';
       el('createManualPending').style.display = cellMode ? 'block' : 'none';
       el('manualShortcutHint').innerHTML = cellMode
         ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">A Save pair</span><span class="shortcut-line">D Save pending</span>'
-        : '<span class="shortcut-line">Key: S Select</span>';
+        : '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">F Save anchor</span>';
       el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
@@ -15877,8 +16339,15 @@ HTML = r"""<!doctype html>
     }
 
     async function previewQcAlignmentRefit() {
-      if (state.actionBusy) return;
+      if (state.actionBusy) {
+        showInteractionHint('正在完成上一项操作，请稍候');
+        return;
+      }
+      const button = el('previewQcRefit');
+      const oldText = button.textContent;
       state.actionBusy = true;
+      button.textContent = '正在计算…';
+      button.setAttribute('aria-busy', 'true');
       renderQcRefitPanel();
       try {
         const result = await postJson('/api/qc-alignment-refit-preview', {});
@@ -15890,6 +16359,8 @@ HTML = r"""<!doctype html>
         alert(`参考峰时间校正预览失败：${err.message}`);
       } finally {
         state.actionBusy = false;
+        button.textContent = oldText;
+        button.removeAttribute('aria-busy');
         renderQcRefitPanel();
       }
     }
@@ -16026,10 +16497,12 @@ HTML = r"""<!doctype html>
     function contextActions(row) {
       if (state.stage === 'qc_calibration' && !calibrationBoundariesConfirmed()) return [];
       if (!row || row.review_enabled === false || row.source === 'preview') return [];
-      const actions = [
-        { action: 'accepted', label: '接受' },
-        { action: 'rejected', label: '拒绝' }
-      ];
+      const ambiguousCalibrationMs = state.stage === 'qc_calibration'
+        && row.source === 'auto_candidate'
+        && row.component_ambiguous === true;
+      const actions = [];
+      if (!ambiguousCalibrationMs) actions.push({ action: 'accepted', label: '接受' });
+      actions.push({ action: 'rejected', label: '拒绝' });
       if (row.source === 'auto_candidate') actions.push({ action: 'pending', label: '待审' });
       if (row.source === 'manual_created') actions.push({ action: 'clear_manual', label: '清除' });
       return actions;
@@ -16129,9 +16602,22 @@ HTML = r"""<!doctype html>
         const deviation = decisionDeviationSec(row);
         const canReview = row.review_enabled !== false && row.source !== 'preview';
         const displayStatus = row.review_enabled === false && row.review_status === 'pending' ? 'preview' : row.review_status;
-        const reviewNote = candidateNeedsIndividualReview(row) ? ' · 需逐条审核' : '';
+        const ambiguousCalibrationMs = state.stage === 'qc_calibration'
+          && row.source === 'auto_candidate'
+          && row.component_ambiguous === true;
+        const alternativeMsTimes = [row.ms_time_min, ...(row.alternative_ms_event_times_min || [])]
+          .map(Number)
+          .filter(Number.isFinite)
+          .filter((value, index, values) => values.findIndex(other => Math.abs(other - value) < 1e-9) === index)
+          .sort((left, right) => left - right);
+        const ambiguityNote = ambiguousCalibrationMs
+          ? `多个可信 MS 峰：${alternativeMsTimes.map(value => fmt(value, 3)).join(', ')} min；请使用 Select peaks 人工选择`
+          : '';
+        const reviewNote = ambiguousCalibrationMs
+          ? ''
+          : candidateNeedsIndividualReview(row) ? ' · 需逐条审核' : '';
         const actions = canReview ? `
-              <button data-action="accepted" data-id="${escapeText(id)}">接受</button>
+              ${ambiguousCalibrationMs ? '' : `<button data-action="accepted" data-id="${escapeText(id)}">接受</button>`}
               <button data-action="rejected" data-id="${escapeText(id)}">拒绝</button>
               ${row.source === 'auto_candidate' ? `<button data-action="pending" data-id="${escapeText(id)}">待审</button>` : ''}
               ${row.source === 'manual_created' ? `<button data-action="clear_manual" data-id="${escapeText(id)}">清除</button>` : ''}
@@ -16139,7 +16625,7 @@ HTML = r"""<!doctype html>
         return `
           <div class="candidate-row${selected}${rejected}" data-candidate-id="${escapeText(id)}">
             <div class="row-title"><span>${escapeText(sourceText(row.source))} #${escapeText(row.rank ?? '')}</span><span>${escapeText(statusText(displayStatus))}</span></div>
-            <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}</div>
+            <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}${ambiguityNote ? `<br>${escapeText(ambiguityNote)}` : ''}</div>
             <div class="row-actions">${actions}</div>
           </div>
         `;
@@ -16245,6 +16731,7 @@ HTML = r"""<!doctype html>
         alert(`审核写入失败: ${err.message}`);
       } finally {
         state.actionBusy = false;
+        renderQcRefitPanel();
       }
     }
 
@@ -16265,6 +16752,7 @@ HTML = r"""<!doctype html>
         alert(`清除失败: ${err.message}`);
       } finally {
         state.actionBusy = false;
+        renderQcRefitPanel();
       }
     }
 
@@ -16569,6 +17057,7 @@ HTML = r"""<!doctype html>
         alert(`批量接受失败: ${err.message}`);
       } finally {
         state.actionBusy = false;
+        renderQcRefitPanel();
       }
     }
 
@@ -16679,6 +17168,7 @@ HTML = r"""<!doctype html>
           alert(`手动细胞二元组写入失败: ${err.message}`);
         } finally {
           state.actionBusy = false;
+          renderQcRefitPanel();
         }
         return;
       }
@@ -16725,6 +17215,7 @@ HTML = r"""<!doctype html>
         alert(`手动参考峰关系保存失败：${err.message}`);
       } finally {
         state.actionBusy = false;
+        renderQcRefitPanel();
       }
     }
 
@@ -16796,13 +17287,83 @@ HTML = r"""<!doctype html>
     function updatePeakLabelPolicyText() {
       const policy = el('windowPolicy');
       if (!policy) return;
+      const calibrationNote = state.stage === 'qc_calibration'
+        ? '；Calibration：橙框 candidate，深框 eligible，空心 review-only，灰点 secondary'
+        : '';
       if (state.peakLabelMode === 'hidden') {
-        policy.textContent = '峰圆点全部保留；时间数字已隐藏，悬停任意圆点可查看精确原始时间(min)';
+        policy.textContent = `峰圆点全部保留；时间数字已隐藏，悬停任意圆点可查看精确原始时间(min)${calibrationNote}`;
       } else if (state.peakLabelMode === 'all') {
-        policy.textContent = '正在尽量显示全部峰时间，高密度窗口可能拥挤；悬停圆点可查看精确信息';
+        policy.textContent = `正在尽量显示全部峰时间，高密度窗口可能拥挤；悬停圆点可查看精确信息${calibrationNote}`;
       } else {
-        policy.textContent = '峰圆点全部保留；每个时间分区只标注一个显著峰，悬停任意圆点可查看精确原始时间(min)';
+        policy.textContent = `峰圆点全部保留；每个时间分区只标注一个显著峰，悬停任意圆点可查看精确原始时间(min)${calibrationNote}`;
       }
+    }
+
+    function msEventMarkerPolicy(row, trace, candidateEventIds = new Set()) {
+      // Events are called from PC34/MS760.  Drawing the same event row as a
+      // QC782 peak claims evidence that does not exist, so QC782 remains a raw
+      // support trace with no synthetic peak markers.
+      if (trace === 'qc_782_linear') return { visible: false, labelEligible: false };
+      if (state.stage !== 'qc_calibration') {
+        const risk = row.low_quality_scan_window || row.collision_risk_high;
+        return {
+          role: 'event',
+          visible: true,
+          labelEligible: true,
+          secondary_local_maximum: false,
+          radius: risk ? 4.7 : 3.5,
+          fill: SIGNAL_COLORS.ms760,
+          stroke: risk ? '#b42318' : '#ffffff',
+          strokeWidth: 1.3,
+          opacity: 1.0
+        };
+      }
+
+      const secondary = row.calibration_evidence_role === 'secondary_local_maximum';
+      if (secondary) {
+        return {
+          role: 'secondary',
+          visible: true,
+          labelEligible: false,
+          secondary_local_maximum: true,
+          radius: 3.5,
+          fill: '#667085',
+          stroke: '#344054',
+          strokeWidth: 1.2,
+          opacity: 0.80
+        };
+      }
+
+      const hasEligibility = typeof row.calibration_auto_eligible === 'boolean';
+      const autoEligible = hasEligibility ? row.calibration_auto_eligible : true;
+      const complexRepresentative = row.calibration_complex_representative === true;
+      if (!autoEligible) {
+        return {
+          role: 'review_only',
+          visible: true,
+          labelEligible: false,
+          secondary_local_maximum: false,
+          radius: 3.6,
+          fill: '#ffffff',
+          stroke: '#667085',
+          strokeWidth: 1.6,
+          opacity: 0.90
+        };
+      }
+
+      const candidate = candidateEventIds.has(String(row.event_id));
+      return {
+        role: candidate ? 'candidate' : 'eligible_unmatched',
+        complex_representative: complexRepresentative,
+        visible: true,
+        labelEligible: true,
+        secondary_local_maximum: false,
+        radius: candidate ? 4.5 : 3.8,
+        fill: SIGNAL_COLORS.ms760,
+        stroke: candidate ? '#d97706' : '#334155',
+        strokeWidth: candidate ? 2.0 : 1.2,
+        opacity: candidate ? 1.0 : 0.88
+      };
     }
 
     function draw() {
@@ -16825,6 +17386,15 @@ HTML = r"""<!doctype html>
       const end = state.current.end_min;
       const xScale = (x) => x0 + ((x - start) / (end - start)) * plotW;
       const contextMarginMin = Math.max(0, Number(state.current.context_margin_min || 0));
+      const calibrationCandidateEventIds = new Set(
+        (state.current.alignment_groups || [])
+          .filter(group => (
+            group.review_status !== 'rejected'
+            && (group.review_status === 'accepted' || !group.component_ambiguous)
+          ))
+          .map(group => String(group.ms_event_id || ''))
+          .filter(Boolean)
+      );
       const contextPadPx = Math.min(86, (contextMarginMin / Math.max(1e-6, end - start)) * plotW);
       const amplitudeLabelX = x0 - contextPadPx - 16;
       const markerPositions = {};
@@ -17022,7 +17592,10 @@ HTML = r"""<!doctype html>
             || !state.meta?.cell_event_map?.available
             || e.in_cell_event_map === true;
           const labelIds = automaticPeakLabelIds(
-            state.current.ms_events.filter(eventIsInteractive),
+            state.current.ms_events.filter(e => {
+              const policy = msEventMarkerPolicy(e, track.trace, calibrationCandidateEventIds);
+              return eventIsInteractive(e) && policy.visible && policy.labelEligible;
+            }),
             e => e.event_id,
             e => e.plot_time_min,
             e => track.trace === 'pc34_760_linear' ? e.pc34_760_apex : e.qc_782_apex,
@@ -17031,23 +17604,26 @@ HTML = r"""<!doctype html>
             plotW
           );
           state.current.ms_events.forEach(e => {
+            const markerPolicy = msEventMarkerPolicy(e, track.trace, calibrationCandidateEventIds);
+            if (!markerPolicy.visible) return;
             const raw = track.trace === 'pc34_760_linear' ? e.pc34_760_apex : e.qc_782_apex;
             const y = Math.max(0, Number(raw || 0));
             const interactive = eventIsInteractive(e);
             const c = svgEl('circle', {
               cx: xScale(e.plot_time_min),
               cy: yScale(y),
-              r: e.low_quality_scan_window || e.collision_risk_high ? 4.7 : 3.5,
-              fill: track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782,
-              stroke: e.low_quality_scan_window || e.collision_risk_high ? '#b42318' : '#fff',
-              'stroke-width': 1.3,
+              r: markerPolicy.radius,
+              fill: markerPolicy.fill,
+              stroke: markerPolicy.stroke,
+              'stroke-width': markerPolicy.strokeWidth,
+              opacity: markerPolicy.opacity,
               class: 'peak-marker'
             });
             if (interactive) {
               c.setAttribute('tabindex', '0');
               c.__detail = {
                 kind: track.trace === 'pc34_760_linear' ? 'ms760_peak' : 'ms782_peak',
-                type: track.trace === 'pc34_760_linear' ? 'MS 760 峰' : 'MS 782 峰',
+                type: markerPolicy.secondary_local_maximum ? 'MS 760 峰簇内次级极大值' : 'MS 760 峰',
                 data: e
               };
               attachHover(c);
@@ -17060,7 +17636,7 @@ HTML = r"""<!doctype html>
                 });
               }
             } else {
-              c.setAttribute('opacity', '.38');
+              c.setAttribute('opacity', String(Math.min(Number(markerPolicy.opacity || 1), .38)));
               c.setAttribute('tabindex', '0');
               c.setAttribute('cursor', 'help');
               c.__detail = {
@@ -17169,6 +17745,14 @@ HTML = r"""<!doctype html>
       if (state.current.time_mode !== 'aligned') return;
       (state.current.alignment_groups || []).forEach(group => {
         if (group.review_status === 'rejected') return;
+        const alternatives = Array.isArray(group.alternative_ms_event_ids)
+          ? group.alternative_ms_event_ids
+          : [];
+        const ambiguous = group.component_ambiguous === true || alternatives.length > 0;
+        // Pending evidence with multiple equally credible MS peaks must not be
+        // rendered as one decisive connector. The candidate card remains for
+        // audit, while the user can select the intended peaks manually.
+        if (ambiguous && group.review_status !== 'accepted') return;
         const markerGroup = qcAnchorMarkerPoints(group, markerPositions);
         const lineStyle = candidateLineStyle(group);
         appendQcConnectorPolyline(svg, markerGroup, group, { kind: 'qc_candidate', type: 'QC 候选', data: group }, lineStyle, () => {
@@ -17456,6 +18040,12 @@ HTML = r"""<!doctype html>
         `${detail.type} · ${reviewDetailStatus(row)}`,
         deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`
       ];
+      if (state.stage === 'qc_calibration' && row.component_ambiguous === true) {
+        const alternatives = [row.ms_time_min, ...(row.alternative_ms_event_times_min || [])]
+          .map(Number).filter(Number.isFinite).sort((left, right) => left - right);
+        lines.push(`多个可信 MS 峰：${alternatives.map(value => fmt(value, 3)).join(', ')} min`);
+        lines.push('请使用 Select peaks 人工选择');
+      }
       if (row.review_status === 'pending') {
         const reason = candidateBatchBlockReason(row);
         if (reason && reason !== 'outside_main_window') lines.push(`需逐条审核：${batchBlockText(reason, row)}`);
@@ -17491,10 +18081,24 @@ HTML = r"""<!doctype html>
       }
       const isMs760 = detail.kind === 'ms760_peak';
       const intensity = isMs760 ? d.pc34_760_apex : d.qc_782_apex;
+      const calibrationRole = String(d.calibration_evidence_role || '');
+      const calibrationReviewReason = String(d.calibration_review_reason || '');
+      const calibrationEvidence = calibrationRole === 'secondary_local_maximum'
+        ? '同一未分辨峰簇内的次级极大值，不参与自动校准'
+        : calibrationReviewReason === 'near_background'
+          ? '近背景 core：仅供人工复核，不参与自动校准'
+          : calibrationReviewReason === 'low_quality_scan_window'
+            ? '局部信号质量不足：仅供人工复核，不参与自动校准'
+            : d.calibration_auto_eligible === true
+              ? '满足自动校准证据门槛'
+        : calibrationRole === 'representative' && Number(d.calibration_complex_size || 0) > 1
+          ? `密集峰簇代表（${Number(d.calibration_complex_size)} 个局部极大值）`
+          : '';
       return [
         detail.type,
         `${fmtMaybe(d.raw_time_min ?? d.time_min, 3)} min`,
         Number.isFinite(Number(intensity)) ? `强度 ${fmt(intensity, 1)}` : '',
+        calibrationEvidence,
         d.collision_risk_high || d.low_quality_scan_window ? '相邻事件或信号质量需注意' : ''
       ].filter(Boolean).join('\n');
     }
