@@ -689,6 +689,9 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
     quiet_localmax_p75 = (
         float(quiet_peaks.quantile(0.75)) if not quiet_peaks.empty else 0.0
     )
+    quiet_localmax_p90 = (
+        float(quiet_peaks.quantile(0.90)) if not quiet_peaks.empty else 0.0
+    )
     quiet_localmax_p99 = float(quiet_peaks.quantile(0.99))
     quiet_mad_sigma = float(1.4826 * np.median(np.abs(quiet_scans - quiet_scans.median())))
     quiet_zero_fraction = float(
@@ -708,6 +711,9 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
     roster_support_height = np.nan
     roster_support_prominence = np.nan
     roster_support_model = "core_only"
+    roster_review_height = np.nan
+    roster_review_prominence = np.nan
+    roster_review_model = "core_only"
     if pc34_signal:
         # Cell events are sparse positive impulses on a continuously sampled
         # background.  The former q99/q99 rule let even a small number of real
@@ -792,6 +798,26 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
                 peak_prominence_zero_inflated_shoulder_candidate,
             )
             roster_support_model = "zero_inflated_height_and_shoulder_gate"
+            # The independently supplied event roster is a second source of
+            # evidence, but it must never lower the automatic/core caller.
+            # For manual review only, admit an exact, resolved local maximum
+            # above 90% of the maxima measured in the selected quiet
+            # background.  The independent prominence and peak-distance
+            # gates still apply.  This gives the review tier a directly
+            # interpretable background false-positive bound without fitting
+            # a threshold to the number of rows in the roster.
+            if (
+                np.isfinite(quiet_localmax_p90)
+                and quiet_localmax_p90 > np.finfo(float).eps
+            ):
+                roster_review_height = min(
+                    float(roster_support_height),
+                    float(quiet_localmax_p90),
+                )
+                roster_review_prominence = float(roster_support_prominence)
+                roster_review_model = (
+                    "zero_inflated_upper_decile_and_shoulder_gate"
+                )
     else:
         quiet_median = float(quiet_scans.median())
         localmax_excess_p99 = max(0.0, quiet_localmax_p99 - quiet_median)
@@ -843,6 +869,22 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
             float(roster_support_prominence),
             float(prominence),
         )
+    if not np.isfinite(roster_review_height):
+        roster_review_height = float(roster_support_height)
+    else:
+        roster_review_height = min(
+            float(roster_review_height),
+            float(roster_support_height),
+        )
+    if not np.isfinite(roster_review_prominence):
+        roster_review_prominence = float(roster_support_prominence)
+    else:
+        roster_review_prominence = min(
+            float(roster_review_prominence),
+            float(roster_support_prominence),
+        )
+    if roster_review_model == "core_only":
+        roster_review_model = str(roster_support_model)
     prelim_distance_points = 2 if pc34_signal else 3
     prelim_idx, _ = find_peaks(
         y,
@@ -872,6 +914,7 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         "quiet_scan_p90": quiet_scan_p90,
         "quiet_scan_p99": quiet_scan_p99,
         "quiet_localmax_p75": quiet_localmax_p75,
+        "quiet_localmax_p90": quiet_localmax_p90,
         "quiet_localmax_p25": quiet_localmax_p25,
         "quiet_localmax_iqr": quiet_localmax_iqr,
         "quiet_localmax_p99": quiet_localmax_p99,
@@ -892,6 +935,9 @@ def estimate_parameters(scan: pd.DataFrame, signal_col: str, bin_summary: pd.Dat
         "event_roster_support_height": roster_support_height,
         "event_roster_support_prominence": roster_support_prominence,
         "event_roster_support_model": roster_support_model,
+        "event_roster_review_height": roster_review_height,
+        "event_roster_review_prominence": roster_review_prominence,
+        "event_roster_review_model": roster_review_model,
         "threshold_fallback_reason": threshold_fallback_reason,
         "signal_max": signal_max,
         "preliminary_peak_count": int(len(prelim_idx)),

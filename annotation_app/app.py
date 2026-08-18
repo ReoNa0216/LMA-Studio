@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.9"
+APP_VERSION = "lma_studio_v0.4.10"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -2620,7 +2620,18 @@ def remove_staging_project(staging_dir: Path, intended_parent: Path) -> None:
     if ".lma-building-" not in staging_dir.name or staging_dir == intended_parent:
         raise RuntimeError("Refusing to remove a directory that is not an LMA staging project")
     if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+        def ignore_disappeared_entry(_function, _path, exc_info) -> None:
+            error = exc_info[1]
+            # macOS represents extended attributes as transient ``._*``
+            # AppleDouble files on some external filesystems. A sidecar can
+            # vanish between scandir() and unlink(); the requested cleanup is
+            # already satisfied in that case. Every other error remains fatal
+            # so permissions and real filesystem damage stay visible.
+            if isinstance(error, FileNotFoundError):
+                return
+            raise error.with_traceback(exc_info[2])
+
+        shutil.rmtree(staging_dir, onerror=ignore_disappeared_entry)
 
 
 def commit_staging_project(
@@ -7275,6 +7286,17 @@ def reconcile_event_roster_supported_ms_events(
                     lane_params.get("peak_prominence", math.inf),
                 )
             )
+            review_height = float(
+                lane_params.get("event_roster_review_height", support_height)
+            )
+            review_prominence = float(
+                lane_params.get(
+                    "event_roster_review_prominence", support_prominence
+                )
+            )
+            review_model = str(
+                lane_params.get("event_roster_review_model") or support_model
+            )
             core_height = float(lane_params.get("peak_height", math.inf))
             core_prominence = float(lane_params.get("peak_prominence", math.inf))
             support_gate_active = (
@@ -7290,13 +7312,25 @@ def reconcile_event_roster_supported_ms_events(
             if not support_gate_active:
                 continue
             support_call_params = dict(lane_params)
-            support_call_params["peak_height"] = support_height
-            support_call_params["peak_prominence"] = support_prominence
+            review_gate_active = (
+                review_model
+                == "zero_inflated_upper_decile_and_shoulder_gate"
+                and math.isfinite(review_height)
+                and math.isfinite(review_prominence)
+                and review_height <= support_height + 1e-12
+                and review_prominence <= support_prominence + 1e-12
+            )
+            call_height = review_height if review_gate_active else support_height
+            call_prominence = (
+                review_prominence if review_gate_active else support_prominence
+            )
+            support_call_params["peak_height"] = call_height
+            support_call_params["peak_prominence"] = call_prominence
             support_indices = ms_qc.call_peak_indices(
                 scan,
                 support_signal_col,
-                support_height,
-                support_prominence,
+                call_height,
+                call_prominence,
                 float(lane_params["min_distance_sec"]),
                 dt_sec,
             )
@@ -7334,9 +7368,15 @@ def reconcile_event_roster_supported_ms_events(
             lane_events["event_roster_support_height"] = support_height
             lane_events["event_roster_support_prominence"] = support_prominence
             lane_events["event_roster_support_model"] = support_model
+            lane_events["event_roster_review_height"] = call_height
+            lane_events["event_roster_review_prominence"] = call_prominence
+            lane_events["event_roster_review_model"] = review_model
             lane_events["event_tier"] = "roster_supported"
-            lane_events["selection_reason"] = (
-                "event_roster_time_plus_robust_ms_peak"
+            lane_events["selection_reason"] = np.where(
+                pd.to_numeric(lane_events["apex_intensity"], errors="coerce")
+                >= support_height - 1e-12,
+                "event_roster_time_plus_robust_ms_peak",
+                "event_roster_time_plus_upper_decile_resolved_peak",
             )
             lane_events = lane_events.sort_values(
                 ["time_min", "scan_id"], kind="stable"
@@ -7442,6 +7482,9 @@ def reconcile_event_roster_supported_ms_events(
             "event_roster_support_model": str(
                 support_params.get("event_roster_support_model") or "core_only"
             ),
+            "event_roster_review_model": str(
+                support_params.get("event_roster_review_model") or "core_only"
+            ),
             "event_roster_support_tolerance_ppm": float(
                 ms_qc.EVENT_ROSTER_SUPPORT_TOLERANCE_PPM
                 if ms_qc.EVENT_ROSTER_SUPPORT_SIGNAL_COLUMN in ms_scan.columns
@@ -7452,6 +7495,8 @@ def reconcile_event_roster_supported_ms_events(
     for key in (
         "event_roster_support_height",
         "event_roster_support_prominence",
+        "event_roster_review_height",
+        "event_roster_review_prominence",
     ):
         value = support_params.get(key)
         if value is not None and math.isfinite(float(value)):
@@ -7468,9 +7513,13 @@ def reconcile_event_roster_supported_ms_events(
         "pc34_760_ppm_error_at_apex",
         "roster_support_signal_col",
         "roster_support_tolerance_ppm",
+        "selection_reason",
         "event_roster_support_height",
         "event_roster_support_prominence",
         "event_roster_support_model",
+        "event_roster_review_height",
+        "event_roster_review_prominence",
+        "event_roster_review_model",
     ]
     if selected_support.empty:
         audit = pd.DataFrame(columns=audit_columns)
@@ -7487,9 +7536,13 @@ def reconcile_event_roster_supported_ms_events(
                 "pc34_760_ppm_error_at_apex",
                 "roster_support_signal_col",
                 "roster_support_tolerance_ppm",
+                "selection_reason",
                 "event_roster_support_height",
                 "event_roster_support_prominence",
                 "event_roster_support_model",
+                "event_roster_review_height",
+                "event_roster_review_prominence",
+                "event_roster_review_model",
             ]
         ].copy()
         audit.insert(
@@ -7504,6 +7557,9 @@ def reconcile_event_roster_supported_ms_events(
             "event_roster_support_height",
             "event_roster_support_prominence",
             "event_roster_support_model",
+            "event_roster_review_height",
+            "event_roster_review_prominence",
+            "event_roster_review_model",
         ):
             if key not in audit.columns:
                 audit[key] = metadata.get(key)
@@ -8741,17 +8797,30 @@ class AppData:
                 )
                 published = True
                 return cls.load(ProjectPaths.for_new_project(project_dir))
-            except Exception:
+            except Exception as creation_error:
+                cleanup_errors: list[str] = []
                 if staging_dir.exists():
-                    remove_staging_project(staging_dir, intended_parent)
+                    try:
+                        remove_staging_project(staging_dir, intended_parent)
+                    except Exception as cleanup_error:
+                        cleanup_errors.append(
+                            f"staging cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                        )
                 if published and project_dir.exists():
-                    rollback_dir = intended_parent / (
-                        f".{project_dir.name}.lma-building-rollback-{uuid.uuid4().hex}"
-                    )
-                    os.replace(project_dir, rollback_dir)
-                    remove_staging_project(rollback_dir, intended_parent)
-                    if target_preexisted:
-                        project_dir.mkdir(parents=False, exist_ok=False)
+                    try:
+                        rollback_dir = intended_parent / (
+                            f".{project_dir.name}.lma-building-rollback-{uuid.uuid4().hex}"
+                        )
+                        os.replace(project_dir, rollback_dir)
+                        remove_staging_project(rollback_dir, intended_parent)
+                        if target_preexisted:
+                            project_dir.mkdir(parents=False, exist_ok=False)
+                    except Exception as cleanup_error:
+                        cleanup_errors.append(
+                            f"published-project rollback failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                for cleanup_message in cleanup_errors:
+                    creation_error.add_note(cleanup_message)
                 raise
         existing_outputs = [
             project_dir / CANONICAL_TABLE_PATHS["lif_traces"],

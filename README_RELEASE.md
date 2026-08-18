@@ -1,21 +1,21 @@
-# LMA Studio v0.4.9 Release Notes
+# LMA Studio v0.4.10 Release Notes
 
 LMA Studio is a local desktop application for project-based, human-assisted LIF-MS annotation review.
 
 ## Downloads
 
-- `LMA-Studio-v0.4.9-windows-x64.zip`: Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
-- `LMA-Studio-v0.4.9-macos-arm64.zip`: Apple Silicon build. Open `LMA Studio.app`.
+- `LMA-Studio-v0.4.10-windows-x64.zip`: Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
+- `LMA-Studio-v0.4.10-macos-arm64.zip`: Apple Silicon build. Open `LMA Studio.app`.
 - Matching `.sha256` files are provided for integrity verification.
 
 The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. On first launch, macOS may require Control-clicking the app and choosing **Open**.
 
-## What changed in v0.4.9
+## What changed in v0.4.10
 
-- Press `D` in `Events > Cell pair` to run `Save pending`. Pending relations remain reviewable in SQLite/Track but do not classify UMAP points, enter the main CSV, reserve an MS event, or train a model until accepted.
-- The compact left-hand workflow is now `S` for `Select peaks`, `A` for `Save pair`, and `D` for `Save pending`. Form fields, modals, bootstrap, modifier-key combinations, key repeats, and busy states remain protected from shortcut activation.
-- Track and UMAP now consume one shared high-contrast signal palette. Accepted UMAP cell colors therefore exactly match their G1/G2/R1/R2 Track identities, while unknown and QC state colors remain separate.
-- The new palette also separates MS760 and MS782 more clearly from the LIF channels. It is presentation-only: no manifest, SQLite, time-model, candidate, peak-calling, event-map, or CSV schema changes are required.
+- macOS staging cleanup now tolerates an AppleDouble `._*` sidecar that disappears while an incomplete project is being removed. Cleanup can no longer replace the real import error with a misleading `._input_manifest.csv` error.
+- Zero-inflated MS traces retain the unchanged conservative core caller and strong roster-support fence. For an independently supplied event-list time only, a second manual-review gate may retain an exact, resolved MS760 local maximum above the 90th percentile of quiet-background maxima. It remains excluded from automatic calibration, time-difference estimation, QC, automatic Cell candidates, and model training.
+- Project manifests and the roster-support audit record both strong and upper-decile review thresholds and the reason used for each retained review event.
+- CAR-T Myr, Ctr–Myr–Bez, Ctr, and Bez raw inputs were exercised end to end with 700, 691, 625, and 1100 event-list rows respectively; every row resolved one-to-one without changing the core caller.
 
 ## Retained interaction behavior
 
@@ -26,7 +26,7 @@ The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. 
 
 ## Compatibility
 
-- Existing formal v0.4.0-v0.4.8 projects using the current adaptive two-tier LIF peak standard open from their manifest paths without migration or preprocessing reruns. Existing candidates, annotations, pending reviews, frozen models, and directory layouts remain intact.
+- Existing formal v0.4.0-v0.4.9 projects using the current adaptive two-tier LIF peak standard open from their manifest paths without migration or preprocessing reruns. Existing candidates, annotations, pending reviews, frozen models, and directory layouts remain intact.
 - Opening an existing project never reruns the MS caller. The project continues to use its manifest-bound peak and event tables.
 - Projects made with the retired fixed-threshold peak standard remain intentionally rejected before writes. Rebuild those projects in a new empty directory from the original LIF/MS/event-list inputs.
 - Close LMA Studio before copying or compressing a project, and share the complete project root rather than individual parquet, SQLite, or coordinate files.
@@ -34,7 +34,7 @@ The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. 
 ## Validation
 
 - Focused interaction tests cover accepted/pending shortcut guards and discoverability, the shared Track/UMAP palette, UMAP time lookup without view mutation, Track-to-UMAP event identity, and the native-window message handshake.
-- The user-accepted Windows candidate and release source passed 382 automated tests (2 platform-conditional skips), JavaScript syntax checks, packaged scientific-binary provenance checks, ABI validation, and the packaged runtime probe before formal publication.
+- The candidate is gated by the automated suite, JavaScript syntax checks, packaged scientific-binary provenance checks, ABI validation, the packaged runtime probe, and four real-data project-creation checks before formal publication.
 - The formal tag workflow binds package names to the source `APP_VERSION`, verifies both platform archives against their SHA256 files, and publishes only after Windows x64 and macOS ARM64 jobs both pass.
 
 ## Data policy

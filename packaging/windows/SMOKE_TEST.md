@@ -1,4 +1,4 @@
-# Windows v0.4.9 Release Smoke Test
+# Windows v0.4.10 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -39,13 +39,14 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4.9 project
+## 3. Create a v0.4.10 project
 
 Create only in a new empty project directory. Configure:
 
 - Two to four distinct LIF raw files and one MS raw file.
 - One automatically configured adaptive two-tier LIF peak standard. The UI must not expose detector version choices or internal configuration keys.
 - One event-list CSV containing `scan_start_time`; `UMAP1` and `UMAP2` are optional but must be supplied together. Unrelated columns are allowed and ignored.
+- On a zero-inflated MS760 trace, verify that an exact roster-time local maximum above the quiet-background upper-decile review bound can be retained for manual Cell pairing, while a lower noise maximum remains in the downloadable unmatched-row report. Neither event may alter the automatic/core event set.
 - Also try a copy with one deliberately unmatched event-list row. Creation must fail atomically, show a row-count summary, and offer `下载逐行诊断 CSV`; the downloaded report must identify the failing CSV line without copying `Type`, `batch`, or `CellNumber`, and the target project directory must remain absent.
 - For every LIF channel: channel name, signal color, scientific identity/sample label, and cell-annotation role. The shared acquisition-time group is assigned automatically from the signal color.
 - One or more ordered front calibration segments, each with a population label, reference channel set, editable `start_min / end_min`, and explicit `边界已确认` checkbox.
