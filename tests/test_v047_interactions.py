@@ -14,7 +14,7 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V047InteractionContractTest(unittest.TestCase):
     def test_manual_shortcuts_are_discoverable_and_guarded(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.9")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.10")
         self.assertIn('aria-keyshortcuts="S"', HTML)
         self.assertIn('aria-keyshortcuts="A"', HTML)
         self.assertIn("Keys: S Select", HTML)
@@ -23,6 +23,11 @@ class V047InteractionContractTest(unittest.TestCase):
             "Keys: S Select</span><span class=\"shortcut-line\">A Save pair",
             HTML,
         )
+        self.assertIn(
+            "Keys: S Select</span><span class=\"shortcut-line\">F Save anchor",
+            HTML,
+        )
+        self.assertIn("setAttribute('aria-keyshortcuts', cellMode ? 'A' : 'F')", HTML)
         body = function_body(
             HTML,
             "handleManualKeyboardShortcut",
@@ -32,8 +37,11 @@ class V047InteractionContractTest(unittest.TestCase):
         self.assertIn("input, textarea, select", body)
         self.assertIn("toggleManualMode()", body)
         self.assertIn("createManualTriplet('accepted')", body)
-        self.assertIn("state.manualAnnotationKind !== 'cell'", body)
+        self.assertIn("state.manualAnnotationKind === 'cell'", body)
+        self.assertIn("state.manualAnnotationKind === 'qc'", body)
+        self.assertIn("state.stage === 'qc_calibration'", body)
         self.assertIn("key === 'a'", body)
+        self.assertIn("key === 'f'", body)
         self.assertNotIn("ev.key === 'Enter'", body)
         self.assertIn(
             "document.addEventListener('keydown', handleManualKeyboardShortcut)",
@@ -74,6 +82,26 @@ class V047InteractionContractTest(unittest.TestCase):
         self.assertNotIn("view.ty", umap_body)
         self.assertIn("message.type === 'highlight-event'", UMAP_HTML)
         self.assertIn("type: 'umap-ready'", UMAP_HTML)
+
+    def test_calibration_writes_reenable_the_refit_preview_after_refresh(self):
+        for name, next_name in (
+            ("reviewCandidate", "clearManualAnnotation"),
+            ("clearManualAnnotation", "exportAcceptedCsv"),
+            ("acceptWindowPendingAutoCandidates", "toggleManualMode"),
+            ("createManualTriplet", "setAttrs"),
+        ):
+            with self.subTest(action=name):
+                body = function_body(HTML, name, next_name)
+                released = body.rsplit("state.actionBusy = false", 1)[1]
+                self.assertIn("renderQcRefitPanel();", released)
+
+        preview = function_body(
+            HTML,
+            "previewQcAlignmentRefit",
+            "applyQcAlignmentRefit",
+        )
+        self.assertIn("正在计算", preview)
+        self.assertIn("aria-busy", preview)
 
 
 if __name__ == "__main__":

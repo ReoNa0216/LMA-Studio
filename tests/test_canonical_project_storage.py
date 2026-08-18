@@ -761,6 +761,68 @@ class CanonicalProjectStorageTest(unittest.TestCase):
             )
             self.assertEqual(list(root.glob(".*.lma-building-*")), [])
 
+    def test_staging_cleanup_ignores_disappearing_macos_appledouble_files(self):
+        """External macOS volumes may remove ``._*`` sidecars during rmtree."""
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            parent = Path(tmp)
+            staging = parent / ".cart-project.lma-building-test"
+            provenance = staging / "provenance"
+            provenance.mkdir(parents=True)
+            (provenance / "input_manifest.csv").write_text(
+                "input_id,path\n",
+                encoding="utf-8",
+            )
+            real_rmtree = shutil.rmtree
+
+            def simulate_appledouble_race(path, *, onerror=None):
+                vanished = FileNotFoundError(
+                    2,
+                    "No such file or directory",
+                    "._input_manifest.csv",
+                )
+                self.assertIsNotNone(onerror)
+                onerror(
+                    Path.unlink,
+                    str(Path(path) / "provenance" / "._input_manifest.csv"),
+                    (FileNotFoundError, vanished, None),
+                )
+                real_rmtree(path)
+
+            with mock.patch(
+                "annotation_app.app.shutil.rmtree",
+                side_effect=simulate_appledouble_race,
+            ):
+                app_module.remove_staging_project(staging, parent)
+
+            self.assertFalse(staging.exists())
+
+    def test_staging_cleanup_failure_does_not_mask_the_import_failure(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            request = _new_project_request(root, "preserve_import_failure")
+            hidden_sidecar_error = FileNotFoundError(
+                2,
+                "No such file or directory",
+                "._input_manifest.csv",
+            )
+
+            with mock.patch(
+                "annotation_app.app.run_preprocessing_script",
+                side_effect=RuntimeError("synthetic scientific import failure"),
+            ), mock.patch(
+                "annotation_app.app.remove_staging_project",
+                side_effect=hidden_sidecar_error,
+            ):
+                with self.assertRaisesRegex(
+                    BadRequest,
+                    "synthetic scientific import failure",
+                ) as caught:
+                    AppData.create_project_from_raw_inputs(**request)
+
+            self.assertNotIn("._input_manifest.csv", str(caught.exception))
+            self.assertFalse(request["project_dir"].exists())
+
     def test_post_publish_reopen_failure_rolls_back_the_requested_target(self):
         """The final reopen is part of the atomic project-creation transaction."""
 

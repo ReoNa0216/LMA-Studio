@@ -888,9 +888,14 @@ def cell_event_map_manifest_entry(
     support_model = str(import_metadata.get("event_roster_support_model") or "")
     if support_model:
         entry["event_roster_support_model"] = support_model
+    review_model = str(import_metadata.get("event_roster_review_model") or "")
+    if review_model:
+        entry["event_roster_review_model"] = review_model
     for key in (
         "event_roster_support_height",
         "event_roster_support_prominence",
+        "event_roster_review_height",
+        "event_roster_review_prominence",
     ):
         value = import_metadata.get(key)
         if value is not None and math.isfinite(float(value)):

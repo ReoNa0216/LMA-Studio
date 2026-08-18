@@ -17,7 +17,7 @@ It opens its own native desktop window, lets users create or open project direct
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
 - Keep that event-list gate strict while making failures actionable: if any row is unmatched, ambiguous, or reuses an event, project creation rolls back and the new-project window offers a complete row-level diagnostic CSV without copying identity/author columns.
-- Keep the established automatic MS760 caller on its ±12 ppm core trace. If a whitelist row has no core event, a separately gated ±15 ppm review lane may expose one resolved event for manual Cell pairing only; it never enters automatic calibration, time-difference, QC, or Cell-candidate evidence.
+- Keep the established automatic MS760 caller on its ±12 ppm core trace. If a whitelist row has no core event, a separately gated ±15 ppm review lane may expose an exact resolved peak above the project background's upper-decile review bound for manual Cell pairing only; it never enters automatic calibration, time-difference, QC, or Cell-candidate evidence.
 - Open a separate synchronized UMAP window. Accepted cell colors use the same shared high-contrast channel palette as Track; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations. A different coordinate CSV for the same MS-event population can be validated and imported from project configuration to switch, for example, between pre- and post-batch-correction views without changing annotations or the time model.
 - Export a compact 16-column full event roster intended for downstream cell labeling. Unannotated events use `Type=unknown`; internal hashes, ambiguity payloads, model metadata, and audit details stay in SQLite rather than bloating the CSV.
 - Create new projects with a compact manifest-bound layout: `data/`, `annotations/`, `provenance/`, and `diagnostics/`, without exposing internal pipeline-version directories. Existing v0.4.0 projects retain their original manifest paths and are never auto-migrated.
@@ -27,7 +27,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The current formal release is v0.4.9. Existing v0.4.0-v0.4.8 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
+The current formal desktop release is v0.4.10. Existing v0.4.0-v0.4.9 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
 
 Windows x64:
 
@@ -80,7 +80,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.9 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.10 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload test artifacts and may explicitly publish a public prerelease candidate. Formal GitHub Release publication remains tag-triggered after both desktop release gates pass.

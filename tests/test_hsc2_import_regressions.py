@@ -163,6 +163,39 @@ class Hsc2EventRosterRegressionTest(unittest.TestCase):
         )
         self.assertIn("补充检查", diagnostic["rows"][0]["Reason"])
 
+    def test_roster_review_accepts_an_upper_decile_resolved_peak_below_strong_fence(self):
+        scan = synthetic_zero_inflated_scan()
+        target_index = 1500
+        scan.loc[target_index, "pc34_760_max_intensity"] = 450.0
+        scan.loc[target_index, "pc34_760_roster_support_max_intensity"] = 450.0
+        events, params = core_events(scan)
+        self.assertGreater(params["event_roster_support_height"], 450.0)
+        self.assertNotIn(
+            int(scan.iloc[target_index]["scan_id"]),
+            events["scan_id"].astype(int).tolist(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write_roster(Path(tmp), scan, target_index)
+            reconciled, canonical, metadata, audit = (
+                reconcile_event_roster_supported_ms_events(source, events, scan)
+            )
+
+        added = reconciled[reconciled["event_tier"].eq("roster_supported")]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(int(added.iloc[0]["scan_id"]), int(scan.iloc[target_index]["scan_id"]))
+        self.assertEqual(
+            added["selection_reason"].tolist(),
+            ["event_roster_time_plus_upper_decile_resolved_peak"],
+        )
+        self.assertLess(metadata["event_roster_review_height"], 450.0)
+        self.assertGreater(
+            metadata["event_roster_review_height"],
+            float(scan.iloc[10]["pc34_760_max_intensity"]),
+        )
+        self.assertEqual(canonical["ms_event_id"].tolist(), added["event_id"].tolist())
+        self.assertEqual(audit["selection_reason"].tolist(), added["selection_reason"].tolist())
+
     def test_roster_support_can_rescue_a_real_peak_just_outside_core_mass_window(self):
         scan = synthetic_zero_inflated_scan()
         target_index = 2000

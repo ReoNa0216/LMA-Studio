@@ -27,7 +27,7 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V049ShortcutAndPaletteContractTest(unittest.TestCase):
     def test_d_saves_a_pending_manual_cell_pair(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.9")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.10")
         self.assertIn(
             'id="createManualPending" class="small-button secondary" '
             'style="display:none;" aria-keyshortcuts="D"',
@@ -41,8 +41,9 @@ class V049ShortcutAndPaletteContractTest(unittest.TestCase):
         )
         self.assertIn("key === 'd'", body)
         self.assertIn("createManualTriplet('pending')", body)
-        self.assertIn("state.stage !== 'event_annotation'", body)
-        self.assertIn("state.manualAnnotationKind !== 'cell'", body)
+        self.assertIn("state.stage === 'event_annotation'", body)
+        self.assertIn("state.manualAnnotationKind === 'cell'", body)
+        self.assertIn("savePairShortcut", body)
         self.assertIn("!state.manualMode", body)
 
     def test_track_and_umap_receive_one_shared_signal_palette(self):
