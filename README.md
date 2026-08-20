@@ -27,7 +27,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The current formal desktop release is v0.4.10; the source tree is preparing the v0.4.11 candidate. Existing v0.4.0-v0.4.10 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
+The current formal desktop release is v0.4.11. Existing v0.4.0-v0.4.10 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
 
 Windows x64:
 
@@ -80,7 +80,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.11-rc1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.11 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload test artifacts and may explicitly publish a public prerelease candidate. Formal GitHub Release publication remains tag-triggered after both desktop release gates pass.

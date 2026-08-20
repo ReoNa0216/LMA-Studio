@@ -115,7 +115,10 @@ class V0411ReferenceLineContractTest(unittest.TestCase):
             "drawVerticalGuideOverlay",
             "renderVerticalGuide",
         )
-        self.assertIn("if (!state.verticalGuideEnabled || !geometry) return", body)
+        disabled_branch = body.split("if (!state.verticalGuideEnabled)", 1)[1].split(
+            "return;", 1
+        )[0]
+        self.assertIn("renderVerticalGuide()", disabled_branch)
         self.assertIn("class: 'vertical-guide-line'", body)
         self.assertIn("class: 'vertical-guide-hit'", body)
         self.assertIn("y1: geometry.y0", body)
@@ -134,6 +137,8 @@ class V0411ReferenceLineContractTest(unittest.TestCase):
         disabled_branch = body.split("if (!enabled)", 1)[1].split("return;", 1)[0]
         self.assertIn("line.style.display = 'none'", disabled_branch)
         self.assertIn("hit.style.display = 'none'", disabled_branch)
+        self.assertIn("readout.style.display = enabled ? 'inline-block' : 'none'", body)
+        self.assertIn("readout.textContent = ''", disabled_branch)
 
     def test_pointer_pin_release_and_pixel_nudge_execute_as_one_state_machine(self):
         if shutil.which("node") is None:

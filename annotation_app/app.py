@@ -17463,7 +17463,11 @@ HTML = r"""<!doctype html>
 
     function drawVerticalGuideOverlay(svg) {
       const geometry = state.verticalGuideGeometry;
-      if (!state.verticalGuideEnabled || !geometry) return;
+      if (!geometry) return;
+      if (!state.verticalGuideEnabled) {
+        renderVerticalGuide();
+        return;
+      }
       const line = svgEl('line', {
         class: 'vertical-guide-line',
         x1: geometry.x0,
