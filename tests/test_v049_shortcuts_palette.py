@@ -11,7 +11,7 @@ from annotation_app.umap_page import UMAP_HTML
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_SIGNAL_COLORS = {
     "G1": "#6929C4",
-    "G2": "#8A3800",
+    "G2": "#B28600",
     "R1": "#005D5D",
     "R2": "#9F1853",
     "ms760": "#1192E8",
@@ -27,7 +27,7 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V049ShortcutAndPaletteContractTest(unittest.TestCase):
     def test_d_saves_a_pending_manual_cell_pair(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.10")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.11")
         self.assertIn(
             'id="createManualPending" class="small-button secondary" '
             'style="display:none;" aria-keyshortcuts="D"',

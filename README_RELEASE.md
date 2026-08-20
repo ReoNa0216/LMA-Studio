@@ -1,16 +1,21 @@
-# LMA Studio v0.4.10 Release Notes
+# LMA Studio v0.4.11 Release Notes
 
 LMA Studio is a local desktop application for project-based, human-assisted LIF-MS annotation review.
 
 ## Downloads
 
-- `LMA-Studio-v0.4.10-windows-x64.zip`: Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
-- `LMA-Studio-v0.4.10-macos-arm64.zip`: Apple Silicon build. Open `LMA Studio.app`.
+- `LMA-Studio-v0.4.11-windows-x64.zip`: Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
+- `LMA-Studio-v0.4.11-macos-arm64.zip`: Apple Silicon build. Open `LMA Studio.app`.
 - Matching `.sha256` files are provided for integrity verification.
 
 The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. On first launch, macOS may require Control-clicking the app and choosing **Open**.
 
-## What changed in v0.4.10
+## What changed in v0.4.11
+
+- Track now has an optional cross-track `Reference line`. It follows the pointer across the shared displayed time axis, clicks to a fixed position, releases when clicked again, and supports one-pixel left/right keyboard nudging (`Shift` for ten pixels). It is a display-only aid available in every stage and never changes peaks, candidates, annotations, or time models.
+- G2 now uses a readable golden-yellow color in the one shared Track/UMAP palette, replacing the previous dark orange-brown while leaving all persisted project identities and annotations unchanged.
+
+## Retained v0.4.10 scientific behavior
 
 - Front Calibration now separates close PC34 maxima by their measured local saddle: a return to background or a deep, prominence-supported saddle establishes two independent peaks, while shallow tail ripples remain one unresolved complex. This pairwise rule prevents a chain of small shoulders from swallowing a later resolved peak.
 - A core MS event remains available for inspection and manual work, but automatic Calibration now requires both height and prominence to clear the event caller's own local thresholds by a two-fold margin. This dimensionless rule prevents a nearly exact-time background extremum from stealing an anchor from a clear peak without using dataset-specific absolute intensity cutoffs.
@@ -31,14 +36,14 @@ The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. 
 
 ## Compatibility
 
-- Existing formal v0.4.0-v0.4.9 projects using the current adaptive two-tier LIF peak standard open from their manifest paths without migration or preprocessing reruns. Existing candidates, annotations, pending reviews, frozen models, and directory layouts remain intact.
+- Existing formal v0.4.0-v0.4.10 projects using the current adaptive two-tier LIF peak standard open from their manifest paths without migration or preprocessing reruns. Existing candidates, annotations, pending reviews, frozen models, and directory layouts remain intact.
 - Opening an existing project never reruns the MS caller. The project continues to use its manifest-bound peak and event tables.
 - Projects made with the retired fixed-threshold peak standard remain intentionally rejected before writes. Rebuild those projects in a new empty directory from the original LIF/MS/event-list inputs.
 - Close LMA Studio before copying or compressing a project, and share the complete project root rather than individual parquet, SQLite, or coordinate files.
 
 ## Validation
 
-- Focused interaction tests cover accepted/pending shortcut guards and discoverability, the shared Track/UMAP palette, UMAP time lookup without view mutation, Track-to-UMAP event identity, and the native-window message handshake.
+- Focused interaction tests cover the reference-line move/pin/release/keyboard state machine, protection of peak and connector clicks, shared Track/UMAP palette contrast, accepted/pending shortcut guards, UMAP time lookup without view mutation, Track-to-UMAP event identity, and the native-window message handshake.
 - The candidate is gated by the automated suite, JavaScript syntax checks, packaged scientific-binary provenance checks, ABI validation, the packaged runtime probe, and four real-data project-creation checks before formal publication.
 - The formal tag workflow binds package names to the source `APP_VERSION`, verifies both platform archives against their SHA256 files, and publishes only after Windows x64 and macOS ARM64 jobs both pass.
 
