@@ -17463,7 +17463,7 @@ HTML = r"""<!doctype html>
 
     function drawVerticalGuideOverlay(svg) {
       const geometry = state.verticalGuideGeometry;
-      if (!geometry) return;
+      if (!state.verticalGuideEnabled || !geometry) return;
       const line = svgEl('line', {
         class: 'vertical-guide-line',
         x1: geometry.x0,
@@ -17497,10 +17497,14 @@ HTML = r"""<!doctype html>
       const readout = el('verticalGuideReadout');
       const geometry = state.verticalGuideGeometry;
       const enabled = Boolean(state.verticalGuideEnabled && geometry);
+      const line = svg.querySelector('.vertical-guide-line');
+      const hit = svg.querySelector('.vertical-guide-hit');
       svg.classList.toggle('vertical-guide-active', enabled);
       svg.classList.toggle('vertical-guide-pinned', enabled && state.verticalGuidePinned);
       readout.style.display = enabled ? 'inline-block' : 'none';
       if (!enabled) {
+        if (line) line.style.display = 'none';
+        if (hit) hit.style.display = 'none';
         readout.textContent = '';
         return;
       }
@@ -17508,8 +17512,6 @@ HTML = r"""<!doctype html>
       const visible = Number.isFinite(timeMin)
         && timeMin >= geometry.start
         && timeMin <= geometry.end;
-      const line = svg.querySelector('.vertical-guide-line');
-      const hit = svg.querySelector('.vertical-guide-hit');
       if (!line || !hit) return;
       line.style.display = visible ? '' : 'none';
       hit.style.display = visible ? '' : 'none';

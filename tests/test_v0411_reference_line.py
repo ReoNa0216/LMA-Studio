@@ -115,6 +115,7 @@ class V0411ReferenceLineContractTest(unittest.TestCase):
             "drawVerticalGuideOverlay",
             "renderVerticalGuide",
         )
+        self.assertIn("if (!state.verticalGuideEnabled || !geometry) return", body)
         self.assertIn("class: 'vertical-guide-line'", body)
         self.assertIn("class: 'vertical-guide-hit'", body)
         self.assertIn("y1: geometry.y0", body)
@@ -127,6 +128,12 @@ class V0411ReferenceLineContractTest(unittest.TestCase):
             draw_tail.index("bringPeakLabelsToFront(svg)"),
             draw_tail.index("drawVerticalGuideOverlay(svg)"),
         )
+
+    def test_disabling_reference_line_removes_the_left_edge_artifact(self):
+        body = function_body(HTML, "renderVerticalGuide", "draw")
+        disabled_branch = body.split("if (!enabled)", 1)[1].split("return;", 1)[0]
+        self.assertIn("line.style.display = 'none'", disabled_branch)
+        self.assertIn("hit.style.display = 'none'", disabled_branch)
 
     def test_pointer_pin_release_and_pixel_nudge_execute_as_one_state_machine(self):
         if shutil.which("node") is None:
