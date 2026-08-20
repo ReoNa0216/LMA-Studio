@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.10"
+APP_VERSION = "lma_studio_v0.4.11"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -12732,6 +12732,17 @@ HTML = r"""<!doctype html>
     .plot-controls select {
       min-width: 104px;
     }
+    .vertical-guide-readout {
+      display: none;
+      min-width: 104px;
+      color: #b42318;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    #chart.vertical-guide-active:not(.vertical-guide-pinned) {
+      cursor: crosshair;
+    }
     button, input, select {
       height: 34px;
       border: 1px solid #aab3c2;
@@ -14015,6 +14026,11 @@ HTML = r"""<!doctype html>
           <input id="showWeakLifPeaks" type="checkbox" />
           Weak peaks
         </label>
+        <label class="checkbox-row" style="margin:0; white-space:nowrap;" title="贯通所有通道；点击锁定，再点竖线解除；锁定后用左右键微调">
+          <input id="verticalGuideEnabled" type="checkbox" />
+          Reference line
+        </label>
+        <output id="verticalGuideReadout" class="vertical-guide-readout" aria-label="Reference line time"></output>
         <button id="go">Show</button>
       </div>
       <div class="window-readout">
@@ -14252,6 +14268,11 @@ HTML = r"""<!doctype html>
       showRejected: false,
       showCrossChannelConflicts: false,
       showWeakLifPeaks: false,
+      verticalGuideEnabled: false,
+      verticalGuidePinned: false,
+      verticalGuideTimeMin: null,
+      verticalGuideGeometry: null,
+      verticalGuideWindowKey: null,
       manualMode: false,
       stage: 'qc_calibration',
       eventFilter: 'all',
@@ -17366,6 +17387,146 @@ HTML = r"""<!doctype html>
       };
     }
 
+    function verticalGuideClickBlocked(target) {
+      if (!(target instanceof Element)) return false;
+      if (target.__detail) return true;
+      if (target.closest('.weak-peak-hit-target')) return true;
+      return Boolean(target.closest('[tabindex]'));
+    }
+
+    function verticalGuideTimeFromPointer(ev) {
+      const geometry = state.verticalGuideGeometry;
+      const svg = el('chart');
+      if (!geometry || !svg) return null;
+      const rect = svg.getBoundingClientRect();
+      if (!(rect.width > 0) || !(rect.height > 0)) return null;
+      const svgX = (Number(ev.clientX) - rect.left) * (geometry.width / rect.width);
+      const svgY = (Number(ev.clientY) - rect.top) * (geometry.height / rect.height);
+      if (
+        svgX < geometry.x0 || svgX > geometry.x1
+        || svgY < geometry.y0 || svgY > geometry.y1
+      ) return null;
+      const ratio = (svgX - geometry.x0) / Math.max(1e-9, geometry.x1 - geometry.x0);
+      return geometry.start + ratio * (geometry.end - geometry.start);
+    }
+
+    function handleVerticalGuidePointerMove(ev) {
+      if (!state.verticalGuideEnabled || state.verticalGuidePinned) return;
+      const timeMin = verticalGuideTimeFromPointer(ev);
+      if (!Number.isFinite(timeMin)) return;
+      state.verticalGuideTimeMin = timeMin;
+      renderVerticalGuide();
+    }
+
+    function handleVerticalGuideClick(ev) {
+      if (!state.verticalGuideEnabled) return;
+      const target = ev.target;
+      if (target instanceof Element && target.closest('.vertical-guide-hit')) {
+        if (!state.verticalGuidePinned) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        state.verticalGuidePinned = false;
+        const timeMin = verticalGuideTimeFromPointer(ev);
+        if (Number.isFinite(timeMin)) state.verticalGuideTimeMin = timeMin;
+        renderVerticalGuide();
+        return;
+      }
+      if (state.verticalGuidePinned || verticalGuideClickBlocked(target)) return;
+      const timeMin = verticalGuideTimeFromPointer(ev);
+      if (!Number.isFinite(timeMin)) return;
+      state.verticalGuideTimeMin = timeMin;
+      state.verticalGuidePinned = true;
+      renderVerticalGuide();
+    }
+
+    function handleVerticalGuideKeyboard(ev) {
+      if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+      if (!state.verticalGuideEnabled || !state.verticalGuidePinned || activeModal) return;
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      const target = ev.target;
+      if (
+        target instanceof Element
+        && target.closest('input, textarea, select, button, [contenteditable="true"]')
+      ) return;
+      const geometry = state.verticalGuideGeometry;
+      if (!geometry || !Number.isFinite(state.verticalGuideTimeMin)) return;
+      const renderedPixels = ev.shiftKey ? 10 : 1;
+      const stepMin = ((geometry.end - geometry.start) / Math.max(1, geometry.x1 - geometry.x0)) * renderedPixels;
+      const direction = ev.key === 'ArrowLeft' ? -1 : 1;
+      state.verticalGuideTimeMin = Math.max(
+        geometry.start,
+        Math.min(geometry.end, state.verticalGuideTimeMin + direction * stepMin)
+      );
+      ev.preventDefault();
+      renderVerticalGuide();
+    }
+
+    function drawVerticalGuideOverlay(svg) {
+      const geometry = state.verticalGuideGeometry;
+      if (!geometry) return;
+      const line = svgEl('line', {
+        class: 'vertical-guide-line',
+        x1: geometry.x0,
+        y1: geometry.y0,
+        x2: geometry.x0,
+        y2: geometry.y1,
+        stroke: '#d92d20',
+        'stroke-width': 1.5,
+        'vector-effect': 'non-scaling-stroke',
+        'pointer-events': 'none'
+      });
+      const hit = svgEl('line', {
+        class: 'vertical-guide-hit',
+        x1: geometry.x0,
+        y1: geometry.y0,
+        x2: geometry.x0,
+        y2: geometry.y1,
+        stroke: 'rgba(217,45,32,0.001)',
+        'stroke-width': 14,
+        'vector-effect': 'non-scaling-stroke',
+        'pointer-events': 'stroke',
+        cursor: 'pointer'
+      });
+      svg.appendChild(line);
+      svg.appendChild(hit);
+      renderVerticalGuide();
+    }
+
+    function renderVerticalGuide() {
+      const svg = el('chart');
+      const readout = el('verticalGuideReadout');
+      const geometry = state.verticalGuideGeometry;
+      const enabled = Boolean(state.verticalGuideEnabled && geometry);
+      svg.classList.toggle('vertical-guide-active', enabled);
+      svg.classList.toggle('vertical-guide-pinned', enabled && state.verticalGuidePinned);
+      readout.style.display = enabled ? 'inline-block' : 'none';
+      if (!enabled) {
+        readout.textContent = '';
+        return;
+      }
+      const timeMin = Number(state.verticalGuideTimeMin);
+      const visible = Number.isFinite(timeMin)
+        && timeMin >= geometry.start
+        && timeMin <= geometry.end;
+      const line = svg.querySelector('.vertical-guide-line');
+      const hit = svg.querySelector('.vertical-guide-hit');
+      if (!line || !hit) return;
+      line.style.display = visible ? '' : 'none';
+      hit.style.display = visible ? '' : 'none';
+      hit.setAttribute('pointer-events', state.verticalGuidePinned ? 'stroke' : 'none');
+      if (!visible) {
+        readout.textContent = 'Outside window';
+        return;
+      }
+      const ratio = (timeMin - geometry.start) / Math.max(1e-9, geometry.end - geometry.start);
+      const x = geometry.x0 + ratio * (geometry.x1 - geometry.x0);
+      for (const node of [line, hit]) {
+        node.setAttribute('x1', x.toFixed(3));
+        node.setAttribute('x2', x.toFixed(3));
+      }
+      readout.textContent = `${fmt(timeMin, 4)} min · ${state.verticalGuidePinned ? 'Fixed' : 'Move'}`;
+    }
+
     function draw() {
       const svg = el('chart');
       const rect = svg.getBoundingClientRect();
@@ -17385,6 +17546,22 @@ HTML = r"""<!doctype html>
       const start = state.current.start_min;
       const end = state.current.end_min;
       const xScale = (x) => x0 + ((x - start) / (end - start)) * plotW;
+      const guideWindowKey = `${Number(start).toFixed(9)}:${Number(end).toFixed(9)}`;
+      if (state.verticalGuideEnabled && state.verticalGuideWindowKey !== guideWindowKey) {
+        state.verticalGuideTimeMin = (start + end) / 2;
+        state.verticalGuidePinned = false;
+      }
+      state.verticalGuideWindowKey = guideWindowKey;
+      state.verticalGuideGeometry = {
+        width,
+        height,
+        x0,
+        x1,
+        y0: margin.top,
+        y1: height - margin.bottom,
+        start,
+        end
+      };
       const contextMarginMin = Math.max(0, Number(state.current.context_margin_min || 0));
       const calibrationCandidateEventIds = new Set(
         (state.current.alignment_groups || [])
@@ -17683,6 +17860,7 @@ HTML = r"""<!doctype html>
       }
       bringPeakMarkersToFront(svg);
       bringPeakLabelsToFront(svg);
+      drawVerticalGuideOverlay(svg);
     }
 
     function trackShiftSec(track) {
@@ -18219,6 +18397,15 @@ HTML = r"""<!doctype html>
       state.showWeakLifPeaks = el('showWeakLifPeaks').checked;
       await loadWindow();
     });
+    el('verticalGuideEnabled').addEventListener('change', () => {
+      state.verticalGuideEnabled = el('verticalGuideEnabled').checked;
+      state.verticalGuidePinned = false;
+      state.verticalGuideTimeMin = null;
+      state.verticalGuideWindowKey = null;
+      if (state.current) draw();
+    });
+    el('chart').addEventListener('pointermove', handleVerticalGuidePointerMove);
+    el('chart').addEventListener('click', handleVerticalGuideClick);
     el('manualMode').addEventListener('click', toggleManualMode);
     el('clearManual').addEventListener('click', () => {
       resetManualSelection();
@@ -18499,6 +18686,7 @@ HTML = r"""<!doctype html>
     el('deltaSlider').addEventListener('change', () => updateDeltaPreview(Number(el('deltaSlider').value || 0)));
     document.addEventListener('click', hideLineContextMenu);
     document.addEventListener('keydown', handleManualKeyboardShortcut);
+    document.addEventListener('keydown', handleVerticalGuideKeyboard);
     document.addEventListener('keydown', (ev) => {
       if (ev.key === 'Escape') {
         if (activeModal) {
