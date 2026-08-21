@@ -27,7 +27,7 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V049ShortcutAndPaletteContractTest(unittest.TestCase):
     def test_d_saves_a_pending_manual_cell_pair(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.11")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.12")
         self.assertIn(
             'id="createManualPending" class="small-button secondary" '
             'style="display:none;" aria-keyshortcuts="D"',
