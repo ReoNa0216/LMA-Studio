@@ -14,7 +14,7 @@ def function_body(source: str, name: str, next_name: str) -> str:
 
 class V047InteractionContractTest(unittest.TestCase):
     def test_manual_shortcuts_are_discoverable_and_guarded(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.11")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.12")
         self.assertIn('aria-keyshortcuts="S"', HTML)
         self.assertIn('aria-keyshortcuts="A"', HTML)
         self.assertIn("Keys: S Select", HTML)

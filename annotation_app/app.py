@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.11"
+APP_VERSION = "lma_studio_v0.4.12"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -223,6 +223,24 @@ LOCAL_DELTA_MATCH_TOL_SEC = 1.50
 LOCAL_DELTA_MAX_ABS_SEC = 20.0
 LOCAL_DELTA_ABS_PRIOR_WEIGHT = 0.50
 LOCAL_DELTA_CONFLICT_PENALTY_SEC = 0.50
+
+
+def live_preview_context_margin_min(mode: str) -> float:
+    """Return enough read-only context for a full client-side slider sweep."""
+
+    normalized = str(mode or "").strip().lower()
+    if normalized == "lif":
+        # A persisted LIF axis may sit at either search bound while the user
+        # drags to the opposite bound, so the maximum relative travel is the
+        # full width of the permitted interval.
+        travel_sec = SHIFT_SEARCH_MAX_SEC - SHIFT_SEARCH_MIN_SEC
+    elif normalized == "ms":
+        travel_sec = 2.0 * LOCAL_DELTA_MAX_ABS_SEC
+    else:
+        return WINDOW_CONTEXT_MARGIN_MIN
+    return WINDOW_CONTEXT_MARGIN_MIN + travel_sec / 60.0
+
+
 FORBIDDEN_PATH_PARTS = [
     "hrgc-obs-check.csv",
     "clean+QC.h5ad",
@@ -7478,6 +7496,137 @@ def accepted_qc_alignment_refit(
     }
 
 
+def manual_qc_alignment_preview_model(
+    *,
+    acquisition_layout: dict[str, Any] | None,
+    calibration_protocol: dict[str, Any] | None,
+    qc_calibration_end_min: float,
+    current_alignment: dict[str, Any],
+    requested_axis_shifts_sec: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an auditable, non-persistent manual physical-axis preview.
+
+    MS remains the fixed reference frame.  Every LIF channel assigned to the
+    same physical time axis receives exactly one shared translation.
+    """
+
+    layout = normalize_acquisition_layout(acquisition_layout)
+    normalized_protocol = (
+        normalize_calibration_protocol(calibration_protocol, layout)
+        if calibration_protocol is not None
+        else None
+    )
+    required_axes = sorted(
+        normalized_protocol["calibration_time_axes"]
+        if normalized_protocol is not None
+        else {str(axis) for axis in layout["qc_anchor_time_axes"]}
+    )
+    if not isinstance(requested_axis_shifts_sec, dict):
+        raise BadRequest("人工时间轴微调必须为每条物理轴提供秒数")
+    supplied_axes = {str(axis) for axis in requested_axis_shifts_sec}
+    if supplied_axes != set(required_axes):
+        raise BadRequest("人工时间轴微调必须且只能覆盖项目中的全部物理轴")
+    axis_shifts: dict[str, float] = {}
+    for axis in required_axes:
+        try:
+            value = float(requested_axis_shifts_sec[axis])
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"{axis} 的人工平移必须是有效秒数") from exc
+        if not math.isfinite(value) or not (
+            SHIFT_SEARCH_MIN_SEC <= value <= SHIFT_SEARCH_MAX_SEC
+        ):
+            raise BadRequest(
+                f"{axis} 的人工平移必须在 {SHIFT_SEARCH_MIN_SEC:g} 到 {SHIFT_SEARCH_MAX_SEC:g} sec 之间"
+            )
+        axis_shifts[axis] = value
+
+    current_shifts = dict(current_alignment.get("axis_shifts_sec") or {})
+    previous_shifts = {
+        axis: float(
+            current_shifts.get(
+                axis,
+                current_alignment.get(
+                    "green_to_ms_shift_sec" if axis == "green_axis" else "red_to_ms_shift_sec",
+                    0.0,
+                ),
+            )
+        )
+        for axis in required_axes
+    }
+    layout_hash = acquisition_layout_hash(layout)
+    protocol_hash = (
+        calibration_protocol_hash(normalized_protocol, layout)
+        if normalized_protocol is not None
+        else ""
+    )
+    active_model = current_alignment.get("qc_alignment_model")
+    if not isinstance(active_model, dict):
+        active_model = {}
+    base_signature = {
+        "acquisition_layout_hash": layout_hash,
+        "calibration_protocol_hash": protocol_hash,
+        "current_axis_shifts_sec": previous_shifts,
+        "active_model_id": str(active_model.get("model_id") or ""),
+        "active_model_hash": str(active_model.get("preview_hash") or ""),
+    }
+    base_alignment_hash = hashlib.sha256(
+        json.dumps(
+            base_signature,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    signature = {
+        "model_version": QC_ALIGNMENT_MODEL_VERSION,
+        "method": "manual_physical_axis_shift",
+        "qc_calibration_end_min": float(qc_calibration_end_min),
+        "acquisition_layout_hash": layout_hash,
+        "calibration_protocol_hash": protocol_hash,
+        "base_alignment_hash": base_alignment_hash,
+        "axis_shifts_sec": axis_shifts,
+    }
+    preview_hash = hashlib.sha256(
+        json.dumps(
+            signature,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    inherited_axes = active_model.get("axes") if isinstance(active_model.get("axes"), dict) else {}
+    axis_models = {
+        axis: {
+            **copy.deepcopy(inherited_axes.get(axis, {})),
+            "shift_sec": float(axis_shifts[axis]),
+            "previous_shift_sec": float(previous_shifts[axis]),
+            "manual_adjustment_sec": float(axis_shifts[axis] - previous_shifts[axis]),
+        }
+        for axis in required_axes
+    }
+    return {
+        "model_version": QC_ALIGNMENT_MODEL_VERSION,
+        "model_id": f"qca_{preview_hash[:12]}",
+        "status": "preview",
+        "method": "manual_physical_axis_shift",
+        "qc_calibration_end_min": float(qc_calibration_end_min),
+        "acquisition_layout_hash": layout_hash,
+        "calibration_protocol_hash": protocol_hash,
+        "base_alignment_hash": base_alignment_hash,
+        "axis_shifts_sec": axis_shifts,
+        "previous_axis_shifts_sec": previous_shifts,
+        "axes": axis_models,
+        "accepted_annotation_ids": copy.deepcopy(active_model.get("accepted_annotation_ids", [])),
+        "evidence": copy.deepcopy(active_model.get("evidence", [])),
+        "all_axis_observations": copy.deepcopy(active_model.get("all_axis_observations", [])),
+        "conflicts": copy.deepcopy(active_model.get("conflicts", [])),
+        "accepted_annotation_count": int(active_model.get("accepted_annotation_count", 0) or 0),
+        "used_annotation_count": int(active_model.get("used_annotation_count", 0) or 0),
+        "conflict_count": int(active_model.get("conflict_count", 0) or 0),
+        "preview_hash": preview_hash,
+    }
+
+
 def apply_qc_alignment_model(
     automatic_alignment: dict[str, Any],
     lif_peaks: pd.DataFrame,
@@ -7522,20 +7671,33 @@ def apply_qc_alignment_model(
         raise BadRequest("QC alignment model 包含无效物理轴平移")
 
     alignment = copy.deepcopy(automatic_alignment)
-    alignment["model"] = (
-        f"accepted_anchor_refit_segmented_{protocol_hash[:12]}"
-        if normalized_protocol is not None
-        else f"accepted_anchor_refit_0_{qc_end:g}min_qc"
-    )
-    alignment["status"] = "accepted_anchor_refit_active"
-    alignment["description"] = (
-        (
-            f"{len(normalized_protocol['segments'])} 个项目参考段的 accepted anchors 按物理轴稳健重拟合；"
-            if normalized_protocol is not None
-            else f"0-{qc_end:g} min accepted QC anchors 按物理轴稳健重拟合；"
+    manual_model = str(model.get("method") or "") == "manual_physical_axis_shift"
+    if manual_model:
+        alignment["model"] = f"manual_physical_axis_shift_{protocol_hash[:12] or f'{qc_end:g}min'}"
+        alignment["status"] = (
+            "manual_axis_shift_preview"
+            if str(model.get("status") or "") == "preview"
+            else "manual_axis_shift_active"
         )
-        + "同一 time_axis 的 LIF 通道共用平移，MS760/MS782 不移动。"
-    )
+        alignment["description"] = (
+            "用户按物理时间轴人工微调 LIF 相对 MS 的平移；"
+            "同一物理轴上的通道共用平移，MS760/MS782 不移动。"
+        )
+    else:
+        alignment["model"] = (
+            f"accepted_anchor_refit_segmented_{protocol_hash[:12]}"
+            if normalized_protocol is not None
+            else f"accepted_anchor_refit_0_{qc_end:g}min_qc"
+        )
+        alignment["status"] = "accepted_anchor_refit_active"
+        alignment["description"] = (
+            (
+                f"{len(normalized_protocol['segments'])} 个项目参考段的 accepted anchors 按物理轴稳健重拟合；"
+                if normalized_protocol is not None
+                else f"0-{qc_end:g} min accepted QC anchors 按物理轴稳健重拟合；"
+            )
+            + "同一 time_axis 的 LIF 通道共用平移，MS760/MS782 不移动。"
+        )
     alignment["axis_shifts_sec"] = axis_shifts
     alignment["green_to_ms_shift_sec"] = float(axis_shifts.get("green_axis", 0.0))
     alignment["red_to_ms_shift_sec"] = float(axis_shifts.get("red_axis", 0.0))
@@ -7543,7 +7705,7 @@ def apply_qc_alignment_model(
     for channel, details in alignment.get("channels", {}).items():
         axis = str(layout["channel_time_axes"].get(channel, default_time_axis_for_channel(channel)))
         details["shift_sec"] = float(axis_shifts.get(axis, 0.0))
-        details["status"] = "accepted_anchor_refit"
+        details["status"] = "manual_axis_shift" if manual_model else "accepted_anchor_refit"
         details["shift_estimation_matches"] = []
     for axis in required_axes:
         details = alignment.setdefault("axes", {}).setdefault(axis, {})
@@ -7551,7 +7713,7 @@ def apply_qc_alignment_model(
             {
                 "time_axis": axis,
                 "shift_sec": float(axis_shifts[axis]),
-                "status": "accepted_anchor_refit",
+                "status": "manual_axis_shift" if manual_model else "accepted_anchor_refit",
                 "refit_summary": copy.deepcopy(model.get("axes", {}).get(axis, {})),
             }
         )
@@ -9880,15 +10042,47 @@ class AppData:
             current_axis_shifts_sec=self.alignment.get("axis_shifts_sec"),
         )
 
-    def save_qc_alignment_refit(
+    def qc_axis_manual_preview(self, requested_axis_shifts_sec: dict[str, Any]) -> dict[str, Any]:
+        self.require_confirmed_calibration("预览人工时间轴微调")
+        config = self.project_config()
+        return manual_qc_alignment_preview_model(
+            acquisition_layout=self.acquisition_layout,
+            calibration_protocol=(
+                None
+                if bool((self.calibration_protocol or {}).get("compatibility_mode"))
+                else config.get("calibration_protocol")
+            ),
+            qc_calibration_end_min=float(config["qc_calibration_end_min"]),
+            current_alignment=self.alignment,
+            requested_axis_shifts_sec=requested_axis_shifts_sec,
+        )
+
+    def alignment_with_axis_shift_preview(
         self,
-        expected_preview_hash: str,
-        *,
-        clear_frozen_time_model: bool = False,
+        requested_axis_shifts_sec: dict[str, Any],
     ) -> dict[str, Any]:
-        preview = self.qc_alignment_refit_preview()
-        if not expected_preview_hash or expected_preview_hash != str(preview.get("preview_hash") or ""):
-            raise BadRequest("QC anchor 证据已变化，当前预览已过期；请重新预览后再应用")
+        config = self.project_config()
+        preview = self.qc_axis_manual_preview(requested_axis_shifts_sec)
+        return apply_qc_alignment_model(
+            self.alignment,
+            self.lif_peaks,
+            self.ms_events,
+            qc_calibration_end_min=float(config["qc_calibration_end_min"]),
+            acquisition_layout=self.acquisition_layout,
+            model=preview,
+            calibration_protocol=(
+                None
+                if bool((self.calibration_protocol or {}).get("compatibility_mode"))
+                else config.get("calibration_protocol")
+            ),
+        )
+
+    def _save_qc_alignment_preview_model(
+        self,
+        preview: dict[str, Any],
+        *,
+        clear_frozen_time_model: bool,
+    ) -> dict[str, Any]:
         config = self.project_config()
         automatic_alignment = estimate_shift_alignment(
             self.lif_peaks,
@@ -9931,7 +10125,7 @@ class AppData:
             "conflict_count": 0,
             "median_abs_residual_sec": None,
             "p90_abs_residual_sec": None,
-            "method": "default_zero_delta_after_qc_alignment_refit",
+            "method": "default_zero_delta_after_qc_alignment_update",
             "residual_summary": {},
             "acquisition_layout_hash": candidate_alignment.get("acquisition_layout_hash"),
             "calibration_protocol_hash": config.get("calibration_protocol_hash"),
@@ -9942,6 +10136,8 @@ class AppData:
             draft_time_model_payload=draft_time_model,
         )
         candidate_alignment["qc_alignment_model"] = stored_model
+        if str(preview.get("method") or "") == "manual_physical_axis_shift":
+            candidate_alignment["status"] = "manual_axis_shift_active"
         object.__setattr__(self, "alignment", candidate_alignment)
         time_model = self.store.active_time_model()
         if not time_model or str(time_model.get("status")) != "draft":
@@ -9953,6 +10149,35 @@ class AppData:
             "time_model": time_model,
             "warning": "",
         }
+
+    def save_qc_alignment_refit(
+        self,
+        expected_preview_hash: str,
+        *,
+        clear_frozen_time_model: bool = False,
+    ) -> dict[str, Any]:
+        preview = self.qc_alignment_refit_preview()
+        if not expected_preview_hash or expected_preview_hash != str(preview.get("preview_hash") or ""):
+            raise BadRequest("QC anchor 证据已变化，当前预览已过期；请重新预览后再应用")
+        return self._save_qc_alignment_preview_model(
+            preview,
+            clear_frozen_time_model=clear_frozen_time_model,
+        )
+
+    def save_qc_axis_manual_adjustment(
+        self,
+        requested_axis_shifts_sec: dict[str, Any],
+        expected_preview_hash: str,
+        *,
+        clear_frozen_time_model: bool = False,
+    ) -> dict[str, Any]:
+        preview = self.qc_axis_manual_preview(requested_axis_shifts_sec)
+        if not expected_preview_hash or expected_preview_hash != str(preview.get("preview_hash") or ""):
+            raise BadRequest("当前时间轴微调预览已过期；请重新预览后再应用")
+        return self._save_qc_alignment_preview_model(
+            preview,
+            clear_frozen_time_model=clear_frozen_time_model,
+        )
 
     def ms_shift_sec_at(self, time_min: float, time_mode: str, *, require_frozen: bool = False) -> float:
         if time_mode != "aligned":
@@ -12129,6 +12354,8 @@ class AppData:
         window_min: float,
         time_mode: str = "aligned",
         preview_ms_delta_sec: float | None = None,
+        preview_axis_shifts_sec: dict[str, Any] | None = None,
+        live_preview_context: str = "",
         lif_signal_mode: str = DEFAULT_LIF_SIGNAL_MODE,
         include_weak_lif_peaks: bool = False,
     ) -> dict[str, Any]:
@@ -12138,6 +12365,8 @@ class AppData:
                 window_min=window_min,
                 time_mode=time_mode,
                 preview_ms_delta_sec=preview_ms_delta_sec,
+                preview_axis_shifts_sec=preview_axis_shifts_sec,
+                live_preview_context=live_preview_context,
                 lif_signal_mode=lif_signal_mode,
                 include_weak_lif_peaks=include_weak_lif_peaks,
             )
@@ -12148,6 +12377,8 @@ class AppData:
         window_min: float,
         time_mode: str = "aligned",
         preview_ms_delta_sec: float | None = None,
+        preview_axis_shifts_sec: dict[str, Any] | None = None,
+        live_preview_context: str = "",
         lif_signal_mode: str = DEFAULT_LIF_SIGNAL_MODE,
         include_weak_lif_peaks: bool = False,
     ) -> dict[str, Any]:
@@ -12157,6 +12388,34 @@ class AppData:
             raise BadRequest("window_min must be a finite number")
         if time_mode not in {"raw", "aligned"}:
             raise BadRequest("time_mode must be raw or aligned")
+        if preview_axis_shifts_sec is not None and time_mode != "aligned":
+            raise BadRequest("人工时间轴微调只能在校正后视图中预览")
+        live_preview_context = str(live_preview_context or "").strip().lower()
+        if live_preview_context not in {"", "lif", "ms"}:
+            raise BadRequest("live_preview_context must be lif, ms, or empty")
+        request_alignment = (
+            self.alignment_with_axis_shift_preview(preview_axis_shifts_sec)
+            if preview_axis_shifts_sec is not None
+            else self.alignment
+        )
+        layout = normalize_acquisition_layout(self.acquisition_layout)
+
+        def request_channel_shift_sec(channel: str) -> float:
+            if time_mode != "aligned":
+                return 0.0
+            axis = layout["channel_time_axes"].get(
+                str(channel).strip().upper(),
+                default_time_axis_for_channel(channel),
+            )
+            shifts = request_alignment.get("axis_shifts_sec") or {}
+            if axis in shifts:
+                return float(shifts[axis])
+            if axis == "green_axis":
+                return float(request_alignment.get("green_to_ms_shift_sec", 0.0))
+            if axis == "red_axis":
+                return float(request_alignment.get("red_to_ms_shift_sec", 0.0))
+            return 0.0
+
         lif_signal_mode = normalize_lif_signal_mode(lif_signal_mode)
         lif_trace_y_col = "raw" if lif_signal_mode == "raw" else "signal"
         lif_peak_y_col = "raw" if lif_signal_mode == "raw" else "height"
@@ -12167,12 +12426,13 @@ class AppData:
         max_start = max(time_min_min, time_min_max - window_min)
         start_min = min(max(float(start_min), time_min_min), max_start)
         end_min = start_min + window_min
-        context_start_min = max(time_min_min, start_min - WINDOW_CONTEXT_MARGIN_MIN)
-        context_end_min = min(time_min_max, end_min + WINDOW_CONTEXT_MARGIN_MIN)
+        context_margin_min = live_preview_context_margin_min(live_preview_context)
+        context_start_min = max(time_min_min, start_min - context_margin_min)
+        context_end_min = min(time_min_max, end_min + context_margin_min)
 
         trace_parts = []
         for channel, sub in self.lif_traces.groupby("channel", sort=False):
-            shift_min = self.channel_shift_sec(str(channel), time_mode) / 60.0
+            shift_min = request_channel_shift_sec(str(channel)) / 60.0
             part = sub.copy()
             part["plot_time_min"] = part["time_min"] + shift_min
             part["applied_shift_sec"] = shift_min * 60.0
@@ -12182,7 +12442,7 @@ class AppData:
         peak_parts = []
         active_peak_detection = self.active_lif_peak_detection()
         for channel, sub in self.lif_peaks.groupby("channel", sort=False):
-            shift_min = self.channel_shift_sec(str(channel), time_mode) / 60.0
+            shift_min = request_channel_shift_sec(str(channel)) / 60.0
             part = sub.copy()
             if "peak_tier" not in part.columns:
                 part["peak_tier"] = "core"
@@ -12338,7 +12598,7 @@ class AppData:
                 ) == "qc_calibration"
             ]
             reconciled_groups = reconcile_qc_calibration_groups(
-                self.alignment.get("qc_groups", {}).get("groups", []),
+                request_alignment.get("qc_groups", {}).get("groups", []),
                 qc_review_rows,
             )
             for group, stored_review in reconciled_groups:
@@ -12460,7 +12720,8 @@ class AppData:
             "start_min": start_min,
             "end_min": end_min,
             "window_min": window_min,
-            "context_margin_min": WINDOW_CONTEXT_MARGIN_MIN,
+            "context_margin_min": context_margin_min,
+            "live_preview_context": live_preview_context,
             "context_start_min": context_start_min,
             "context_end_min": context_end_min,
             "time_mode": time_mode,
@@ -12470,10 +12731,11 @@ class AppData:
                 "lif_peak_y_col": lif_peak_y_col,
                 "include_weak_lif_peaks": bool(include_weak_lif_peaks),
             },
-            "alignment": self.alignment,
+            "alignment": request_alignment,
             "project_config": self.project_config(),
             "time_model": self.active_time_model(),
             "preview_ms_delta_sec": clean_value(preview_ms_delta_sec),
+            "preview_axis_shifts_sec": clean_value(preview_axis_shifts_sec),
             "alignment_groups": alignment_groups,
             "post_qc_candidates": post_qc_candidates,
             "cell_candidates": cell_candidates,
@@ -12574,6 +12836,8 @@ class BootstrapAppData:
         window_min: float,
         time_mode: str = "aligned",
         preview_ms_delta_sec: float | None = None,
+        preview_axis_shifts_sec: dict[str, Any] | None = None,
+        live_preview_context: str = "",
         lif_signal_mode: str = DEFAULT_LIF_SIGNAL_MODE,
         include_weak_lif_peaks: bool = False,
     ) -> dict[str, Any]:
@@ -12585,7 +12849,7 @@ class BootstrapAppData:
             "start_min": 0.0,
             "end_min": window_min,
             "window_min": window_min,
-            "context_margin_min": WINDOW_CONTEXT_MARGIN_MIN,
+            "context_margin_min": live_preview_context_margin_min(live_preview_context),
             "context_start_min": 0.0,
             "context_end_min": window_min,
             "time_mode": time_mode if time_mode in {"raw", "aligned"} else "aligned",
@@ -12599,6 +12863,8 @@ class BootstrapAppData:
             "project_config": self.project_config(),
             "time_model": self.active_time_model(),
             "preview_ms_delta_sec": clean_value(preview_ms_delta_sec),
+            "preview_axis_shifts_sec": clean_value(preview_axis_shifts_sec),
+            "live_preview_context": str(live_preview_context or ""),
             "alignment_groups": [],
             "post_qc_candidates": [],
             "cell_candidates": [],
@@ -13002,6 +13268,67 @@ HTML = r"""<!doctype html>
       padding-top: 8px;
       color: #475467;
       font-size: 12px;
+    }
+    .axis-fine-tune-panel {
+      margin-top: 8px;
+      padding: 8px;
+      border: 1px solid #d7dce3;
+      border-radius: 7px;
+      background: #f8fafc;
+    }
+    .axis-fine-tune-help {
+      margin: 0 0 7px;
+      color: #667085;
+      line-height: 1.35;
+    }
+    .axis-fine-tune-row {
+      margin-top: 9px;
+      padding-top: 8px;
+      border-top: 1px solid #e4e7ec;
+    }
+    .axis-fine-tune-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+    .axis-fine-tune-heading strong {
+      min-width: 0;
+      font-size: 12px;
+      color: #344054;
+      white-space: nowrap;
+    }
+    .axis-fine-tune-value {
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .axis-fine-tune-slider {
+      display: block;
+      width: 100%;
+      height: auto;
+      min-width: 0;
+      padding: 0;
+    }
+    .axis-fine-tune-nudges {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .axis-fine-tune-nudges button {
+      width: 100%;
+      height: 30px;
+      white-space: nowrap;
+    }
+    .axis-fine-tune-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 8px;
     }
     .manual-save-actions {
       display: grid;
@@ -13918,12 +14245,21 @@ HTML = r"""<!doctype html>
         <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考峰预览重算</button>
         <div id="qcRefitStats" class="empty" style="margin-top:6px;">尚未生成重算预览。</div>
         <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用参考峰时间校正</button>
+        <button id="axisFineTuneToggle" class="small-button secondary" style="width:100%; margin-top:7px;">微调 LIF 时间轴</button>
+        <div id="axisFineTunePanel" class="axis-fine-tune-panel" style="display:none;">
+          <p class="axis-fine-tune-help">MS 不移动。数值是 LIF 相对 MS 的总平移（sec）；同轴通道一起移动。调整会实时预览，应用后才保存。</p>
+          <div id="axisFineTuneRows"></div>
+          <div class="axis-fine-tune-actions">
+            <button id="discardAxisFineTune" class="small-button secondary">取消预览</button>
+            <button id="applyAxisFineTune" class="small-button">应用微调</button>
+          </div>
+        </div>
       </div>
       <div id="localDeltaPanel" class="manual-box" style="display:none; margin-top:8px;">
         <button id="estimateDelta" class="small-button" style="width:100%;" title="Estimate the MS time offset from unlabeled peak timing">Estimate MS Δt</button>
         <div id="deltaBaseSummary" class="empty" style="margin-top:6px;">基础时间平移：-</div>
         <div class="metric"><span>当前 MS 时间差</span><strong id="deltaReadout">0.00 sec</strong></div>
-        <input id="deltaSlider" class="delta-slider" type="range" min="-20" max="20" step="0.25" value="0" />
+        <input id="deltaSlider" class="delta-slider" type="range" min="-20" max="20" step="0.05" value="0" />
         <div class="row-actions">
           <button id="deltaMinus" class="small-button secondary">-0.25 sec</button>
           <button id="deltaPlus" class="small-button secondary">+0.25 sec</button>
@@ -14280,6 +14616,9 @@ HTML = r"""<!doctype html>
       previewDeltaSec: null,
       localDeltaPreview: null,
       qcRefitPreview: null,
+      axisFineTuneOpen: false,
+      axisFineTuneBaseShifts: null,
+      axisFineTuneShifts: null,
       manual: { anchors: {}, LIF: null, MS760: null },
       requestSeq: 0,
       actionBusy: false,
@@ -14304,6 +14643,16 @@ HTML = r"""<!doctype html>
     const MIN_WINDOW_MIN = 0.25;
     const MAX_WINDOW_MIN = 15.0;
     const SIGNAL_COLORS = __LMA_SIGNAL_COLORS__;
+    let livePreviewDrawFrame = null;
+
+    function scheduleLivePreviewDraw() {
+      if (livePreviewDrawFrame !== null || !state.current) return;
+      livePreviewDrawFrame = window.requestAnimationFrame(() => {
+        livePreviewDrawFrame = null;
+        applyLivePreviewTransforms();
+      });
+    }
+
     const fallbackLifTracks = [
       { key: 'lif_g2', label: 'LIF G2 / Day0', kind: 'lif', channels: ['G2'] },
       { key: 'lif_r1', label: 'LIF R1 / Day9', kind: 'lif', channels: ['R1'] },
@@ -14824,6 +15173,9 @@ HTML = r"""<!doctype html>
       state.selectedCandidateId = null;
       state.previewDeltaSec = null;
       state.qcRefitPreview = null;
+      state.axisFineTuneOpen = false;
+      state.axisFineTuneBaseShifts = null;
+      state.axisFineTuneShifts = null;
       resetManualSelection();
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
@@ -15501,6 +15853,14 @@ HTML = r"""<!doctype html>
       if (state.stage === 'local_calibration' && state.previewDeltaSec !== null) {
         url += `&preview_ms_delta_sec=${encodeURIComponent(state.previewDeltaSec)}`;
       }
+      if (state.stage === 'qc_calibration' && state.timeMode === 'aligned' && state.axisFineTuneShifts !== null) {
+        url += `&preview_axis_shifts_sec=${encodeURIComponent(JSON.stringify(state.axisFineTuneShifts))}`;
+      }
+      if (state.stage === 'local_calibration') {
+        url += '&live_preview_context=ms';
+      } else if (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null) {
+        url += '&live_preview_context=lif';
+      }
       const payload = await fetchJson(url);
       if (seq !== state.requestSeq) return;
       state.current = payload;
@@ -15935,6 +16295,11 @@ HTML = r"""<!doctype html>
       const n = batchAcceptableAutoCandidatesInMainWindow().length;
       const individual = Math.max(0, pending - n);
       el('acceptWindow').textContent = `批量接受唯一匹配（${n}）`;
+      if (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null) {
+        el('acceptWindowHint').textContent = '正在预览时间轴微调；请先应用或取消预览，再审核参考峰';
+        el('acceptWindow').disabled = true;
+        return;
+      }
       if (state.stage === 'event_annotation' || state.stage === 'local_calibration') {
         if (state.stage === 'local_calibration') {
           el('acceptWindowHint').textContent = '后段时间差校正只生成预览，不会写入人工标注';
@@ -16056,6 +16421,10 @@ HTML = r"""<!doctype html>
         .join('；') || '尚未估计';
       el('deltaBaseSummary').textContent = `基础时间平移：${axisSummary}；MS 后段时间差可单独调节`;
       el('deltaSlider').value = String(Math.max(-20, Math.min(20, displayDelta)));
+      if (previewChanged) {
+        el('deltaStats').textContent = 'Track 正在即时预览；点击“锁定 MS 时间差”时才会由后端校验并保存。';
+        return;
+      }
       const p = state.localDeltaPreview;
       if (!p) {
         el('deltaStats').textContent = '未加载预览。';
@@ -16080,8 +16449,9 @@ HTML = r"""<!doctype html>
       const visible = state.stage === 'qc_calibration';
       el('qcRefitPanel').style.display = visible ? 'block' : 'none';
       if (!visible) return;
+      renderAxisFineTunePanel();
       const calibrationReady = calibrationBoundariesConfirmed();
-      el('previewQcRefit').disabled = !calibrationReady || state.actionBusy;
+      el('previewQcRefit').disabled = !calibrationReady || state.actionBusy || state.axisFineTuneOpen;
       if (!calibrationReady) {
         el('applyQcRefit').disabled = true;
         el('qcRefitStats').textContent = '参考段边界待确认；请先查看原始峰形，并在“配置”中确认全部边界。';
@@ -16093,7 +16463,7 @@ HTML = r"""<!doctype html>
         || state.current?.project_config?.qc_alignment_model
         || state.meta?.project_config?.qc_alignment_model;
       const button = el('applyQcRefit');
-      button.disabled = !preview || state.actionBusy;
+      button.disabled = !preview || state.actionBusy || state.axisFineTuneOpen;
       if (preview) {
         const axes = Object.entries(preview.axes || {}).map(([axis, details]) => (
           `${physicalAxisName(axis)}：${fmt(details.previous_shift_sec, 2)} → ${fmt(details.shift_sec, 2)} sec `
@@ -16115,6 +16485,172 @@ HTML = r"""<!doctype html>
       el('qcRefitStats').textContent = '尚未生成重算预览。';
     }
 
+    function persistedAxisShifts() {
+      const alignment = state.meta?.alignment || state.current?.alignment || {};
+      const raw = alignment.axis_shifts_sec || {};
+      const result = {};
+      configuredPhysicalAxes().forEach(axis => {
+        let value = raw[axis];
+        if (!Number.isFinite(Number(value)) && axis === 'green_axis') value = alignment.green_to_ms_shift_sec;
+        if (!Number.isFinite(Number(value)) && axis === 'red_axis') value = alignment.red_to_ms_shift_sec;
+        result[axis] = Number.isFinite(Number(value)) ? Number(value) : 0;
+      });
+      return result;
+    }
+
+    function calibrationFineTuneAxes() {
+      const configured = configuredPhysicalAxes();
+      const protocolAxes = (calibrationProtocol()?.calibration_time_axes || []).map(axis => String(axis));
+      if (!protocolAxes.length) return configured;
+      return configured.filter(axis => protocolAxes.includes(axis));
+    }
+
+    function calibrationAxisChannels(axis) {
+      return (state.meta?.acquisition_layout?.lif_channels || [])
+        .filter(row => String(row.time_axis || '').trim() === String(axis))
+        .map(row => String(row.channel || '').trim())
+        .filter(Boolean);
+    }
+
+    function axisFineTuneDirty() {
+      if (!state.axisFineTuneShifts || !state.axisFineTuneBaseShifts) return false;
+      return calibrationFineTuneAxes().some(axis => (
+        Math.abs(Number(state.axisFineTuneShifts[axis]) - Number(state.axisFineTuneBaseShifts[axis])) > 1e-9
+      ));
+    }
+
+    function renderAxisFineTunePanel() {
+      const toggle = el('axisFineTuneToggle');
+      const panel = el('axisFineTunePanel');
+      if (!toggle || !panel) return;
+      const configured = configuredPhysicalAxes();
+      const axes = calibrationFineTuneAxes().filter(axis => configured.includes(axis));
+      const ready = calibrationBoundariesConfirmed();
+      toggle.disabled = !ready || state.actionBusy;
+      toggle.textContent = state.axisFineTuneOpen ? '关闭微调' : '微调 LIF 时间轴';
+      panel.style.display = state.axisFineTuneOpen ? 'block' : 'none';
+      if (!state.axisFineTuneOpen) return;
+      const shifts = state.axisFineTuneShifts || {};
+      const base = state.axisFineTuneBaseShifts || {};
+      el('axisFineTuneRows').innerHTML = axes.map(axis => {
+        const channels = calibrationAxisChannels(axis);
+        const compactName = axis === 'green_axis' ? '绿色轴' : (axis === 'red_axis' ? '红色轴' : '共享轴');
+        const visibleName = channels.length ? `${compactName} ${channels.join('/')}` : compactName;
+        const fullName = `${physicalAxisName(axis)}${channels.length ? `（${channels.join('/')}）` : ''}相对 MS 的总平移秒数`;
+        const value = Number(shifts[axis] ?? base[axis] ?? 0);
+        return (
+        `<div class="axis-fine-tune-row" data-axis="${escapeText(axis)}">`
+        + `<div class="axis-fine-tune-heading"><strong title="${escapeText(fullName)}">${escapeText(visibleName)}</strong>`
+        + `<output class="axis-fine-tune-value" data-axis-readout>${value >= 0 ? '+' : ''}${escapeText(fmt(value, 2))} sec</output></div>`
+        + `<input class="axis-fine-tune-slider" type="range" min="-60" max="60" step="0.05" value="${escapeText(String(value))}" title="${escapeText(fullName)}" aria-label="${escapeText(fullName)}" />`
+        + `<div class="axis-fine-tune-nudges">`
+        + `<button type="button" class="small-button secondary" data-axis-adjust="-0.25" aria-label="${escapeText(physicalAxisName(axis))} 减少 0.25 秒">−0.25 sec</button>`
+        + `<button type="button" class="small-button secondary" data-axis-adjust="0.25" aria-label="${escapeText(physicalAxisName(axis))} 增加 0.25 秒">+0.25 sec</button>`
+        + `</div>`
+        + `</div>`
+        );
+      }).join('');
+      el('axisFineTuneRows').querySelectorAll('.axis-fine-tune-row').forEach(row => {
+        const axis = row.dataset.axis;
+        row.querySelectorAll('button[data-axis-adjust]').forEach(button => {
+          button.disabled = state.actionBusy;
+          button.addEventListener('click', () => {
+            const next = Number(state.axisFineTuneShifts?.[axis] ?? 0) + Number(button.dataset.axisAdjust || 0);
+            updateAxisFineTuneValue(axis, next);
+          });
+        });
+        const input = row.querySelector('.axis-fine-tune-slider');
+        input.disabled = state.actionBusy;
+        input.addEventListener('input', () => updateAxisFineTuneValue(axis, Number(input.value)));
+      });
+      el('discardAxisFineTune').disabled = state.actionBusy;
+      el('applyAxisFineTune').disabled = state.actionBusy || !axisFineTuneDirty();
+    }
+
+    async function toggleAxisFineTune() {
+      if (state.actionBusy || !calibrationBoundariesConfirmed()) return;
+      if (state.axisFineTuneOpen) {
+        await discardAxisFineTune();
+        return;
+      }
+      const allShifts = persistedAxisShifts();
+      const axes = calibrationFineTuneAxes();
+      state.axisFineTuneBaseShifts = Object.fromEntries(axes.map(axis => [axis, Number(allShifts[axis] || 0)]));
+      state.axisFineTuneShifts = { ...state.axisFineTuneBaseShifts };
+      state.axisFineTuneOpen = true;
+      state.timeMode = 'aligned';
+      el('timeMode').value = 'aligned';
+      renderCurrentState();
+      await loadWindow();
+    }
+
+    function updateAxisFineTuneValue(axis, value) {
+      if (!state.axisFineTuneOpen || state.actionBusy) return;
+      if (!Number.isFinite(value) || value < -60 || value > 60) {
+        alert('时间轴平移必须在 −60 到 +60 sec 之间。');
+        renderAxisFineTunePanel();
+        return;
+      }
+      state.axisFineTuneShifts = { ...state.axisFineTuneShifts, [axis]: Math.round(value * 100) / 100 };
+      const row = el('axisFineTuneRows').querySelector(`.axis-fine-tune-row[data-axis="${axis}"]`);
+      const current = Number(state.axisFineTuneShifts[axis]);
+      if (row) {
+        const slider = row.querySelector('.axis-fine-tune-slider');
+        const readout = row.querySelector('[data-axis-readout]');
+        if (slider && Math.abs(Number(slider.value) - current) > 1e-9) slider.value = String(current);
+        if (readout) readout.textContent = `${current >= 0 ? '+' : ''}${fmt(current, 2)} sec`;
+      }
+      el('applyAxisFineTune').disabled = state.actionBusy || !axisFineTuneDirty();
+      scheduleLivePreviewDraw();
+    }
+
+    async function discardAxisFineTune() {
+      const hadPreview = state.axisFineTuneShifts !== null;
+      state.axisFineTuneOpen = false;
+      state.axisFineTuneBaseShifts = null;
+      state.axisFineTuneShifts = null;
+      renderCurrentState();
+      if (hadPreview && state.current) await loadWindow();
+    }
+
+    async function applyAxisFineTune() {
+      if (state.actionBusy || !axisFineTuneDirty()) return;
+      const shifts = { ...state.axisFineTuneShifts };
+      state.actionBusy = true;
+      renderAxisFineTunePanel();
+      try {
+        const previewResult = await postJson('/api/qc-axis-preview', { axis_shifts_sec: shifts });
+        const tm = state.current?.time_model || state.meta?.time_model || {};
+        const frozen = tm.status === 'frozen';
+        const consequence = frozen
+          ? '当前已锁定的后段时间模型会失效，并需要重新进行后段时间差校正。'
+          : '当前后段时间差会重置为草稿，需要重新进行后段时间差校正。';
+        const summary = Object.entries(shifts)
+          .map(([axis, shift]) => `${physicalAxisName(axis)} ${Number(shift) >= 0 ? '+' : ''}${fmt(Number(shift), 2)} sec`)
+          .join('；');
+        if (!confirm(`应用以下 LIF 时间轴微调？\n${summary}\n\nMS 不移动。${consequence}已有人工标注会保留。`)) return;
+        const result = await postJson('/api/qc-axis-apply', {
+          axis_shifts_sec: shifts,
+          preview_hash: previewResult.preview.preview_hash,
+          clear_frozen_time_model: frozen
+        });
+        state.meta.alignment = result.alignment;
+        state.meta.project_config = result.project_config;
+        state.meta.time_model = result.time_model;
+        state.qcRefitPreview = null;
+        state.axisFineTuneOpen = false;
+        state.axisFineTuneBaseShifts = null;
+        state.axisFineTuneShifts = null;
+        await loadWindow();
+        alert('LIF 时间轴微调已应用；已有人工标注已保留。请重新进行后段时间差校正。');
+      } catch (err) {
+        alert(`应用 LIF 时间轴微调失败：${err.message}`);
+      } finally {
+        state.actionBusy = false;
+        renderQcRefitPanel();
+      }
+    }
+
     function renderStagePanels() {
       const local = state.stage === 'local_calibration';
       const qcCalibration = state.stage === 'qc_calibration';
@@ -16128,6 +16664,7 @@ HTML = r"""<!doctype html>
         || 'disabled'
       );
       const postQcEnabled = postQcMode !== 'disabled';
+      const axisPreviewActive = qcCalibration && state.axisFineTuneShifts !== null;
       if (eventAnnotation && !postQcEnabled && state.eventFilter === 'qc') state.eventFilter = 'all';
       if (eventAnnotation && !postQcEnabled && state.manualAnnotationKind === 'qc') {
         state.manualAnnotationKind = 'cell';
@@ -16135,9 +16672,9 @@ HTML = r"""<!doctype html>
       }
       el('qcRefitPanel').style.display = qcCalibration ? 'block' : 'none';
       el('baseTimePanel').style.display = local ? 'none' : 'block';
-      el('reviewPanel').style.display = (!calibrationReady || local || (eventAnnotation && !frozen)) ? 'none' : 'block';
-      el('manualPanel').style.display = calibrationReady && (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
-      if (calibrationReady && (qcCalibration || (eventAnnotation && frozen))) {
+      el('reviewPanel').style.display = (!calibrationReady || local || axisPreviewActive || (eventAnnotation && !frozen)) ? 'none' : 'block';
+      el('manualPanel').style.display = calibrationReady && !axisPreviewActive && (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
+      if (calibrationReady && !axisPreviewActive && (qcCalibration || (eventAnnotation && frozen))) {
         el('reviewPanel').parentNode.insertBefore(el('manualPanel'), el('reviewPanel'));
       }
       document.querySelectorAll('.stage-tab').forEach(button => {
@@ -16299,6 +16836,9 @@ HTML = r"""<!doctype html>
           : null;
         state.configPostQcDraft = JSON.parse(JSON.stringify(result.project_config.post_qc_strategy || { mode: 'disabled' }));
         if (qcEndChanged) state.qcRefitPreview = null;
+        state.axisFineTuneOpen = false;
+        state.axisFineTuneBaseShifts = null;
+        state.axisFineTuneShifts = null;
         const cfg = result.project_config;
         const calibrationBecameReady = !calibrationWasReady && calibrationBoundariesConfirmed();
         const annotationStart = Number(cfg.annotation_start_min || state.start);
@@ -16454,17 +16994,13 @@ HTML = r"""<!doctype html>
       }
     }
 
-    async function updateDeltaPreview(deltaSec) {
+    function updateDeltaPreview(deltaSec) {
       if (state.actionBusy) return;
-      state.actionBusy = true;
-      try {
-        state.previewDeltaSec = Number(deltaSec);
-        await loadWindow();
-      } catch (err) {
-        alert(`预览 MS 时间差失败：${err.message}`);
-      } finally {
-        state.actionBusy = false;
-      }
+      const value = Math.max(-20, Math.min(20, Number(deltaSec)));
+      if (!Number.isFinite(value)) return;
+      state.previewDeltaSec = Math.round(value * 100) / 100;
+      renderLocalDeltaPanel();
+      scheduleLivePreviewDraw();
     }
 
     async function freezeLocalDelta() {
@@ -17533,6 +18069,48 @@ HTML = r"""<!doctype html>
       readout.textContent = `${fmt(timeMin, 4)} min · ${state.verticalGuidePinned ? 'Fixed' : 'Move'}`;
     }
 
+    function livePreviewDeltaSecForTrack(track) {
+      if (!state.current || state.current.time_mode !== 'aligned') return 0;
+      if (track.kind === 'lif' && state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null) {
+        const channel = track.channels[0];
+        const alignment = state.current.alignment || {};
+        const axes = alignment.channel_time_axes || state.meta?.acquisition_layout?.channel_time_axes || {};
+        const axis = axes[channel] || (String(channel).startsWith('G') ? 'green_axis' : 'red_axis');
+        const serverShifts = alignment.axis_shifts_sec || {};
+        let serverShift = serverShifts[axis];
+        if (!Number.isFinite(Number(serverShift)) && axis === 'green_axis') serverShift = alignment.green_to_ms_shift_sec;
+        if (!Number.isFinite(Number(serverShift)) && axis === 'red_axis') serverShift = alignment.red_to_ms_shift_sec;
+        const desiredShift = state.axisFineTuneShifts?.[axis];
+        if (!Number.isFinite(Number(desiredShift))) return 0;
+        return Number(desiredShift) - Number(serverShift || 0);
+      }
+      if (track.kind === 'ms' && state.stage === 'local_calibration' && state.previewDeltaSec !== null) {
+        const serverPreview = state.current.preview_ms_delta_sec;
+        const serverDelta = serverPreview !== null && serverPreview !== undefined && Number.isFinite(Number(serverPreview))
+          ? Number(serverPreview)
+          : Number(state.current.time_model?.ms_local_delta_sec || 0);
+        return Number(state.previewDeltaSec) - serverDelta;
+      }
+      return 0;
+    }
+
+    function applyLivePreviewTransforms() {
+      const svg = el('chart');
+      const geometry = state.verticalGuideGeometry;
+      if (!svg || !geometry || !state.current) return;
+      const durationMin = Math.max(1e-9, Number(geometry.end) - Number(geometry.start));
+      const pixelsPerSecond = (Number(geometry.x1) - Number(geometry.x0)) / durationMin / 60.0;
+      const trackMap = new Map(tracksForCurrentProject().map(track => [String(track.key), track]));
+      svg.querySelectorAll('[data-preview-track-key]').forEach(layer => {
+        const track = trackMap.get(String(layer.dataset.previewTrackKey || ''));
+        if (!track) return;
+        const baseDeltaSec = Number(layer.dataset.previewBaseDeltaSec || 0);
+        const desiredDeltaSec = livePreviewDeltaSecForTrack(track);
+        const dx = (desiredDeltaSec - baseDeltaSec) * pixelsPerSecond;
+        layer.setAttribute('transform', Math.abs(dx) < 1e-9 ? '' : `translate(${dx.toFixed(3)} 0)`);
+      });
+    }
+
     function draw() {
       const svg = el('chart');
       const rect = svg.getBoundingClientRect();
@@ -17601,6 +18179,16 @@ HTML = r"""<!doctype html>
 
       const bg = svgEl('rect', { x: 0, y: 0, width, height, fill: '#fff' });
       svg.appendChild(bg);
+      const defs = svgEl('defs');
+      const clip = svgEl('clipPath', { id: 'live-preview-plot-clip' });
+      clip.appendChild(svgEl('rect', {
+        x: x0,
+        y: margin.top,
+        width: plotW,
+        height: Math.max(1, height - margin.top - margin.bottom)
+      }));
+      defs.appendChild(clip);
+      svg.appendChild(defs);
 
       tracks.forEach((track, idx) => {
         const top = margin.top + idx * (trackH + gap);
@@ -17618,8 +18206,19 @@ HTML = r"""<!doctype html>
         }
         const [yMin, yMax] = yAxisExtent(series);
         const yScale = (y) => signalBottom - ((clampForAxis(y, yMin, yMax) - yMin) / (yMax - yMin)) * (signalBottom - top);
+        const livePreviewDeltaMin = livePreviewDeltaSecForTrack(track) / 60.0;
+        const trackXScale = (x) => xScale(Number(x) + livePreviewDeltaMin);
         const trackShiftMin = trackShiftSec(track) / 60.0;
         const labelBoxes = [];
+        const liveLayerActive = state.stage === 'local_calibration'
+          || (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null);
+        const signalLayer = liveLayerActive
+          ? svgEl('g', {
+              'data-preview-track-key': track.key,
+              'data-preview-base-delta-sec': (livePreviewDeltaMin * 60.0).toFixed(6),
+              'clip-path': 'url(#live-preview-plot-clip)'
+            })
+          : svg;
 
         svg.appendChild(svgEl('rect', { x: x0, y: top, width: plotW, height: trackH, fill: idx % 2 ? '#fbfcfd' : '#ffffff' }));
         svg.appendChild(svgEl('line', { x1: x0, y1: signalBottom, x2: x1, y2: signalBottom, stroke: '#d7dce3', 'stroke-width': 1 }));
@@ -17655,13 +18254,14 @@ HTML = r"""<!doctype html>
           'stroke-linejoin': 'round'
         })).textContent = yMinText;
 
-        drawTrackTimeAxis(svg, xScale, start, end, x0, x1, top, signalBottom, bottom, trackShiftMin);
+        drawTrackTimeAxis(svg, signalLayer, xScale, start, end, x0, x1, top, signalBottom, bottom, trackShiftMin);
+        if (signalLayer !== svg) svg.appendChild(signalLayer);
 
         if (track.kind === 'lif') {
           track.channels.forEach(ch => {
             const points = state.current.lif_traces[ch] || [];
-            svg.appendChild(svgEl('path', {
-              d: linePath(points, xScale, yScale),
+            signalLayer.appendChild(svgEl('path', {
+              d: linePath(points, trackXScale, yScale),
               fill: 'none',
               stroke: colorForChannel(ch),
               'stroke-width': 1.15,
@@ -17699,7 +18299,7 @@ HTML = r"""<!doctype html>
               const manuallySelected = String(state.manual.LIF?.id || '') === String(p.peak_id)
                 || Object.values(state.manual.anchors || {}).some(item => String(item?.id || '') === String(p.peak_id));
               const c = svgEl('circle', {
-                cx: xScale(p.plot_time_min),
+                cx: trackXScale(p.plot_time_min),
                 cy: yScale(peakY),
                 r: manuallySelected ? 5.2 : (p.close_peak_risk || p.merge_risk ? 4.5 : (weakPeak ? 3.8 : 3.4)),
                 fill: weakPeak ? '#fff' : colorForChannel(p.channel),
@@ -17723,7 +18323,7 @@ HTML = r"""<!doctype html>
                 c.setAttribute('opacity', '.58');
                 c.setAttribute('pointer-events', 'none');
               }
-              svg.appendChild(c);
+              signalLayer.appendChild(c);
               if (weakPeak && state.showWeakLifPeaks) {
                 const activateWeakPeak = () => {
                   if (state.stage !== 'event_annotation') {
@@ -17734,7 +18334,7 @@ HTML = r"""<!doctype html>
                 };
                 const weakHit = svgEl('circle', {
                   class: 'weak-peak-hit-target',
-                  cx: xScale(p.plot_time_min),
+                  cx: trackXScale(p.plot_time_min),
                   cy: yScale(peakY),
                   r: 9,
                   fill: 'transparent',
@@ -17753,19 +18353,19 @@ HTML = r"""<!doctype html>
                     activateWeakPeak();
                   }
                 });
-                svg.appendChild(weakHit);
+                signalLayer.appendChild(weakHit);
               }
               if (interactive && labelIds.has(String(p.peak_id))) {
-                markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
-                addTimeLabel(svg, fmt(p.raw_time_min ?? p.time_min, 3), xScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes, state.peakLabelMode === 'all');
+                markerPositions[`lif:${p.peak_id}`] = { x: trackXScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
+                addTimeLabel(signalLayer, fmt(p.raw_time_min ?? p.time_min, 3), trackXScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes, state.peakLabelMode === 'all');
               } else if (interactive) {
-                markerPositions[`lif:${p.peak_id}`] = { x: xScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
+                markerPositions[`lif:${p.peak_id}`] = { x: trackXScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
               }
             });
         } else {
           const trace = state.current.ms_traces[track.trace] || [];
-          svg.appendChild(svgEl('path', {
-            d: linePath(trace, xScale, yScale),
+          signalLayer.appendChild(svgEl('path', {
+            d: linePath(trace, trackXScale, yScale),
             fill: 'none',
             stroke: track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782,
             'stroke-width': 1.15,
@@ -17793,7 +18393,7 @@ HTML = r"""<!doctype html>
             const y = Math.max(0, Number(raw || 0));
             const interactive = eventIsInteractive(e);
             const c = svgEl('circle', {
-              cx: xScale(e.plot_time_min),
+              cx: trackXScale(e.plot_time_min),
               cy: yScale(y),
               r: markerPolicy.radius,
               fill: markerPolicy.fill,
@@ -17841,12 +18441,12 @@ HTML = r"""<!doctype html>
                 });
               }
             }
-            svg.appendChild(c);
+            signalLayer.appendChild(c);
             if (interactive && track.trace === 'pc34_760_linear') {
-              markerPositions[`ms760:${e.event_id}`] = { x: xScale(e.plot_time_min), y: yScale(y) };
+              markerPositions[`ms760:${e.event_id}`] = { x: trackXScale(e.plot_time_min), y: yScale(y) };
             }
             if (interactive && labelIds.has(String(e.event_id))) {
-              addTimeLabel(svg, fmt(e.raw_time_min ?? e.time_min, 3), xScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782, labelBoxes, state.peakLabelMode === 'all');
+              addTimeLabel(signalLayer, fmt(e.raw_time_min ?? e.time_min, 3), trackXScale(e.plot_time_min), yScale(y), top, signalBottom, x1, track.trace === 'pc34_760_linear' ? SIGNAL_COLORS.ms760 : SIGNAL_COLORS.ms782, labelBoxes, state.peakLabelMode === 'all');
             }
           });
         }
@@ -17860,7 +18460,7 @@ HTML = r"""<!doctype html>
           drawCellCandidates(svg, markerPositions);
           drawManualCellAnnotations(svg, markerPositions);
         }
-      } else {
+      } else if (state.stage === 'qc_calibration' && state.axisFineTuneShifts === null) {
         drawAlignmentGroups(svg, markerPositions);
         drawManualAnnotations(svg, markerPositions);
       }
@@ -17873,7 +18473,13 @@ HTML = r"""<!doctype html>
       if (!state.current || state.current.time_mode !== 'aligned') return 0;
       if (track.kind === 'ms') {
         const tm = state.current.time_model || {};
-        if (state.current.start_min >= Number(tm.annotation_start_min || 40)) return Number(tm.ms_local_delta_sec || 0);
+        if (state.current.start_min >= Number(tm.annotation_start_min || 40)) {
+          const serverPreview = state.current.preview_ms_delta_sec;
+          const serverShift = serverPreview !== null && serverPreview !== undefined && Number.isFinite(Number(serverPreview))
+            ? Number(serverPreview)
+            : Number(tm.ms_local_delta_sec || 0);
+          return serverShift + livePreviewDeltaSecForTrack(track);
+        }
         return 0;
       }
       if (track.kind !== 'lif') return 0;
@@ -17881,9 +18487,9 @@ HTML = r"""<!doctype html>
       const axes = state.current.alignment.channel_time_axes || state.meta?.acquisition_layout?.channel_time_axes || {};
       const axis = axes[channel] || (String(channel).startsWith('G') ? 'green_axis' : 'red_axis');
       const axisShifts = state.current.alignment.axis_shifts_sec || {};
-      if (axisShifts[axis] !== undefined) return Number(axisShifts[axis] || 0);
-      if (axis === 'green_axis') return Number(state.current.alignment.green_to_ms_shift_sec || 0);
-      if (axis === 'red_axis') return Number(state.current.alignment.red_to_ms_shift_sec || 0);
+      if (axisShifts[axis] !== undefined) return Number(axisShifts[axis] || 0) + livePreviewDeltaSecForTrack(track);
+      if (axis === 'green_axis') return Number(state.current.alignment.green_to_ms_shift_sec || 0) + livePreviewDeltaSecForTrack(track);
+      if (axis === 'red_axis') return Number(state.current.alignment.red_to_ms_shift_sec || 0) + livePreviewDeltaSecForTrack(track);
       return 0;
     }
 
@@ -18088,7 +18694,7 @@ HTML = r"""<!doctype html>
       return { stroke: '#111827', width: selected ? 1.9 : 1.35, dash: '6 4', opacity: selected ? 0.76 : 0.56 };
     }
 
-    function drawTrackTimeAxis(svg, xScale, start, end, left, right, top, signalBottom, bottom, shiftMin) {
+    function drawTrackTimeAxis(svg, movingLayer, xScale, start, end, left, right, top, signalBottom, bottom, shiftMin) {
       const axisY = signalBottom;
       svg.appendChild(svgEl('line', { x1: left, y1: axisY, x2: right, y2: axisY, stroke: '#98a2b3', 'stroke-width': 1 }));
       const widthMin = end - start;
@@ -18099,9 +18705,9 @@ HTML = r"""<!doctype html>
       for (let rawTick = first; rawTick <= rawEnd + 1e-9; rawTick += step) {
         const x = xScale(rawTick + shiftMin);
         if (x < left - 1 || x > right + 1) continue;
-        svg.appendChild(svgEl('line', { x1: x, y1: top, x2: x, y2: signalBottom, stroke: '#edf0f4', 'stroke-width': 1 }));
-        svg.appendChild(svgEl('line', { x1: x, y1: axisY, x2: x, y2: axisY + 5, stroke: '#667085', 'stroke-width': 1 }));
-        svg.appendChild(svgEl('text', {
+        movingLayer.appendChild(svgEl('line', { x1: x, y1: top, x2: x, y2: signalBottom, stroke: '#edf0f4', 'stroke-width': 1, 'pointer-events': 'none' }));
+        movingLayer.appendChild(svgEl('line', { x1: x, y1: axisY, x2: x, y2: axisY + 5, stroke: '#667085', 'stroke-width': 1, 'pointer-events': 'none' }));
+        movingLayer.appendChild(svgEl('text', {
           x,
           y: Math.min(axisY + 17, bottom - 3),
           fill: '#475467',
@@ -18145,12 +18751,12 @@ HTML = r"""<!doctype html>
     }
 
     function bringPeakLabelsToFront(svg) {
-      svg.querySelectorAll('.peak-time-label, .amplitude-label').forEach(node => svg.appendChild(node));
+      svg.querySelectorAll('.peak-time-label, .amplitude-label').forEach(node => node.parentNode?.appendChild(node));
     }
 
     function bringPeakMarkersToFront(svg) {
-      svg.querySelectorAll('.peak-marker').forEach(node => svg.appendChild(node));
-      svg.querySelectorAll('.weak-peak-hit-target').forEach(node => svg.appendChild(node));
+      svg.querySelectorAll('.peak-marker').forEach(node => node.parentNode?.appendChild(node));
+      svg.querySelectorAll('.weak-peak-hit-target').forEach(node => node.parentNode?.appendChild(node));
     }
 
     function addTimeLabel(svg, text, x, y, top, bottom, right, color, labelBoxes, allowOverlap = false) {
@@ -18345,6 +18951,11 @@ HTML = r"""<!doctype html>
     });
     el('timeMode').addEventListener('change', async () => {
       state.timeMode = el('timeMode').value;
+      if (state.timeMode !== 'aligned' && state.axisFineTuneShifts !== null) {
+        state.axisFineTuneOpen = false;
+        state.axisFineTuneBaseShifts = null;
+        state.axisFineTuneShifts = null;
+      }
       await loadWindow();
     });
     el('yAxisMode').addEventListener('change', () => {
@@ -18359,6 +18970,9 @@ HTML = r"""<!doctype html>
       button.addEventListener('click', async () => {
         hideLineContextMenu();
         state.stage = button.dataset.stage;
+        state.axisFineTuneOpen = false;
+        state.axisFineTuneBaseShifts = null;
+        state.axisFineTuneShifts = null;
         state.showCrossChannelConflicts = false;
         el('showCrossChannelConflicts').checked = false;
         resetManualSelection();
@@ -18685,11 +19299,14 @@ HTML = r"""<!doctype html>
     el('attachCellEventMap').addEventListener('input', updateAttachMapControls);
     el('previewQcRefit').addEventListener('click', previewQcAlignmentRefit);
     el('applyQcRefit').addEventListener('click', applyQcAlignmentRefit);
+    el('axisFineTuneToggle').addEventListener('click', toggleAxisFineTune);
+    el('discardAxisFineTune').addEventListener('click', discardAxisFineTune);
+    el('applyAxisFineTune').addEventListener('click', applyAxisFineTune);
     el('estimateDelta').addEventListener('click', estimateLocalDelta);
     el('freezeDelta').addEventListener('click', freezeLocalDelta);
     el('deltaMinus').addEventListener('click', () => updateDeltaPreview(Number(el('deltaSlider').value || 0) - 0.25));
     el('deltaPlus').addEventListener('click', () => updateDeltaPreview(Number(el('deltaSlider').value || 0) + 0.25));
-    el('deltaSlider').addEventListener('change', () => updateDeltaPreview(Number(el('deltaSlider').value || 0)));
+    el('deltaSlider').addEventListener('input', () => updateDeltaPreview(Number(el('deltaSlider').value || 0)));
     document.addEventListener('click', hideLineContextMenu);
     document.addEventListener('keydown', handleManualKeyboardShortcut);
     document.addEventListener('keydown', handleVerticalGuideKeyboard);
@@ -18909,7 +19526,18 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     preview_ms_delta_sec = None if preview_value in {None, ""} else float(preview_value)
                 except ValueError as exc:
                     raise BadRequest("start_min, window_min, and preview_ms_delta_sec must be numeric") from exc
+                axis_preview_value = query.get("preview_axis_shifts_sec", [None])[0]
+                preview_axis_shifts_sec = None
+                if axis_preview_value not in {None, ""}:
+                    try:
+                        decoded_axis_preview = json.loads(str(axis_preview_value))
+                    except json.JSONDecodeError as exc:
+                        raise BadRequest("人工时间轴微调预览格式无效") from exc
+                    if not isinstance(decoded_axis_preview, dict):
+                        raise BadRequest("人工时间轴微调预览必须为物理轴秒数")
+                    preview_axis_shifts_sec = decoded_axis_preview
                 time_mode = str(query.get("time_mode", ["aligned"])[0])
+                live_preview_context = str(query.get("live_preview_context", [""])[0])
                 lif_signal_mode = str(query.get("lif_signal_mode", [DEFAULT_LIF_SIGNAL_MODE])[0])
                 include_weak_lif_peaks = str(
                     query.get("include_weak_lif_peaks", ["false"])[0]
@@ -18920,6 +19548,8 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         window_min=window_min,
                         time_mode=time_mode,
                         preview_ms_delta_sec=preview_ms_delta_sec,
+                        preview_axis_shifts_sec=preview_axis_shifts_sec,
+                        live_preview_context=live_preview_context,
                         lif_signal_mode=lif_signal_mode,
                         include_weak_lif_peaks=include_weak_lif_peaks,
                     )
@@ -19002,6 +19632,28 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/qc-alignment-refit":
                 result = self.data.save_qc_alignment_refit(
+                    str(payload.get("preview_hash") or ""),
+                    clear_frozen_time_model=bool(payload.get("clear_frozen_time_model")),
+                )
+                self.send_json({"ok": True, **result})
+                return
+            if parsed.path == "/api/qc-axis-preview":
+                requested = payload.get("axis_shifts_sec")
+                if not isinstance(requested, dict):
+                    raise BadRequest("请为项目中的每条 LIF 时间轴提供微调秒数")
+                self.send_json(
+                    {
+                        "ok": True,
+                        "preview": self.data.qc_axis_manual_preview(requested),
+                    }
+                )
+                return
+            if parsed.path == "/api/qc-axis-apply":
+                requested = payload.get("axis_shifts_sec")
+                if not isinstance(requested, dict):
+                    raise BadRequest("请为项目中的每条 LIF 时间轴提供微调秒数")
+                result = self.data.save_qc_axis_manual_adjustment(
+                    requested,
                     str(payload.get("preview_hash") or ""),
                     clear_frozen_time_model=bool(payload.get("clear_frozen_time_model")),
                 )

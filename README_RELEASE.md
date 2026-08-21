@@ -1,16 +1,23 @@
-# LMA Studio v0.4.11 Release Notes
+# LMA Studio v0.4.12 Release Notes
 
 LMA Studio is a local desktop application for project-based, human-assisted LIF-MS annotation review.
 
 ## Downloads
 
-- `LMA-Studio-v0.4.11-windows-x64.zip`: Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
-- `LMA-Studio-v0.4.11-macos-arm64.zip`: Apple Silicon build. Open `LMA Studio.app`.
+- `LMA-Studio-v0.4.12-windows-x64.zip`: Windows x64 build. Keep the extracted folder together and run `LMAStudio.exe`.
+- `LMA-Studio-v0.4.12-macos-arm64.zip`: Apple Silicon build. Open `LMA Studio.app`.
 - Matching `.sha256` files are provided for integrity verification.
 
 The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. On first launch, macOS may require Control-clicking the app and choosing **Open**.
 
-## What changed in v0.4.11
+## What changed in v0.4.12
+
+- Calibration now provides compact full-width sliders for projects with one or more physical LIF time axes. MS remains the fixed reference; G1/G2 move together on the Green axis and R1/R2 move together on the Red axis, while Green and Red can be adjusted independently. Each slider has a live signed-second readout and clear `−0.25 sec` / `+0.25 sec` controls without crowded channel labels.
+- Calibration-axis and MS-Δt dragging now updates the signal, peaks, labels, grid, and time ticks together through an in-memory SVG translation on the next animation frame. It makes no window request during the drag or nudge; the full permitted travel is loaded once as clipped read-only context, and the backend validates again only when the user applies or locks the model.
+- Each adjustment is a request-only Track preview. It does not write the project, move the fixed reference, or permit review against an uncommitted coordinate frame. `取消预览` restores the persisted model; `应用微调` is the only Calibration-axis write action.
+- Applying a physical-axis adjustment keeps all manual annotations and audit history, stores the result in the existing QC-alignment model schema, and explicitly resets the downstream MS time-difference model to a draft zero delta for recomputation. Existing projects do not need to be rebuilt or migrated.
+
+## Retained v0.4.11 interaction behavior
 
 - Track now has an optional cross-track `Reference line`. It follows the pointer across the shared displayed time axis, clicks to a fixed position, releases when clicked again, and supports one-pixel left/right keyboard nudging (`Shift` for ten pixels). It is a display-only aid available in every stage and never changes peaks, candidates, annotations, or time models.
 - G2 now uses a readable golden-yellow color in the one shared Track/UMAP palette, replacing the previous dark orange-brown while leaving all persisted project identities and annotations unchanged.
@@ -36,15 +43,15 @@ The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. 
 
 ## Compatibility
 
-- Existing formal v0.4.0-v0.4.10 projects using the current adaptive two-tier LIF peak standard open from their manifest paths without migration or preprocessing reruns. Existing candidates, annotations, pending reviews, frozen models, and directory layouts remain intact.
+- Existing formal v0.4.0-v0.4.11 projects using the current adaptive two-tier LIF peak standard open from their manifest paths without migration or preprocessing reruns. Existing candidates, annotations, pending reviews, frozen models, and directory layouts remain intact.
 - Opening an existing project never reruns the MS caller. The project continues to use its manifest-bound peak and event tables.
 - Projects made with the retired fixed-threshold peak standard remain intentionally rejected before writes. Rebuild those projects in a new empty directory from the original LIF/MS/event-list inputs.
 - Close LMA Studio before copying or compressing a project, and share the complete project root rather than individual parquet, SQLite, or coordinate files.
 
 ## Validation
 
-- Focused interaction tests cover the reference-line move/pin/release/keyboard state machine, protection of peak and connector clicks, shared Track/UMAP palette contrast, accepted/pending shortcut guards, UMAP time lookup without view mutation, Track-to-UMAP event identity, and the native-window message handshake.
-- The candidate is gated by the automated suite, JavaScript syntax checks, packaged scientific-binary provenance checks, ABI validation, the packaged runtime probe, and four real-data project-creation checks before formal publication.
+- Focused interaction tests cover the independent Green/Red physical-axis preview and apply path, fixed-MS invariant, shared-axis channel movement, downstream invalidation with annotation preservation, the reference-line state machine, palette contrast, shortcuts, UMAP lookup, and the native-window message handshake.
+- The release is gated by the automated suite, JavaScript syntax checks, packaged scientific-binary provenance checks, ABI validation, the packaged runtime probe, and four real-data project-creation checks before publication.
 - The formal tag workflow binds package names to the source `APP_VERSION`, verifies both platform archives against their SHA256 files, and publishes only after Windows x64 and macOS ARM64 jobs both pass.
 
 ## Data policy

@@ -13,6 +13,7 @@ It opens its own native desktop window, lets users create or open project direct
 - Configure ordered front reference windows using green-only, red-only, or combined red/green evidence. A read-only raw-peak scan can suggest boundaries but never confirms them. Unconfirmed windows can be opened as a raw-track draft while calibration and downstream stages remain locked.
 - Configure later QC independently as `Off`, `QC signature`, or `Scheduled windows`, with a short explanation of the intended experimental scenario in the UI.
 - Estimate one calibration translation per shared signal-time group, so same-color channels such as G1/G2 pool evidence without requiring simultaneous peaks.
+- Fine-tune Green and Red physical signal-time groups independently in Calibration while MS remains fixed. The preview is temporary until explicitly applied; applying it invalidates downstream time-difference results but preserves manual annotation history.
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
 - Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
@@ -27,7 +28,7 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Desktop Releases
 
-The current formal desktop release is v0.4.11. Existing v0.4.0-v0.4.10 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
+The current formal desktop release is v0.4.12. Existing v0.4.0-v0.4.11 projects using the current peak-recognition standard remain manifest-compatible and are not migrated when opened.
 
 Windows x64:
 
@@ -80,7 +81,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.4.11 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.4.12 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload test artifacts and may explicitly publish a public prerelease candidate. Formal GitHub Release publication remains tag-triggered after both desktop release gates pass.
