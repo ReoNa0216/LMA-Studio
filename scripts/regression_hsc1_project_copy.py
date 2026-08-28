@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from pathlib import Path
 import sys
@@ -15,7 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from annotation_app.app import AppData, ProjectPaths, raw_file_fingerprint
+from annotation_app.app import (
+    AppData,
+    ProjectPaths,
+    cell_candidate_id,
+    manual_cell_annotation_id,
+    raw_file_fingerprint,
+)
 
 
 EXPECTED_EXPORT_COLUMNS = [
@@ -193,6 +200,197 @@ def main() -> int:
         header = exported["csv_text"].splitlines()[0].split(",")
         if header != EXPECTED_EXPORT_COLUMNS:
             raise AssertionError(f"Unexpected compact CSV header: {header}")
+        frozen = reopened.freeze_local_delta_model()
+        if frozen["status"] != "frozen":
+            raise AssertionError("HSC1 disposable project did not freeze its local time model")
+        config = reopened.project_config()
+        candidates = reopened.build_cell_candidates(
+            float(config["annotation_start_min"]),
+            float(reopened.meta()["time_min_max"]),
+            "aligned",
+        )
+        unique_candidates: dict[str, dict[str, Any]] = {}
+        for candidate in sorted(
+            candidates,
+            key=lambda row: (
+                float(row.get("abs_residual_sec", 9999.0)),
+                str(row.get("lif_channel") or ""),
+            ),
+        ):
+            unique_candidates.setdefault(str(candidate["ms_event_id"]), candidate)
+        selected = list(unique_candidates.values())[:120]
+        if len(selected) < 12:
+            raise AssertionError(
+                f"HSC1 real-data copy produced too few cell candidates: {len(selected)}"
+            )
+        if len(selected) < 120:
+            selected_event_ids = {str(row["ms_event_id"]) for row in selected}
+            allowed_event_ids = reopened.cell_event_map_event_ids() or set()
+            cell_channels = set(reopened.cell_annotation_channels())
+            manual_peaks = reopened.lif_peaks[
+                reopened.lif_peaks["channel"].astype(str).isin(cell_channels)
+            ].copy()
+            manual_peaks["projected_time_sec"] = manual_peaks.apply(
+                lambda row: float(row["time_sec"])
+                + reopened.channel_shift_sec(str(row["channel"]), "aligned"),
+                axis=1,
+            )
+            for _, event in reopened.ms_events.sort_values("time_sec").iterrows():
+                event_id = str(event["event_id"])
+                if event_id in selected_event_ids or event_id not in allowed_event_ids:
+                    continue
+                if float(event["time_min"]) < float(config["annotation_start_min"]):
+                    continue
+                event_plot_sec = float(event["time_sec"]) + reopened.ms_shift_sec_at(
+                    float(event["time_min"]),
+                    "aligned",
+                    require_frozen=True,
+                )
+                nearest_index = (
+                    manual_peaks["projected_time_sec"] - event_plot_sec
+                ).abs().idxmin()
+                peak = manual_peaks.loc[nearest_index]
+                relation = {
+                    "lif_channel": str(peak["channel"]),
+                    "lif_peak_id": str(peak["peak_id"]),
+                    "ms_event_id": event_id,
+                    "candidate_type": "manual_cell_pair",
+                    "_regression_manual_only": True,
+                }
+                try:
+                    reopened.payload_from_cell_ids(
+                        relation["lif_channel"],
+                        relation["lif_peak_id"],
+                        relation["ms_event_id"],
+                        enforce_acceptance_conflicts=False,
+                    )
+                except ValueError:
+                    continue
+                selected.append(relation)
+                selected_event_ids.add(event_id)
+                if len(selected) >= 120:
+                    break
+        if len(selected) < 100:
+            raise AssertionError(
+                f"HSC1 long-session copy produced too few durable relations: {len(selected)}"
+            )
+        statuses = ("accepted", "pending", "rejected")
+        for index, candidate in enumerate(selected):
+            source = (
+                "manual_created"
+                if candidate.get("_regression_manual_only") or index % 4 == 0
+                else "auto_candidate"
+            )
+            status = statuses[index % len(statuses)]
+            payload = reopened.payload_from_cell_ids(
+                str(candidate["lif_channel"]),
+                str(candidate["lif_peak_id"]),
+                str(candidate["ms_event_id"]),
+                enforce_acceptance_conflicts=False,
+            )
+            payload.update(
+                {
+                    "review_stage": "cell_annotation",
+                    "candidate_type": (
+                        "manual_cell_pair"
+                        if source == "manual_created"
+                        else str(candidate.get("candidate_type") or "cell_high_confidence")
+                    ),
+                }
+            )
+            annotation_id = (
+                manual_cell_annotation_id(
+                    str(candidate["lif_channel"]),
+                    str(candidate["lif_peak_id"]),
+                    str(candidate["ms_event_id"]),
+                )
+                if source == "manual_created"
+                else cell_candidate_id(candidate)
+            )
+            reopened.store.upsert_review(
+                annotation_id=annotation_id,
+                source=source,
+                review_status=status,
+                payload=payload,
+                action="hsc1_long_session_regression_review",
+            )
+        decisions_before = {
+            str(row["annotation_id"]): {
+                "review_status": str(row["review_status"]),
+                "source": str(row["source"]),
+                "lif_peak_id": str(row.get("lif_peak_id") or ""),
+                "ms_event_id": str(row.get("ms_event_id") or ""),
+                "time_model_version": str(row.get("time_model_version") or ""),
+            }
+            for row in reopened.store.records()
+        }
+        umap_before = reopened.projected_cell_event_map_state()
+        current_shifts = dict(reopened.alignment.get("axis_shifts_sec") or {})
+        adjusted_shifts = {
+            axis: float(shift) + 2.0 for axis, shift in current_shifts.items()
+        }
+        timeline_preview = reopened.timeline_adjustment_preview(
+            adjusted_shifts,
+            ms_local_delta_sec=float(frozen.get("ms_local_delta_sec", 0.0) or 0.0),
+        )
+        applied = reopened.apply_timeline_adjustment(
+            adjusted_shifts,
+            ms_local_delta_sec=float(frozen.get("ms_local_delta_sec", 0.0) or 0.0),
+            expected_preview_hash=str(timeline_preview["preview_hash"]),
+        )
+        decisions_after = {
+            str(row["annotation_id"]): {
+                "review_status": str(row["review_status"]),
+                "source": str(row["source"]),
+                "lif_peak_id": str(row.get("lif_peak_id") or ""),
+                "ms_event_id": str(row.get("ms_event_id") or ""),
+                "time_model_version": str(row.get("time_model_version") or ""),
+            }
+            for row in reopened.store.records()
+        }
+        if decisions_after != decisions_before:
+            raise AssertionError("Timeline adjustment mutated reviewed raw-ID decisions")
+        projected_relations = [
+            reopened.project_saved_relation(row)
+            for row in reopened.store.records()
+            if reopened.annotation_review_stage(row) in {"qc_survey", "cell_annotation"}
+        ]
+        needs_review_count = sum(
+            1 for row in projected_relations if bool(row.get("needs_review"))
+        )
+        if needs_review_count < 1:
+            raise AssertionError("Adjusted HSC1 relations were not flagged for review")
+        umap_after = reopened.projected_cell_event_map_state()
+        before_classification = {
+            str(point["ms_event_id"]): (
+                str(point["classification"]),
+                str(point.get("lif_channel") or ""),
+            )
+            for point in umap_before["points"]
+        }
+        after_classification = {
+            str(point["ms_event_id"]): (
+                str(point["classification"]),
+                str(point.get("lif_channel") or ""),
+            )
+            for point in umap_after["points"]
+        }
+        if after_classification != before_classification:
+            raise AssertionError("Timeline adjustment changed HSC1 UMAP identities")
+        if umap_after["revision"] == umap_before["revision"]:
+            raise AssertionError("Timeline adjustment did not advance the UMAP state revision")
+        reviewed_export = reopened.export_accepted_annotations_csv()
+        exported_frame = pd.read_csv(io.StringIO(reviewed_export["csv_text"]))
+        expected_accepted_ids = {
+            annotation_id
+            for annotation_id, row in decisions_before.items()
+            if row["review_status"] == "accepted"
+        }
+        actual_accepted_ids = set(
+            exported_frame["annotation_id"].dropna().astype(str)
+        )
+        if not expected_accepted_ids.issubset(actual_accepted_ids):
+            raise AssertionError("Timeline adjustment dropped accepted HSC1 CSV identities")
         print(
             json.dumps(
                 {
@@ -212,6 +410,19 @@ def main() -> int:
                     "post_qc_mode": config["post_qc_strategy"]["mode"],
                     "axis_shifts_sec": reopened.alignment.get("axis_shifts_sec"),
                     "empty_export_header": header,
+                    "long_session_relation_count": len(decisions_before),
+                    "long_session_status_counts": {
+                        status: sum(
+                            1
+                            for row in decisions_before.values()
+                            if row["review_status"] == status
+                        )
+                        for status in statuses
+                    },
+                    "timeline_revision": applied["time_model"]["time_model_version"],
+                    "needs_review_count": needs_review_count,
+                    "accepted_csv_identity_count": len(expected_accepted_ids),
+                    "umap_identity_preserved": True,
                 },
                 ensure_ascii=False,
                 indent=2,

@@ -944,8 +944,6 @@ def project_annotation_state(
         stage = _annotation_stage(row, annotation_start_min)
         if stage not in {"qc_survey", "cell_annotation"}:
             continue
-        if not active_version or str(row.get("time_model_version") or "") != active_version:
-            continue
         relation = {
             "annotation_id": str(row.get("annotation_id") or ""),
             "kind": "qc" if stage == "qc_survey" else "cell",

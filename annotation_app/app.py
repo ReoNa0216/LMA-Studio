@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.13"
+APP_VERSION = "lma_studio_v0.5.0"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -482,6 +482,11 @@ def normalize_acquisition_layout(
                 raise BadRequest("每个 LIF 通道配置必须填写 channel")
             identity = str(item.get("identity_prior") or identities.get(channel) or "").strip()
             time_axis = str(item.get("time_axis") or default_time_axis_for_channel(channel)).strip()
+            expected_axis = default_time_axis_for_channel(channel)
+            if channel.startswith(("G", "R")) and time_axis != expected_axis:
+                raise BadRequest(
+                    f"{channel} 必须使用 {expected_axis}；同色通道必须共享同一物理时间轴"
+                )
             input_id = str(item.get("input_id") or f"lif_{index}_raw").strip()
             lif_channels.append(
                 {
@@ -3598,6 +3603,74 @@ class AnnotationStore:
                 )
         return stored_model
 
+    def apply_timeline_adjustment(
+        self,
+        qc_alignment_model: dict[str, Any],
+        time_model_payload: dict[str, Any],
+        *,
+        expected_previous_time_model_version: str,
+    ) -> dict[str, Any]:
+        """Atomically apply one physical-axis + downstream-MS model revision."""
+
+        if not isinstance(qc_alignment_model, dict) or not qc_alignment_model.get(
+            "preview_hash"
+        ):
+            raise BadRequest("时间轴调整缺少可审计的物理轴预览")
+        if str(time_model_payload.get("status") or "") != "frozen":
+            raise BadRequest("时间轴调整必须直接生成 frozen time model 修订")
+        timestamp = now_iso()
+        stored_qc_model = {
+            **copy.deepcopy(qc_alignment_model),
+            "status": "active",
+            "applied_at": timestamp,
+        }
+        time_model_row = self._prepare_time_model_row(
+            time_model_payload,
+            timestamp=timestamp,
+        )
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active_row = conn.execute(
+                "SELECT * FROM time_models WHERE is_active = 1 "
+                "ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+            active_model = self._decode_time_model_row(active_row) if active_row else None
+            active_version = str((active_model or {}).get("time_model_version") or "")
+            if active_version != str(expected_previous_time_model_version or ""):
+                raise BadRequest("当前 time model 已变化；请重新预览时间轴调整")
+            if str((active_model or {}).get("status") or "") != "frozen":
+                raise BadRequest("只能从已冻结的 time model 应用第三阶段时间轴调整")
+            conn.execute(
+                """
+                INSERT INTO project_config (key, value_json, updated_at, app_version)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at,
+                    app_version=excluded.app_version
+                """,
+                (
+                    QC_ALIGNMENT_MODEL_KEY,
+                    json.dumps(stored_qc_model, ensure_ascii=False, sort_keys=True),
+                    timestamp,
+                    APP_VERSION,
+                ),
+            )
+            self._upsert_time_model_row(
+                conn,
+                time_model_row,
+                action="apply_timeline_adjustment",
+            )
+        invalidate_request_cached_reads(
+            self,
+            "project_config",
+            "active_time_model",
+        )
+        return {
+            "qc_alignment_model": stored_qc_model,
+            "time_model": self.active_time_model(),
+        }
+
     def record_project_table_binding(self, binding: dict[str, Any]) -> None:
         timestamp = now_iso()
         with self._lock, self._connect() as conn:
@@ -4149,21 +4222,17 @@ class AnnotationStore:
                 )
             previous_row = conn.execute("SELECT * FROM annotations WHERE annotation_id = ?", (annotation_id,)).fetchone()
             previous = self._decode_annotation_row(previous_row) if previous_row else {}
-            if review_status == "pending" and source == "auto_candidate":
-                conn.execute("DELETE FROM annotations WHERE annotation_id = ?", (annotation_id,))
-                current = {}
-            else:
-                current = {
-                    **previous,
-                    **payload,
-                    "annotation_id": annotation_id,
-                    "source": source,
-                    "review_status": review_status,
-                    "exportable": review_status == "accepted",
-                    "updated_at": timestamp,
-                }
-                current.setdefault("created_at", timestamp)
-                self._upsert_annotation_row(conn, current)
+            current = {
+                **previous,
+                **payload,
+                "annotation_id": annotation_id,
+                "source": source,
+                "review_status": review_status,
+                "exportable": review_status == "accepted",
+                "updated_at": timestamp,
+            }
+            current.setdefault("created_at", timestamp)
+            self._upsert_annotation_row(conn, current)
             audit = self._audit_row(
                 annotation_id=annotation_id,
                 source=source,
@@ -4184,12 +4253,7 @@ class AnnotationStore:
             "annotation_records",
             "annotation_record_index",
         )
-        return current or {
-            "annotation_id": annotation_id,
-            "source": source,
-            "review_status": "pending",
-            "exportable": False,
-        }
+        return current
 
 
 class BadRequest(ValueError):
@@ -7552,9 +7616,7 @@ def manual_qc_alignment_preview_model(
         else None
     )
     required_axes = sorted(
-        normalized_protocol["calibration_time_axes"]
-        if normalized_protocol is not None
-        else {str(axis) for axis in layout["qc_anchor_time_axes"]}
+        {str(axis) for axis in layout["channel_time_axes"].values()}
     )
     if not isinstance(requested_axis_shifts_sec, dict):
         raise BadRequest("人工时间轴微调必须为每条物理轴提供秒数")
@@ -7689,8 +7751,11 @@ def apply_qc_alignment_model(
     )
     if normalized_protocol is not None and str(model.get("calibration_protocol_hash") or "") != protocol_hash:
         raise BadRequest("已保存的 QC alignment model 与当前 calibration protocol 不一致")
+    manual_model = str(model.get("method") or "") == "manual_physical_axis_shift"
     required_axes = sorted(
-        normalized_protocol["calibration_time_axes"]
+        {str(axis) for axis in layout["channel_time_axes"].values()}
+        if manual_model
+        else normalized_protocol["calibration_time_axes"]
         if normalized_protocol is not None
         else {str(axis) for axis in layout["qc_anchor_time_axes"]}
     )
@@ -7702,7 +7767,6 @@ def apply_qc_alignment_model(
         raise BadRequest("QC alignment model 包含无效物理轴平移")
 
     alignment = copy.deepcopy(automatic_alignment)
-    manual_model = str(model.get("method") or "") == "manual_physical_axis_shift"
     if manual_model:
         alignment["model"] = f"manual_physical_axis_shift_{protocol_hash[:12] or f'{qc_end:g}min'}"
         alignment["status"] = (
@@ -8579,12 +8643,7 @@ class AppData:
             raise BadRequest("当前项目没有单细胞 event map")
         frozen = self.frozen_time_model()
         config = self.project_config()
-        annotations = [
-            row
-            for row in self.store.records()
-            if self.annotation_review_stage(row) != "qc_survey"
-            or self.qc_survey_matches_current_strategy(row, config=config)
-        ]
+        annotations = self.store.records()
         state = project_annotation_state(
             self.cell_event_map,
             annotations,
@@ -8650,7 +8709,6 @@ class AppData:
             if str(row.get("annotation_id") or "") != str(annotation_id)
             and str(row.get("review_status") or "") == "accepted"
             and str(row.get("ms_event_id") or "") == ms_event_id
-            and str(row.get("time_model_version") or "") == active_version
             and self.annotation_review_stage(row) in {"qc_survey", "cell_annotation"}
         ]
         if conflicting:
@@ -8860,7 +8918,8 @@ class AppData:
             "include_stages": ["qc_survey", "cell_annotation"],
             "include_unannotated_event_map_rows_as_unknown": self.cell_event_map is not None,
             "calibration_evidence_policy": "sqlite_audit_only",
-            "current_time_model_only_for_post_qc_and_cell": True,
+            "relationship_identity": "raw_lif_peak_id_plus_ms_event_id",
+            "coordinates_and_time": "active_time_model_projection",
             "active_time_model_version": active_version,
             "input_policy": "first_principles_preprocessing_tables_plus_human_review",
             "label_policy": "Day labels are channel identity priors from raw filename/project config, not author CSV/h5ad labels",
@@ -8868,9 +8927,10 @@ class AppData:
         }
         rows: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
-        for row in self.store.records():
-            if row.get("review_status") != "accepted" or not bool(row.get("exportable")):
+        for stored_row in self.store.records():
+            if stored_row.get("review_status") != "accepted" or not bool(stored_row.get("exportable")):
                 continue
+            row = self.project_saved_relation(stored_row)
             stage = self.annotation_review_stage(row)
             if stage == "qc_calibration":
                 skipped.append(
@@ -8885,32 +8945,6 @@ class AppData:
                     {
                         "annotation_id": row.get("annotation_id"),
                         "reason": "not_a_main_cell_export_stage",
-                    }
-                )
-                continue
-            if stage in {"qc_survey", "cell_annotation"}:
-                row_version = str(row.get("time_model_version") or "")
-                if not active_version or not row_version or row_version != active_version:
-                    skipped.append(
-                        {
-                            "annotation_id": row.get("annotation_id"),
-                            "reason": "stale_time_model_version",
-                            "row_time_model_version": row_version,
-                            "active_time_model_version": active_version,
-                        }
-                    )
-                    continue
-            if stage == "qc_survey" and not self.qc_survey_matches_current_strategy(row):
-                skipped.append(
-                    {
-                        "annotation_id": row.get("annotation_id"),
-                        "reason": "stale_post_qc_strategy_hash",
-                        "row_post_qc_strategy_hash": str(
-                            row.get("post_qc_strategy_hash") or ""
-                        ),
-                        "active_post_qc_strategy_hash": str(
-                            self.project_config().get("post_qc_strategy_hash") or ""
-                        ),
                     }
                 )
                 continue
@@ -9837,18 +9871,31 @@ class AppData:
         return cls.load(project)
 
     def channel_shift_sec(self, channel: str, time_mode: str) -> float:
+        return self.channel_shift_sec_for_alignment(
+            channel,
+            time_mode,
+            alignment=self.alignment,
+        )
+
+    def channel_shift_sec_for_alignment(
+        self,
+        channel: str,
+        time_mode: str,
+        *,
+        alignment: dict[str, Any],
+    ) -> float:
         if time_mode != "aligned":
             return 0.0
         channel = str(channel).strip().upper()
         layout = normalize_acquisition_layout(self.acquisition_layout)
         axis = layout["channel_time_axes"].get(channel, default_time_axis_for_channel(channel))
-        axis_shifts = self.alignment.get("axis_shifts_sec")
+        axis_shifts = alignment.get("axis_shifts_sec")
         if isinstance(axis_shifts, dict) and axis in axis_shifts:
             return float(axis_shifts[axis])
         if axis == "green_axis":
-            return float(self.alignment.get("green_to_ms_shift_sec", 0.0))
+            return float(alignment.get("green_to_ms_shift_sec", 0.0))
         if axis == "red_axis":
-            return float(self.alignment.get("red_to_ms_shift_sec", 0.0))
+            return float(alignment.get("red_to_ms_shift_sec", 0.0))
         return 0.0
 
     def layout_lif_channels(self) -> list[dict[str, Any]]:
@@ -10108,6 +10155,245 @@ class AppData:
             ),
         )
 
+    def timeline_adjustment_preview(
+        self,
+        requested_axis_shifts_sec: dict[str, Any],
+        *,
+        ms_local_delta_sec: float,
+    ) -> dict[str, Any]:
+        """Build the third-stage timeline projection without writing project state."""
+
+        self.require_confirmed_calibration("预览第三阶段时间轴调整")
+        frozen = self.frozen_time_model()
+        if not frozen:
+            raise BadRequest("第三阶段时间轴调整需要已冻结的 time model")
+        try:
+            delta_sec = float(ms_local_delta_sec)
+        except (TypeError, ValueError) as exc:
+            raise BadRequest("后段 MS Δt 必须是有效秒数") from exc
+        if not math.isfinite(delta_sec) or abs(delta_sec) > LOCAL_DELTA_MAX_ABS_SEC:
+            raise BadRequest(
+                f"后段 MS Δt 绝对值必须不超过 {LOCAL_DELTA_MAX_ABS_SEC} sec"
+            )
+        qc_preview = self.qc_axis_manual_preview(requested_axis_shifts_sec)
+        candidate_alignment = self.alignment_with_axis_shift_preview(
+            requested_axis_shifts_sec
+        )
+        decision_rows = [
+            row
+            for row in self.store.records()
+            if self.annotation_review_stage(row) in {"qc_survey", "cell_annotation"}
+        ]
+        decision_signature = [
+            {
+                "annotation_id": str(row.get("annotation_id") or ""),
+                "review_status": str(row.get("review_status") or ""),
+                "updated_at": str(row.get("updated_at") or ""),
+                "lif_peak_id": str(row.get("lif_peak_id") or ""),
+                "lif_anchor_peak_ids": qc_anchor_peak_id_map(row),
+                "ms_event_id": str(row.get("ms_event_id") or ""),
+            }
+            for row in decision_rows
+        ]
+        signature = {
+            "base_time_model_version": str(frozen.get("time_model_version") or ""),
+            "physical_axis_preview_hash": str(qc_preview.get("preview_hash") or ""),
+            "axis_shifts_sec": {
+                str(axis): float(value)
+                for axis, value in sorted(
+                    (candidate_alignment.get("axis_shifts_sec") or {}).items()
+                )
+            },
+            "ms_local_delta_sec": delta_sec,
+            "decisions": decision_signature,
+        }
+        preview_hash = hashlib.sha256(
+            json.dumps(
+                signature,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        preview_time_model = {
+            **copy.deepcopy(frozen),
+            "time_model_version": f"preview_{preview_hash[:12]}",
+            "status": "frozen",
+            "ms_local_delta_sec": delta_sec,
+            "physical_axis_shifts_sec": copy.deepcopy(
+                candidate_alignment.get("axis_shifts_sec") or {}
+            ),
+        }
+        config = self.project_config()
+        delta_evidence_kwargs = self.local_delta_anchor_pair_kwargs(config)
+        delta_evidence_kwargs.update(
+            {
+                "axis_shifts_sec": candidate_alignment.get("axis_shifts_sec"),
+                "channel_time_axes": candidate_alignment.get("channel_time_axes"),
+                "qc_anchor_channels": candidate_alignment.get("qc_anchor_channels"),
+            }
+        )
+        channel_shifts = {
+            channel: self.channel_shift_sec_for_alignment(
+                channel,
+                "aligned",
+                alignment=candidate_alignment,
+            )
+            for channel in self.cell_annotation_channels()
+        }
+        delta_evidence = local_delta_preview_evidence(
+            self.lif_peaks,
+            self.ms_events,
+            annotation_start_min=float(config["annotation_start_min"]),
+            seed_window_min=float(config["local_delta_seed_window_min"]),
+            green_shift_sec=float(
+                candidate_alignment.get("green_to_ms_shift_sec", 0.0)
+            ),
+            red_shift_sec=float(
+                candidate_alignment.get("red_to_ms_shift_sec", 0.0)
+            ),
+            ms_delta_sec=delta_sec,
+            channel_shifts_sec=channel_shifts,
+            **delta_evidence_kwargs,
+        )
+        projected = [
+            self.project_saved_relation(
+                row,
+                alignment=candidate_alignment,
+                time_model=preview_time_model,
+            )
+            for row in decision_rows
+        ]
+        return {
+            "status": "preview",
+            "preview_hash": preview_hash,
+            "base_time_model_version": str(frozen.get("time_model_version") or ""),
+            "physical_axis": {
+                "model_id": qc_preview.get("model_id"),
+                "preview_hash": qc_preview.get("preview_hash"),
+                "axis_shifts_sec": copy.deepcopy(
+                    candidate_alignment.get("axis_shifts_sec") or {}
+                ),
+                "ms_fixed_reference": True,
+            },
+            "post_ms_delta": {
+                "ms_local_delta_sec": delta_sec,
+                "annotation_start_min": float(
+                    frozen.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+                ),
+                "evidence": delta_evidence,
+            },
+            "impact": {
+                "reviewed_relationships_preserved": len(decision_rows),
+                "needs_review_count": sum(
+                    1 for row in projected if bool(row.get("needs_review"))
+                ),
+                "unreviewed_auto_candidates": "rebuild",
+            },
+            "qc_alignment_preview": qc_preview,
+            "alignment": candidate_alignment,
+            "time_model": preview_time_model,
+        }
+
+    def apply_timeline_adjustment(
+        self,
+        requested_axis_shifts_sec: dict[str, Any],
+        *,
+        ms_local_delta_sec: float,
+        expected_preview_hash: str,
+    ) -> dict[str, Any]:
+        """Atomically commit a frozen third-stage timeline model revision."""
+
+        preview = self.timeline_adjustment_preview(
+            requested_axis_shifts_sec,
+            ms_local_delta_sec=ms_local_delta_sec,
+        )
+        if not expected_preview_hash or str(expected_preview_hash) != str(
+            preview.get("preview_hash") or ""
+        ):
+            raise BadRequest("时间轴或人工关系已变化；请重新预览后再应用")
+        previous = self.frozen_time_model()
+        if not previous:
+            raise BadRequest("第三阶段时间轴调整需要已冻结的 time model")
+        config = self.project_config()
+        new_version = f"tm_{uuid.uuid4().hex[:12]}"
+        time_model_payload = {
+            **copy.deepcopy(previous),
+            "time_model_version": new_version,
+            "created_at": now_iso(),
+            "status": "frozen",
+            "base_model_name": str(preview["alignment"].get("model") or "timeline_adjustment"),
+            "ms_local_delta_sec": float(ms_local_delta_sec),
+            "contains_cell_labels": False,
+            "previous_time_model_version": str(previous.get("time_model_version") or ""),
+            "time_model_revision": int(previous.get("time_model_revision", 0) or 0) + 1,
+            "method": "third_stage_timeline_adjustment",
+            "physical_axis_shifts_sec": copy.deepcopy(
+                preview["physical_axis"]["axis_shifts_sec"]
+            ),
+            "physical_axis_model_id": preview["physical_axis"].get("model_id"),
+            "physical_axis_preview_hash": preview["physical_axis"].get("preview_hash"),
+            "timeline_adjustment_preview_hash": preview["preview_hash"],
+            "candidate_invalidation": "unreviewed_auto_candidates_rebuild",
+            "downstream_invalidation": {
+                "unreviewed_auto_candidates": "invalidate_and_rebuild",
+                "reviewed_relationships": "preserve_and_reproject",
+                "umap_identity": "preserve",
+                "csv_identity": "preserve",
+            },
+            "reviewed_relationships_preserved": int(
+                preview["impact"]["reviewed_relationships_preserved"]
+            ),
+            "needs_review_count": int(preview["impact"]["needs_review_count"]),
+            "evidence_count": int(
+                preview["post_ms_delta"]["evidence"].get("evidence_count", 0)
+            ),
+            "unique_match_count": int(
+                preview["post_ms_delta"]["evidence"].get("unique_match_count", 0)
+            ),
+            "conflict_count": int(
+                preview["post_ms_delta"]["evidence"].get("conflict_count", 0)
+            ),
+            "median_abs_residual_sec": preview["post_ms_delta"]["evidence"].get(
+                "median_abs_residual_sec"
+            ),
+            "p90_abs_residual_sec": preview["post_ms_delta"]["evidence"].get(
+                "p90_abs_residual_sec"
+            ),
+            "evidence_preview": preview["post_ms_delta"]["evidence"].get(
+                "evidence", []
+            )[:50],
+            "acquisition_layout_hash": preview["alignment"].get(
+                "acquisition_layout_hash"
+            ),
+            "calibration_protocol_hash": config.get("calibration_protocol_hash"),
+        }
+        stored = self.store.apply_timeline_adjustment(
+            preview["qc_alignment_preview"],
+            time_model_payload,
+            expected_previous_time_model_version=str(
+                previous.get("time_model_version") or ""
+            ),
+        )
+        candidate_alignment = copy.deepcopy(preview["alignment"])
+        candidate_alignment["qc_alignment_model"] = stored["qc_alignment_model"]
+        candidate_alignment["status"] = "manual_axis_shift_active"
+        object.__setattr__(self, "alignment", candidate_alignment)
+        invalidate_request_cached_reads(
+            self,
+            "project_config",
+            "active_time_model",
+        )
+        return {
+            **stored,
+            "alignment": candidate_alignment,
+            "impact": preview["impact"],
+            "warning": (
+                "人工关系会保留，未审核候选会重算，"
+                "偏差过大的旧关系会标记需复核。"
+            ),
+        }
+
     def _save_qc_alignment_preview_model(
         self,
         preview: dict[str, Any],
@@ -10211,17 +10497,38 @@ class AppData:
         )
 
     def ms_shift_sec_at(self, time_min: float, time_mode: str, *, require_frozen: bool = False) -> float:
+        return self.ms_shift_sec_for_model(
+            time_min,
+            time_mode,
+            time_model=self.active_time_model(),
+            require_frozen=require_frozen,
+        )
+
+    def ms_shift_sec_for_model(
+        self,
+        time_min: float,
+        time_mode: str,
+        *,
+        time_model: dict[str, Any],
+        require_frozen: bool = False,
+    ) -> float:
         if time_mode != "aligned":
             return 0.0
-        model = self.active_time_model()
-        if require_frozen and str(model.get("status")) != "frozen":
+        if require_frozen and str(time_model.get("status")) != "frozen":
             return 0.0
-        if float(time_min) < float(model.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)):
+        if float(time_min) < float(
+            time_model.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+        ):
             return 0.0
-        return float(model.get("ms_local_delta_sec", 0.0) or 0.0)
+        return float(time_model.get("ms_local_delta_sec", 0.0) or 0.0)
 
     def time_model_payload_fields(self) -> dict[str, Any]:
-        model = self.active_time_model()
+        return self.time_model_payload_fields_for(self.active_time_model())
+
+    def time_model_payload_fields_for(
+        self,
+        model: dict[str, Any],
+    ) -> dict[str, Any]:
         payload = {
             "time_model_name": str(model.get("base_model_name", self.alignment["model"])),
             "time_model_version": str(model.get("time_model_version", "")),
@@ -10906,6 +11213,199 @@ class AppData:
             "input_policy": "first_principles_preprocessing_tables_only",
         }
 
+    def project_saved_relation(
+        self,
+        row: dict[str, Any],
+        *,
+        alignment: dict[str, Any] | None = None,
+        time_model: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project a durable raw-ID relation through a selected time model."""
+
+        alignment = alignment or self.alignment
+        time_model = time_model or self.active_time_model()
+        projection_version = str(time_model.get("time_model_version") or "")
+        decision_version = str(row.get("time_model_version") or "")
+        stage = self.annotation_review_stage(row)
+        base = {
+            **copy.deepcopy(row),
+            "decision_time_model_version": decision_version,
+            "projection_time_model_version": projection_version,
+            "projection_revision_changed": decision_version != projection_version,
+            "projection_unavailable": False,
+        }
+
+        def unavailable(reason: str) -> dict[str, Any]:
+            return {
+                **base,
+                "projection_unavailable": True,
+                "needs_review": True,
+                "review_reason": reason,
+            }
+
+        ms_event_id = str(row.get("ms_event_id") or "")
+        if "event_id" not in self.ms_events.columns:
+            return unavailable("原始 MS event 表不可用，关系已保留")
+        ms = self.ms_events[self.ms_events["event_id"].astype(str).eq(ms_event_id)]
+        if not ms_event_id or ms.empty:
+            return unavailable("原始 MS event ID 无法解析，关系已保留")
+        ms_row = ms.iloc[0]
+        ms_raw_min = float(ms_row["time_min"])
+        ms_raw_sec = float(ms_row.get("time_sec", ms_raw_min * 60.0))
+        ms_plot_sec = ms_raw_sec + self.ms_shift_sec_for_model(
+            ms_raw_min,
+            "aligned",
+            time_model=time_model,
+            require_frozen=True,
+        )
+
+        if stage == "cell_annotation":
+            peak_id = str(row.get("lif_peak_id") or "")
+            if "peak_id" not in self.lif_peaks.columns:
+                return unavailable("原始 LIF peak 表不可用，关系已保留")
+            peak = self.lif_peaks[
+                self.lif_peaks["peak_id"].astype(str).eq(peak_id)
+            ]
+            if not peak_id or peak.empty:
+                return unavailable("原始 LIF peak ID 无法解析，关系已保留")
+            peak_row = peak.iloc[0]
+            channel = str(
+                row.get("lif_channel") or peak_row.get("channel") or ""
+            ).strip().upper()
+            if str(peak_row.get("channel") or "").strip().upper() != channel:
+                return unavailable("LIF peak 与通道身份不一致，关系已保留")
+            lif_raw_min = float(peak_row["time_min"])
+            lif_raw_sec = float(
+                peak_row.get("time_sec", lif_raw_min * 60.0)
+            )
+            lif_plot_sec = lif_raw_sec + self.channel_shift_sec_for_alignment(
+                channel,
+                "aligned",
+                alignment=alignment,
+            )
+            residual = float(ms_plot_sec - lif_plot_sec)
+            tolerance = float(
+                row.get("match_tolerance_sec") or CELL_CANDIDATE_TOL_SEC
+            )
+            needs_review = bool(
+                decision_version != projection_version
+                and abs(residual) > tolerance
+            )
+            return {
+                **base,
+                "lif_channel": channel,
+                "lif_peak_id": peak_id,
+                "lif_raw_time_min": lif_raw_min,
+                "lif_plot_time_min": float(lif_plot_sec / 60.0),
+                "ms_time_min": ms_raw_min,
+                "ms_plot_time_min": float(ms_plot_sec / 60.0),
+                "expected_lif_time_sec": float(lif_plot_sec),
+                "residual_sec": residual,
+                "abs_residual_sec": abs(residual),
+                "projection_tolerance_sec": tolerance,
+                "needs_review": needs_review,
+                "review_reason": (
+                    f"新时间模型下偏差 {abs(residual):.2f} sec，需复核"
+                    if needs_review
+                    else None
+                ),
+            }
+
+        anchor_ids = {
+            str(channel).strip().upper(): str(peak_id)
+            for channel, peak_id in qc_anchor_peak_id_map(row).items()
+            if peak_id
+        }
+        if not anchor_ids:
+            return unavailable("原始 LIF anchor peak ID 无法解析，关系已保留")
+        layout = normalize_acquisition_layout(self.acquisition_layout)
+        plot_times: dict[str, float] = {}
+        raw_times: dict[str, float] = {}
+        axis_times: dict[str, list[float]] = {}
+        lif_anchors: list[dict[str, Any]] = []
+        for channel, peak_id in anchor_ids.items():
+            if "peak_id" not in self.lif_peaks.columns:
+                return unavailable("原始 LIF peak 表不可用，关系已保留")
+            peak = self.lif_peaks[
+                self.lif_peaks["peak_id"].astype(str).eq(str(peak_id))
+            ]
+            if peak.empty:
+                return unavailable(
+                    f"原始 LIF peak ID {peak_id} 无法解析，关系已保留"
+                )
+            peak_row = peak.iloc[0]
+            if str(peak_row.get("channel") or "").strip().upper() != channel:
+                return unavailable("LIF anchor 与通道身份不一致，关系已保留")
+            axis = str(
+                layout["channel_time_axes"].get(
+                    channel,
+                    default_time_axis_for_channel(channel),
+                )
+            )
+            peak_raw_min = float(peak_row["time_min"])
+            peak_raw_sec = float(
+                peak_row.get("time_sec", peak_raw_min * 60.0)
+            )
+            plot_sec = peak_raw_sec + self.channel_shift_sec_for_alignment(
+                channel,
+                "aligned",
+                alignment=alignment,
+            )
+            plot_times[channel] = float(plot_sec / 60.0)
+            raw_times[channel] = peak_raw_min
+            axis_times.setdefault(axis, []).append(plot_sec)
+            lif_anchors.append(
+                {
+                    "channel": channel,
+                    "time_axis": axis,
+                    "peak_id": str(peak_id),
+                    "raw_time_min": peak_raw_min,
+                    "plot_time_min": float(plot_sec / 60.0),
+                    "snr": clean_value(peak_row.get("snr")),
+                }
+            )
+        axis_composites_sec = {
+            axis: float(np.median(values)) for axis, values in axis_times.items()
+        }
+        lif_composite_sec = float(np.median(list(axis_composites_sec.values())))
+        residual = float(ms_plot_sec - lif_composite_sec)
+        tolerance = float(
+            row.get("match_tolerance_sec") or POST_QC_CANDIDATE_TOL_SEC
+        )
+        needs_review = bool(
+            stage == "qc_survey"
+            and decision_version != projection_version
+            and abs(residual) > tolerance
+        )
+        projected = {
+            **base,
+            "lif_anchors": lif_anchors,
+            "lif_anchor_peak_ids": anchor_ids,
+            "lif_anchor_raw_times_min": raw_times,
+            "lif_anchor_plot_times_min": plot_times,
+            "axis_composite_times_min": {
+                axis: value / 60.0
+                for axis, value in axis_composites_sec.items()
+            },
+            "ms_time_min": ms_raw_min,
+            "ms_plot_time_min": float(ms_plot_sec / 60.0),
+            "lif_composite_plot_time_min": float(lif_composite_sec / 60.0),
+            "residual_sec": residual,
+            "composite_to_ms_residual_sec": residual,
+            "abs_residual_sec": abs(residual),
+            "abs_composite_to_ms_residual_sec": abs(residual),
+            "projection_tolerance_sec": tolerance,
+            "needs_review": needs_review,
+            "review_reason": (
+                f"新时间模型下偏差 {abs(residual):.2f} sec，需复核"
+                if needs_review
+                else None
+            ),
+        }
+        for channel, value in plot_times.items():
+            projected[f"{channel.lower()}_plot_time_min"] = value
+        return projected
+
     def payload_from_auto_candidate_id(
         self,
         annotation_id: str,
@@ -11395,9 +11895,10 @@ class AppData:
     ) -> dict[str, Any]:
         existing = self.store.get(annotation_id)
         if existing and existing.get("source") == "manual_created":
+            projected_existing = self.project_saved_relation(existing)
             payload = {
                 key: value
-                for key, value in existing.items()
+                for key, value in projected_existing.items()
                 if key
                 not in {
                     "annotation_id",
@@ -11406,8 +11907,16 @@ class AppData:
                     "exportable",
                     "created_at",
                     "updated_at",
+                    "decision_time_model_version",
+                    "projection_time_model_version",
+                    "projection_revision_changed",
+                    "projection_unavailable",
+                    "needs_review",
+                    "review_reason",
+                    "projection_tolerance_sec",
                 }
             }
+            payload.update(self.time_model_payload_fields())
             if str(payload.get("review_stage") or "") == "qc_calibration":
                 self.require_confirmed_calibration("审核前段校准证据")
             if review_status == "accepted":
@@ -11824,12 +12333,18 @@ class AppData:
         *,
         post_qc: bool,
         stored_review: dict[str, Any] | None = None,
+        time_model: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         generated_id = post_qc_candidate_id(group) if post_qc else candidate_id_for_group(group)
         stored = stored_review or self.store.get(generated_id)
         annotation_id = str(stored.get("annotation_id")) if stored else generated_id
-        active_version = str(self.active_time_model().get("time_model_version", ""))
-        frozen = self.frozen_time_model()
+        projection_model = time_model or self.active_time_model()
+        active_version = str(projection_model.get("time_model_version", ""))
+        frozen = (
+            projection_model
+            if str(projection_model.get("status") or "") == "frozen"
+            else None
+        )
         stored_version = str(stored.get("time_model_version", "")) if stored else ""
         strategy = self.project_config().get("post_qc_strategy", {}) if post_qc else {}
         current_strategy_hash = (
@@ -11847,10 +12362,7 @@ class AppData:
             and not strategy.get("compatibility_mode")
             and stored_strategy_hash != current_strategy_hash
         )
-        if stale_time_model or stale_strategy:
-            review_status = "pending"
-        else:
-            review_status = str(stored.get("review_status")) if stored else "pending"
+        review_status = str(stored.get("review_status")) if stored else "pending"
         generated_type = (
             "qc_survey_post_10p5"
             if post_qc and bool(strategy.get("compatibility_mode"))
@@ -11862,12 +12374,12 @@ class AppData:
         )
         return {
             **group,
-            **self.time_model_payload_fields(),
+            **self.time_model_payload_fields_for(projection_model),
             "annotation_id": annotation_id,
             "candidate_id": generated_id,
             "candidate_type": (
                 str(stored.get("candidate_type"))
-                if stored and stored.get("candidate_type") and not stale_strategy
+                if stored and stored.get("candidate_type")
                 else generated_type
             ),
             "source": str(stored.get("source")) if stored else "auto_candidate",
@@ -11877,31 +12389,36 @@ class AppData:
             "post_qc_strategy_hash": (
                 current_strategy_hash if post_qc else None
             ),
-            "stale_review_status": (
-                str(stored.get("review_status"))
-                if stored and (stale_time_model or stale_strategy)
-                else None
-            ),
+            "stale_review_status": None,
             "stale_time_model_version": stored_version if stale_time_model else None,
             "stale_post_qc_strategy_hash": stored_strategy_hash if stale_strategy else None,
         }
 
-    def build_post_qc_candidates(self, context_start_min: float, context_end_min: float, time_mode: str) -> list[dict[str, Any]]:
+    def build_post_qc_candidates(
+        self,
+        context_start_min: float,
+        context_end_min: float,
+        time_mode: str,
+        *,
+        alignment: dict[str, Any] | None = None,
+        time_model: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         config = self.project_config()
+        projection_alignment = alignment or self.alignment
+        model = time_model or self.active_time_model()
         qc_end = float(config.get("qc_calibration_end_min", QC_SHIFT_WINDOW_MIN))
         if time_mode != "aligned" or context_end_min <= qc_end:
             return []
-        if not self.frozen_time_model():
+        if str(model.get("status") or "") != "frozen":
             return []
         strategy = normalize_post_qc_strategy(
             config.get("post_qc_strategy"), self.acquisition_layout
         )
         if strategy["mode"] == "disabled":
             return []
-        model = self.active_time_model()
-        pair_offset = self.alignment.get("qc_groups", {}).get("lif_anchor_b_minus_anchor_a_offset_sec")
+        pair_offset = projection_alignment.get("qc_groups", {}).get("lif_anchor_b_minus_anchor_a_offset_sec")
         if pair_offset is None:
-            pair_offset = self.alignment.get("qc_groups", {}).get("lif_r1_minus_g2_offset_sec")
+            pair_offset = projection_alignment.get("qc_groups", {}).get("lif_r1_minus_g2_offset_sec")
         if pair_offset is None:
             pair_offset = 0.0
         ms_shift_sec = 0.0
@@ -11914,14 +12431,14 @@ class AppData:
                 context_start_min=context_start_min,
                 context_end_min=context_end_min,
                 qc_calibration_end_min=qc_end,
-                green_shift_sec=float(self.alignment["green_to_ms_shift_sec"]),
-                red_shift_sec=float(self.alignment["red_to_ms_shift_sec"]),
+                green_shift_sec=float(projection_alignment["green_to_ms_shift_sec"]),
+                red_shift_sec=float(projection_alignment["red_to_ms_shift_sec"]),
                 ms_shift_sec=ms_shift_sec,
                 pair_offset_sec=float(pair_offset),
                 tolerance_sec=POST_QC_CANDIDATE_TOL_SEC,
-                axis_shifts_sec=self.alignment.get("axis_shifts_sec"),
-                channel_time_axes=self.alignment.get("channel_time_axes"),
-                qc_anchor_channels=self.alignment.get("qc_anchor_channels"),
+                axis_shifts_sec=projection_alignment.get("axis_shifts_sec"),
+                channel_time_axes=projection_alignment.get("channel_time_axes"),
+                qc_anchor_channels=projection_alignment.get("qc_anchor_channels"),
             )
         else:
             current_strategy_hash = str(config.get("post_qc_strategy_hash") or "")
@@ -11951,9 +12468,9 @@ class AppData:
             annotation_start = float(
                 model.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
             )
-            axis_shifts = dict(self.alignment.get("axis_shifts_sec") or {})
+            axis_shifts = dict(projection_alignment.get("axis_shifts_sec") or {})
             channel_axes = dict(
-                self.alignment.get("channel_time_axes")
+                projection_alignment.get("channel_time_axes")
                 or normalize_acquisition_layout(self.acquisition_layout)["channel_time_axes"]
             )
             groups = []
@@ -12022,33 +12539,52 @@ class AppData:
             if (allowed_ids is None or str(group.get("ms_event_id")) in allowed_ids)
             and str(group.get("ms_event_id")) not in accepted_cell_ids
         ]
-        return [self.enrich_qc_candidate(group, post_qc=True) for group in groups]
+        return [
+            self.enrich_qc_candidate(
+                group,
+                post_qc=True,
+                time_model=model,
+            )
+            for group in groups
+        ]
 
-    def enrich_cell_candidate(self, row: dict[str, Any]) -> dict[str, Any]:
+    def enrich_cell_candidate(
+        self,
+        row: dict[str, Any],
+        *,
+        time_model: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         annotation_id = cell_candidate_id(row)
         stored = self.store.get(annotation_id)
-        active_version = str(self.active_time_model().get("time_model_version", ""))
+        projection_model = time_model or self.active_time_model()
+        active_version = str(projection_model.get("time_model_version", ""))
         stored_version = str(stored.get("time_model_version", "")) if stored else ""
-        if stored and stored_version != active_version:
-            review_status = "pending"
-        else:
-            review_status = str(stored.get("review_status")) if stored else "pending"
+        review_status = str(stored.get("review_status")) if stored else "pending"
         return {
             **row,
-            **self.time_model_payload_fields(),
+            **self.time_model_payload_fields_for(projection_model),
             "annotation_id": annotation_id,
             "candidate_id": annotation_id,
             "candidate_type": str(row.get("candidate_type") or "cell_high_confidence"),
             "source": "auto_candidate",
             "review_status": review_status,
             "exportable": review_status == "accepted",
-            "review_enabled": bool(self.frozen_time_model()),
-            "stale_review_status": str(stored.get("review_status")) if stored and stored_version != active_version else None,
+            "review_enabled": str(projection_model.get("status") or "") == "frozen",
+            "stale_review_status": None,
             "stale_time_model_version": stored_version if stored and stored_version != active_version else None,
         }
 
-    def build_cell_candidates(self, context_start_min: float, context_end_min: float, time_mode: str) -> list[dict[str, Any]]:
-        frozen = self.frozen_time_model()
+    def build_cell_candidates(
+        self,
+        context_start_min: float,
+        context_end_min: float,
+        time_mode: str,
+        *,
+        alignment: dict[str, Any] | None = None,
+        time_model: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        projection_alignment = alignment or self.alignment
+        frozen = time_model or self.frozen_time_model()
         if not frozen:
             return []
         annotation_start = float(frozen.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN))
@@ -12065,7 +12601,11 @@ class AppData:
                     channel=channel,
                     context_start_min=context_start_min,
                     context_end_min=context_end_min,
-                    shift_sec=self.channel_shift_sec(channel, "aligned"),
+                    shift_sec=self.channel_shift_sec_for_alignment(
+                        channel,
+                        "aligned",
+                        alignment=projection_alignment,
+                    ),
                     ms_shift_sec=ms_shift_sec,
                     annotation_start_min=annotation_start,
                     excluded_ms_event_ids=excluded_ms_event_ids,
@@ -12079,7 +12619,6 @@ class AppData:
             for row in rows
             if allowed_ids is None or str(row.get("ms_event_id")) in allowed_ids
         ]
-        active_version = str(frozen.get("time_model_version") or "")
         manual_relation_keys = {
             (
                 str(review.get("lif_channel") or "").strip().upper(),
@@ -12089,7 +12628,6 @@ class AppData:
             for review in self.store.records()
             if str(review.get("source") or "") == "manual_created"
             and self.manual_annotation_stage(review) == "cell_annotation"
-            and str(review.get("time_model_version") or "") == active_version
         }
         rows = [
             row
@@ -12132,7 +12670,7 @@ class AppData:
                     }
                 )
         enriched = [
-            self.enrich_cell_candidate(row)
+            self.enrich_cell_candidate(row, time_model=frozen)
             for row in rows
         ]
         accepted_cell_ids = self.accepted_cell_annotation_ms_event_ids()
@@ -12230,26 +12768,18 @@ class AppData:
         *,
         context_start_min: float | None = None,
         context_end_min: float | None = None,
+        alignment: dict[str, Any] | None = None,
+        time_model: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         context_start = float(window_start_min) if context_start_min is None else float(context_start_min)
         context_end = float(window_end_min) if context_end_min is None else float(context_end_min)
         rows = []
-        for row in self.store.records():
-            status = str(row.get("review_status", "pending"))
-            stage = self.manual_annotation_stage(row)
-            if status == "pending" and not (
-                str(row.get("source") or "") == "manual_created"
-                and stage == "cell_annotation"
-            ):
-                continue
-            if stage in {"qc_survey", "cell_annotation"}:
-                frozen = self.frozen_time_model()
-                active_version = str(frozen.get("time_model_version", "")) if frozen else ""
-                row_version = str(row.get("time_model_version") or "")
-                if not active_version or row_version != active_version:
-                    continue
-            if stage == "qc_survey" and not self.qc_survey_matches_current_strategy(row):
-                continue
+        for stored_row in self.store.records():
+            row = self.project_saved_relation(
+                stored_row,
+                alignment=alignment,
+                time_model=time_model,
+            )
             dynamic_plot_times = row.get("lif_anchor_plot_times_min")
             lif_plot_times = [row.get("lif_plot_time_min")]
             if isinstance(dynamic_plot_times, dict):
@@ -12329,12 +12859,7 @@ class AppData:
     def is_qc_survey_annotation(self, row: dict[str, Any]) -> bool:
         if str(row.get("review_status")) != "accepted":
             return False
-        frozen = self.frozen_time_model()
-        active_version = str(frozen.get("time_model_version", "")) if frozen else ""
-        row_version = str(row.get("time_model_version") or "")
-        if not active_version or row_version != active_version:
-            return False
-        return self.qc_survey_matches_current_strategy(row)
+        return self.annotation_review_stage(row) == "qc_survey"
 
     def accepted_qc_survey_ms_event_ids(self) -> set[str]:
         ids: set[str] = set()
@@ -12349,10 +12874,6 @@ class AppData:
     def is_cell_annotation(self, row: dict[str, Any]) -> bool:
         if str(row.get("review_status")) != "accepted":
             return False
-        frozen = self.frozen_time_model()
-        active_version = str(frozen.get("time_model_version", "")) if frozen else ""
-        if not active_version or str(row.get("time_model_version") or "") != active_version:
-            return False
         return self.annotation_review_stage(row) == "cell_annotation"
 
     def accepted_cell_annotation_ms_event_ids(self) -> set[str]:
@@ -12366,11 +12887,19 @@ class AppData:
         self,
         context_start_min: float,
         context_end_min: float,
+        *,
+        alignment: dict[str, Any] | None = None,
+        time_model: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for row in self.store.records():
-            if not self.is_qc_survey_annotation(row):
+        for stored_row in self.store.records():
+            if not self.is_qc_survey_annotation(stored_row):
                 continue
+            row = self.project_saved_relation(
+                stored_row,
+                alignment=alignment,
+                time_model=time_model,
+            )
             ms_plot_time = row.get("ms_plot_time_min")
             if not isinstance(ms_plot_time, (int, float)):
                 continue
@@ -12429,6 +12958,48 @@ class AppData:
             if preview_axis_shifts_sec is not None
             else self.alignment
         )
+        request_time_model = copy.deepcopy(self.active_time_model())
+        if preview_ms_delta_sec is not None:
+            request_time_model["ms_local_delta_sec"] = float(preview_ms_delta_sec)
+        persisted_axis_shifts = self.alignment.get("axis_shifts_sec") or {}
+        axis_preview_changed = bool(
+            preview_axis_shifts_sec is not None
+            and any(
+                abs(
+                    float(request_alignment.get("axis_shifts_sec", {}).get(axis, 0.0))
+                    - float(persisted_axis_shifts.get(axis, 0.0))
+                )
+                > 1e-9
+                for axis in set(request_alignment.get("axis_shifts_sec", {}))
+                | set(persisted_axis_shifts)
+            )
+        )
+        delta_preview_changed = bool(
+            preview_ms_delta_sec is not None
+            and abs(
+                float(request_time_model.get("ms_local_delta_sec", 0.0) or 0.0)
+                - float(self.active_time_model().get("ms_local_delta_sec", 0.0) or 0.0)
+            )
+            > 1e-9
+        )
+        if axis_preview_changed or delta_preview_changed:
+            preview_projection_signature = {
+                "base_time_model_version": str(
+                    request_time_model.get("time_model_version") or ""
+                ),
+                "axis_shifts_sec": request_alignment.get("axis_shifts_sec") or {},
+                "ms_local_delta_sec": float(
+                    request_time_model.get("ms_local_delta_sec", 0.0) or 0.0
+                ),
+            }
+            request_time_model["time_model_version"] = "preview_" + hashlib.sha256(
+                json.dumps(
+                    preview_projection_signature,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:12]
         layout = normalize_acquisition_layout(self.acquisition_layout)
 
         def request_channel_shift_sec(channel: str) -> float:
@@ -12498,7 +13069,7 @@ class AppData:
             if peak_parts
             else pd.DataFrame()
         )
-        ms_model = self.active_time_model()
+        ms_model = request_time_model
         if preview_ms_delta_sec is not None and abs(float(preview_ms_delta_sec)) > LOCAL_DELTA_MAX_ABS_SEC:
             raise BadRequest(f"preview_ms_delta_sec absolute value must be <= {LOCAL_DELTA_MAX_ABS_SEC} sec")
         ms_delta_sec = float(ms_model.get("ms_local_delta_sec", 0.0) or 0.0)
@@ -12643,6 +13214,7 @@ class AppData:
                         group,
                         post_qc=False,
                         stored_review=stored_review,
+                        time_model=request_time_model,
                     )
                     block_reason = qc_group_batch_accept_block_reason(
                         candidate,
@@ -12655,7 +13227,13 @@ class AppData:
 
         post_qc_candidates = [
             candidate
-            for candidate in self.build_post_qc_candidates(context_start_min, context_end_min, time_mode)
+            for candidate in self.build_post_qc_candidates(
+                context_start_min,
+                context_end_min,
+                time_mode,
+                alignment=request_alignment,
+                time_model=request_time_model,
+            )
             if (plot_times := qc_group_plot_times(candidate))
             and all(start_min <= t <= end_min for t in plot_times)
         ]
@@ -12669,22 +13247,38 @@ class AppData:
             candidate["batch_accept_eligible"] = block_reason is None
         cell_candidates = [
             candidate
-            for candidate in self.build_cell_candidates(context_start_min, context_end_min, time_mode)
+            for candidate in self.build_cell_candidates(
+                context_start_min,
+                context_end_min,
+                time_mode,
+                alignment=request_alignment,
+                time_model=request_time_model,
+            )
             if all(
                 start_min <= float(candidate[key]) <= end_min
                 for key in ("lif_plot_time_min", "ms_plot_time_min")
             )
         ]
         cell_qc_anchors = (
-            self.accepted_qc_survey_anchors_for_window(start_min, end_min)
+            self.accepted_qc_survey_anchors_for_window(
+                start_min,
+                end_min,
+                alignment=request_alignment,
+                time_model=request_time_model,
+            )
             if time_mode == "aligned"
             else []
         )
 
-        represented_manual_ids = {
+        represented_relation_ids = {
             str(group.get("annotation_id"))
-            for group in alignment_groups
-            if group.get("source") == "manual_created" and group.get("annotation_id")
+            for group in [
+                *alignment_groups,
+                *post_qc_candidates,
+                *cell_candidates,
+                *cell_qc_anchors,
+            ]
+            if group.get("annotation_id")
         }
         annotations = [
             row
@@ -12693,8 +13287,10 @@ class AppData:
                 end_min,
                 context_start_min=context_start_min,
                 context_end_min=context_end_min,
+                alignment=request_alignment,
+                time_model=request_time_model,
             )
-            if str(row.get("annotation_id")) not in represented_manual_ids
+            if str(row.get("annotation_id")) not in represented_relation_ids
         ]
         annotation_counts = {status: 0 for status in REVIEW_STATUSES}
         for group in alignment_groups:
@@ -12764,7 +13360,7 @@ class AppData:
             },
             "alignment": request_alignment,
             "project_config": self.project_config(),
-            "time_model": self.active_time_model(),
+            "time_model": request_time_model,
             "preview_ms_delta_sec": clean_value(preview_ms_delta_sec),
             "preview_axis_shifts_sec": clean_value(preview_axis_shifts_sec),
             "alignment_groups": alignment_groups,
@@ -13241,6 +13837,10 @@ HTML = r"""<!doctype html>
     .candidate-row.rejected {
       opacity: 0.58;
       background: #f6f7f9;
+    }
+    .candidate-row.needs-review {
+      border-color: #d97706;
+      background: #fffbeb;
     }
     .row-title {
       display: flex;
@@ -14339,6 +14939,27 @@ HTML = r"""<!doctype html>
         <button type="button" data-event-filter="qc">QC</button>
         <button type="button" data-event-filter="cell">Cells</button>
       </div>
+      <div id="timelineAdjustBox" class="manual-box" style="display:none; margin-top:8px;">
+        <button id="timelineAdjustToggle" class="small-button secondary" style="width:100%;">调整时间轴</button>
+        <div id="timelineAdjustPanel" class="axis-fine-tune-panel" style="display:none;">
+          <p class="axis-fine-tune-help">物理轴校正移动 LIF；后段 MS Δt 只移动事件起点后的 MS。MS 始终是固定参考。</p>
+          <div id="timelineAxisRows"></div>
+          <div class="axis-fine-tune-row">
+            <div class="axis-fine-tune-heading"><strong>后段 MS Δt</strong><output id="timelineDeltaReadout" class="axis-fine-tune-value">0.00 sec</output></div>
+            <input id="timelineDeltaSlider" class="axis-fine-tune-slider" type="range" min="-20" max="20" step="0.05" value="0" aria-label="后段 MS 时间差" />
+            <div class="axis-fine-tune-nudges">
+              <button id="timelineDeltaMinus" type="button" class="small-button secondary">−0.25 sec</button>
+              <button id="timelineDeltaPlus" type="button" class="small-button secondary">+0.25 sec</button>
+            </div>
+          </div>
+          <p class="axis-fine-tune-help" style="margin-top:8px;">人工关系会保留，未审核候选会重算，偏差过大的旧关系会标记需复核。</p>
+          <div class="axis-fine-tune-actions">
+            <button id="timelineAdjustCancel" class="small-button secondary">取消预览</button>
+            <button id="timelineAdjustApply" class="small-button">应用调整</button>
+          </div>
+          <div id="timelineAdjustStatus" class="empty" style="margin-top:6px;"></div>
+        </div>
+      </div>
       <div id="qcRefitPanel" class="manual-box" style="display:none; margin-top:8px;">
         <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考峰预览重算</button>
         <div id="qcRefitStats" class="empty" style="margin-top:6px;">尚未生成重算预览。</div>
@@ -14722,6 +15343,12 @@ HTML = r"""<!doctype html>
       axisFineTuneBaseShifts: null,
       axisFineTuneShifts: null,
       axisFineTuneRanges: null,
+      timelineAdjustOpen: false,
+      timelineBaseAxisShifts: null,
+      timelineAxisShifts: null,
+      timelineAxisRanges: null,
+      timelineBaseDeltaSec: null,
+      timelineDeltaSec: null,
       manual: { anchors: {}, LIF: null, MS760: null },
       requestSeq: 0,
       actionBusy: false,
@@ -14747,13 +15374,25 @@ HTML = r"""<!doctype html>
     const MAX_WINDOW_MIN = 15.0;
     const SIGNAL_COLORS = __LMA_SIGNAL_COLORS__;
     let livePreviewDrawFrame = null;
+    let timelinePreviewRefreshTimer = null;
 
     function scheduleLivePreviewDraw() {
       if (livePreviewDrawFrame !== null || !state.current) return;
       livePreviewDrawFrame = window.requestAnimationFrame(() => {
         livePreviewDrawFrame = null;
-        applyLivePreviewTransforms();
+        if (state.stage === 'event_annotation' && state.timelineAdjustOpen) draw();
+        else applyLivePreviewTransforms();
       });
+    }
+
+    function scheduleTimelinePreviewRefresh() {
+      if (!state.timelineAdjustOpen || state.stage !== 'event_annotation') return;
+      if (timelinePreviewRefreshTimer !== null) window.clearTimeout(timelinePreviewRefreshTimer);
+      timelinePreviewRefreshTimer = window.setTimeout(() => {
+        timelinePreviewRefreshTimer = null;
+        if (!state.timelineAdjustOpen || state.stage !== 'event_annotation') return;
+        loadWindow().catch(err => showInteractionHint(`预览刷新失败：${err.message || err}`));
+      }, 180);
     }
 
     const fallbackLifTracks = [
@@ -15960,9 +16599,15 @@ HTML = r"""<!doctype html>
       if (state.stage === 'qc_calibration' && state.timeMode === 'aligned' && state.axisFineTuneShifts !== null) {
         url += `&preview_axis_shifts_sec=${encodeURIComponent(JSON.stringify(state.axisFineTuneShifts))}`;
       }
+      if (state.stage === 'event_annotation' && state.timelineAdjustOpen) {
+        url += `&preview_axis_shifts_sec=${encodeURIComponent(JSON.stringify(state.timelineAxisShifts || {}))}`;
+        url += `&preview_ms_delta_sec=${encodeURIComponent(Number(state.timelineDeltaSec || 0))}`;
+      }
       if (state.stage === 'local_calibration') {
         url += '&live_preview_context=ms';
       } else if (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null) {
+        url += '&live_preview_context=lif';
+      } else if (state.stage === 'event_annotation' && state.timelineAdjustOpen) {
         url += '&live_preview_context=lif';
       }
       const payload = await fetchJson(url);
@@ -15972,7 +16617,11 @@ HTML = r"""<!doctype html>
       state.width = state.current.window_min;
       el('widthDisplay').value = fmt(state.width, 2);
       state.meta.project_config = payload.project_config || state.meta.project_config;
-      state.meta.time_model = payload.time_model || state.meta.time_model;
+      const hasWindowPreview = payload.preview_ms_delta_sec !== null
+        && payload.preview_ms_delta_sec !== undefined
+        || payload.preview_axis_shifts_sec !== null
+        && payload.preview_axis_shifts_sec !== undefined;
+      if (!hasWindowPreview) state.meta.time_model = payload.time_model || state.meta.time_model;
       el('start').value = state.start.toFixed(2);
       if (state.stage === 'local_calibration' && calibrationBoundariesConfirmed()) {
         await loadLocalDeltaPreview(state.previewDeltaSec);
@@ -16287,16 +16936,15 @@ HTML = r"""<!doctype html>
       } else {
         rows = [...(state.current?.alignment_groups || [])];
       }
-      const manualRows = (state.current?.annotations || [])
-        .filter(row => row.source === 'manual_created')
+      const savedRows = (state.current?.annotations || [])
         .filter(row => manualBelongsToStage(row, state.stage))
         .filter(row => state.stage !== 'event_annotation' || eventRowMatchesFilter(row))
         .map(row => ({
           ...row,
-          rank: '人工',
+          rank: row.source === 'manual_created' ? '人工' : '已审',
           candidate_id: row.annotation_id
         }));
-      const combined = (state.stage === 'qc_calibration' || state.stage === 'event_annotation') ? [...rows, ...manualRows] : rows;
+      const combined = (state.stage === 'qc_calibration' || state.stage === 'event_annotation') ? [...rows, ...savedRows] : rows;
       return combined
         .filter(row => state.showRejected || row.review_status !== 'rejected')
         .sort((a, b) => Number(a.ms_plot_time_min || a.ms_time_min || 0) - Number(b.ms_plot_time_min || b.ms_time_min || 0));
@@ -16833,6 +17481,169 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function timelineAdjustmentDirty() {
+      if (!state.timelineAdjustOpen || !state.timelineAxisShifts || !state.timelineBaseAxisShifts) return false;
+      const axisChanged = configuredPhysicalAxes().some(axis => (
+        Math.abs(Number(state.timelineAxisShifts[axis] || 0) - Number(state.timelineBaseAxisShifts[axis] || 0)) > 1e-9
+      ));
+      return axisChanged
+        || Math.abs(Number(state.timelineDeltaSec || 0) - Number(state.timelineBaseDeltaSec || 0)) > 1e-9;
+    }
+
+    function renderTimelineAdjustmentPanel() {
+      const visible = state.stage === 'event_annotation'
+        && (state.current?.time_model || state.meta?.time_model || {}).status === 'frozen';
+      el('timelineAdjustBox').style.display = visible ? 'block' : 'none';
+      if (!visible) return;
+      el('timelineAdjustToggle').textContent = state.timelineAdjustOpen ? '关闭时间轴调整' : '调整时间轴';
+      el('timelineAdjustToggle').disabled = state.actionBusy;
+      el('timelineAdjustPanel').style.display = state.timelineAdjustOpen ? 'block' : 'none';
+      if (!state.timelineAdjustOpen) return;
+      const axes = configuredPhysicalAxes();
+      const shifts = state.timelineAxisShifts || {};
+      const base = state.timelineBaseAxisShifts || {};
+      el('timelineAxisRows').innerHTML = axes.map(axis => {
+        const channels = calibrationAxisChannels(axis);
+        const label = axis === 'green_axis' ? 'Green axis' : axis === 'red_axis' ? 'Red axis' : physicalAxisName(axis);
+        const value = Number(shifts[axis] ?? base[axis] ?? 0);
+        const bounds = state.timelineAxisRanges?.[axis] || axisFineTuneBounds(axis, value);
+        return `<div class="axis-fine-tune-row" data-timeline-axis="${escapeText(axis)}">`
+          + `<div class="axis-fine-tune-heading"><strong>${escapeText(label)}${channels.length ? ` ${escapeText(channels.join('/'))}` : ''}</strong>`
+          + `<output class="axis-fine-tune-value" data-timeline-axis-readout>${value >= 0 ? '+' : ''}${escapeText(fmt(value, 2))} sec</output></div>`
+          + `<input class="axis-fine-tune-slider" type="range" min="${escapeText(String(bounds.min))}" max="${escapeText(String(bounds.max))}" step="0.05" value="${escapeText(String(value))}" aria-label="${escapeText(label)}" />`
+          + `<div class="axis-fine-tune-nudges"><button type="button" class="small-button secondary" data-timeline-axis-adjust="-0.25">−0.25 sec</button>`
+          + `<button type="button" class="small-button secondary" data-timeline-axis-adjust="0.25">+0.25 sec</button></div></div>`;
+      }).join('');
+      el('timelineAxisRows').querySelectorAll('[data-timeline-axis]').forEach(row => {
+        const axis = row.dataset.timelineAxis;
+        const slider = row.querySelector('.axis-fine-tune-slider');
+        slider.disabled = state.actionBusy;
+        slider.addEventListener('input', () => updateTimelineAxisValue(axis, Number(slider.value)));
+        row.querySelectorAll('[data-timeline-axis-adjust]').forEach(button => {
+          button.disabled = state.actionBusy;
+          button.addEventListener('click', () => updateTimelineAxisValue(
+            axis,
+            Number(state.timelineAxisShifts?.[axis] || 0) + Number(button.dataset.timelineAxisAdjust || 0)
+          ));
+        });
+      });
+      const delta = Number(state.timelineDeltaSec || 0);
+      el('timelineDeltaSlider').value = String(Math.max(-20, Math.min(20, delta)));
+      el('timelineDeltaSlider').disabled = state.actionBusy;
+      el('timelineDeltaReadout').textContent = `${delta >= 0 ? '+' : ''}${fmt(delta, 2)} sec`;
+      el('timelineDeltaMinus').disabled = state.actionBusy;
+      el('timelineDeltaPlus').disabled = state.actionBusy;
+      el('timelineAdjustCancel').disabled = state.actionBusy;
+      el('timelineAdjustApply').disabled = state.actionBusy || !timelineAdjustmentDirty();
+      el('timelineAdjustStatus').textContent = timelineAdjustmentDirty()
+        ? '正在实时预览，项目尚未写入。'
+        : '当前为已应用模型。';
+    }
+
+    async function toggleTimelineAdjustment() {
+      if (state.actionBusy) return;
+      if (state.timelineAdjustOpen) {
+        await cancelTimelineAdjustment();
+        return;
+      }
+      const shifts = persistedAxisShifts();
+      const axes = configuredPhysicalAxes();
+      state.timelineBaseAxisShifts = Object.fromEntries(axes.map(axis => [axis, Number(shifts[axis] || 0)]));
+      state.timelineAxisShifts = { ...state.timelineBaseAxisShifts };
+      state.timelineAxisRanges = Object.fromEntries(
+        axes.map(axis => [axis, axisFineTuneBounds(axis, state.timelineBaseAxisShifts[axis])])
+      );
+      const model = state.meta?.time_model || state.current?.time_model || {};
+      state.timelineBaseDeltaSec = Number(model.ms_local_delta_sec || 0);
+      state.timelineDeltaSec = state.timelineBaseDeltaSec;
+      state.timelineAdjustOpen = true;
+      state.timeMode = 'aligned';
+      el('timeMode').value = 'aligned';
+      renderCurrentState();
+      await loadWindow();
+    }
+
+    function updateTimelineAxisValue(axis, value) {
+      if (!state.timelineAdjustOpen || state.actionBusy || !Number.isFinite(value)) return;
+      const bounds = state.timelineAxisRanges?.[axis] || axisFineTuneBounds(axis, value);
+      if (value < bounds.min || value > bounds.max) return;
+      state.timelineAxisShifts = {
+        ...state.timelineAxisShifts,
+        [axis]: Math.round(value * 100) / 100,
+      };
+      renderTimelineAdjustmentPanel();
+      scheduleLivePreviewDraw();
+      scheduleTimelinePreviewRefresh();
+    }
+
+    function updateTimelineDeltaValue(value) {
+      if (!state.timelineAdjustOpen || state.actionBusy || !Number.isFinite(value)) return;
+      state.timelineDeltaSec = Math.round(Math.max(-20, Math.min(20, value)) * 100) / 100;
+      renderTimelineAdjustmentPanel();
+      scheduleLivePreviewDraw();
+      scheduleTimelinePreviewRefresh();
+    }
+
+    async function cancelTimelineAdjustment() {
+      const hadPreview = state.timelineAdjustOpen;
+      if (timelinePreviewRefreshTimer !== null) {
+        window.clearTimeout(timelinePreviewRefreshTimer);
+        timelinePreviewRefreshTimer = null;
+      }
+      state.timelineAdjustOpen = false;
+      state.timelineBaseAxisShifts = null;
+      state.timelineAxisShifts = null;
+      state.timelineAxisRanges = null;
+      state.timelineBaseDeltaSec = null;
+      state.timelineDeltaSec = null;
+      renderCurrentState();
+      if (hadPreview && state.current) await loadWindow();
+    }
+
+    async function applyTimelineAdjustment() {
+      if (state.actionBusy || !timelineAdjustmentDirty()) return;
+      const axisShifts = { ...state.timelineAxisShifts };
+      const deltaSec = Number(state.timelineDeltaSec || 0);
+      if (timelinePreviewRefreshTimer !== null) {
+        window.clearTimeout(timelinePreviewRefreshTimer);
+        timelinePreviewRefreshTimer = null;
+      }
+      state.actionBusy = true;
+      renderTimelineAdjustmentPanel();
+      try {
+        const previewResult = await postJson('/api/timeline-adjustment-preview', {
+          axis_shifts_sec: axisShifts,
+          ms_local_delta_sec: deltaSec,
+        });
+        if (!confirm('人工关系会保留，未审核候选会重算，偏差过大的旧关系会标记需复核。\n\n应用调整？')) return;
+        const result = await postJson('/api/timeline-adjustment-apply', {
+          axis_shifts_sec: axisShifts,
+          ms_local_delta_sec: deltaSec,
+          preview_hash: previewResult.preview.preview_hash,
+        });
+        state.meta.alignment = result.alignment;
+        state.meta.time_model = result.time_model;
+        state.meta.project_config = {
+          ...(state.meta.project_config || {}),
+          qc_alignment_model: result.qc_alignment_model,
+        };
+        state.timelineAdjustOpen = false;
+        state.timelineBaseAxisShifts = null;
+        state.timelineAxisShifts = null;
+        state.timelineAxisRanges = null;
+        state.timelineBaseDeltaSec = null;
+        state.timelineDeltaSec = null;
+        await loadWindow();
+        notifyStateChannel();
+        showInteractionHint('时间轴调整已应用');
+      } catch (err) {
+        alert(`应用时间轴调整失败：${err.message}`);
+      } finally {
+        state.actionBusy = false;
+        renderTimelineAdjustmentPanel();
+      }
+    }
+
     function renderStagePanels() {
       const local = state.stage === 'local_calibration';
       const qcCalibration = state.stage === 'qc_calibration';
@@ -16847,16 +17658,18 @@ HTML = r"""<!doctype html>
       );
       const postQcEnabled = postQcMode !== 'disabled';
       const axisPreviewActive = qcCalibration && state.axisFineTuneShifts !== null;
+      const timelinePreviewActive = eventAnnotation && state.timelineAdjustOpen;
       if (eventAnnotation && !postQcEnabled && state.eventFilter === 'qc') state.eventFilter = 'all';
       if (eventAnnotation && !postQcEnabled && state.manualAnnotationKind === 'qc') {
         state.manualAnnotationKind = 'cell';
         cellMode = true;
       }
       el('qcRefitPanel').style.display = qcCalibration ? 'block' : 'none';
+      renderTimelineAdjustmentPanel();
       el('baseTimePanel').style.display = local ? 'none' : 'block';
-      el('reviewPanel').style.display = (!calibrationReady || local || axisPreviewActive || (eventAnnotation && !frozen)) ? 'none' : 'block';
-      el('manualPanel').style.display = calibrationReady && !axisPreviewActive && (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
-      if (calibrationReady && !axisPreviewActive && (qcCalibration || (eventAnnotation && frozen))) {
+      el('reviewPanel').style.display = (!calibrationReady || local || axisPreviewActive || timelinePreviewActive || (eventAnnotation && !frozen)) ? 'none' : 'block';
+      el('manualPanel').style.display = calibrationReady && !axisPreviewActive && !timelinePreviewActive && (qcCalibration || (eventAnnotation && frozen)) ? 'block' : 'none';
+      if (calibrationReady && !axisPreviewActive && !timelinePreviewActive && (qcCalibration || (eventAnnotation && frozen))) {
         el('reviewPanel').parentNode.insertBefore(el('manualPanel'), el('reviewPanel'));
       }
       document.querySelectorAll('.stage-tab').forEach(button => {
@@ -17334,12 +18147,13 @@ HTML = r"""<!doctype html>
         const id = row.annotation_id || row.candidate_id;
         const selected = id === state.selectedCandidateId ? ' selected' : '';
         const rejected = row.review_status === 'rejected' ? ' rejected' : '';
+        const needsReview = row.needs_review === true ? ' needs-review' : '';
         const isCell = String(row.candidate_type || '').startsWith('cell') || row.candidate_type === 'manual_cell_pair';
         const times = isCell
           ? `${channelDisplayLabel(row.lif_channel)} ${fmt(row.lif_raw_time_min, 3)} → MS760 ${fmt(row.ms_time_min, 3)}`
           : qcAnchorTimeText(row);
         const deviation = decisionDeviationSec(row);
-        const canReview = row.review_enabled !== false && row.source !== 'preview';
+        const canReview = row.review_enabled !== false && row.source !== 'preview' && !state.timelineAdjustOpen;
         const displayStatus = row.review_enabled === false && row.review_status === 'pending' ? 'preview' : row.review_status;
         const ambiguousCalibrationMs = state.stage === 'qc_calibration'
           && row.source === 'auto_candidate'
@@ -17352,7 +18166,9 @@ HTML = r"""<!doctype html>
         const ambiguityNote = ambiguousCalibrationMs
           ? `多个可信 MS 峰：${alternativeMsTimes.map(value => fmt(value, 3)).join(', ')} min；请使用 Select peaks 人工选择`
           : '';
-        const reviewNote = ambiguousCalibrationMs
+        const reviewNote = row.needs_review === true
+          ? '，需复核'
+          : ambiguousCalibrationMs
           ? ''
           : candidateNeedsIndividualReview(row) ? '，需逐条审核' : '';
         const actions = canReview ? `
@@ -17362,7 +18178,7 @@ HTML = r"""<!doctype html>
               ${row.source === 'manual_created' ? `<button data-action="clear_manual" data-id="${escapeText(id)}">清除</button>` : ''}
         ` : '<span class="empty">仅供预览</span>';
         return `
-          <div class="candidate-row${selected}${rejected}" data-candidate-id="${escapeText(id)}">
+          <div class="candidate-row${selected}${rejected}${needsReview}" data-candidate-id="${escapeText(id)}">
             <div class="row-title"><span>${escapeText(sourceText(row.source))} #${escapeText(row.rank ?? '')}</span><span>${escapeText(statusText(displayStatus))}</span></div>
             <div class="row-sub">${escapeText(times)} min<br>${deviation === null ? '偏差 -' : `偏差 ${escapeText(fmt(deviation, 3))} sec`}${escapeText(reviewNote)}${ambiguityNote ? `<br>${escapeText(ambiguityNote)}` : ''}</div>
             <div class="row-actions">${actions}</div>
@@ -18266,12 +19082,32 @@ HTML = r"""<!doctype html>
         if (!Number.isFinite(Number(desiredShift))) return 0;
         return Number(desiredShift) - Number(serverShift || 0);
       }
+      if (track.kind === 'lif' && state.stage === 'event_annotation' && state.timelineAdjustOpen) {
+        const channel = track.channels[0];
+        const alignment = state.current.alignment || {};
+        const axes = alignment.channel_time_axes || state.meta?.acquisition_layout?.channel_time_axes || {};
+        const axis = axes[channel] || (String(channel).startsWith('G') ? 'green_axis' : 'red_axis');
+        const serverShifts = alignment.axis_shifts_sec || {};
+        let serverShift = serverShifts[axis];
+        if (!Number.isFinite(Number(serverShift)) && axis === 'green_axis') serverShift = alignment.green_to_ms_shift_sec;
+        if (!Number.isFinite(Number(serverShift)) && axis === 'red_axis') serverShift = alignment.red_to_ms_shift_sec;
+        const desiredShift = state.timelineAxisShifts?.[axis];
+        if (!Number.isFinite(Number(desiredShift))) return 0;
+        return Number(desiredShift) - Number(serverShift || 0);
+      }
       if (track.kind === 'ms' && state.stage === 'local_calibration' && state.previewDeltaSec !== null) {
         const serverPreview = state.current.preview_ms_delta_sec;
         const serverDelta = serverPreview !== null && serverPreview !== undefined && Number.isFinite(Number(serverPreview))
           ? Number(serverPreview)
           : Number(state.current.time_model?.ms_local_delta_sec || 0);
         return Number(state.previewDeltaSec) - serverDelta;
+      }
+      if (track.kind === 'ms' && state.stage === 'event_annotation' && state.timelineAdjustOpen) {
+        const serverPreview = state.current.preview_ms_delta_sec;
+        const serverDelta = serverPreview !== null && serverPreview !== undefined && Number.isFinite(Number(serverPreview))
+          ? Number(serverPreview)
+          : Number(state.current.time_model?.ms_local_delta_sec || 0);
+        return Number(state.timelineDeltaSec || 0) - serverDelta;
       }
       return 0;
     }
@@ -18393,7 +19229,8 @@ HTML = r"""<!doctype html>
         const trackShiftMin = trackShiftSec(track) / 60.0;
         const labelBoxes = [];
         const liveLayerActive = state.stage === 'local_calibration'
-          || (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null);
+          || (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null)
+          || (state.stage === 'event_annotation' && state.timelineAdjustOpen);
         const signalLayer = liveLayerActive
           ? svgEl('g', {
               'data-preview-track-key': track.key,
@@ -18738,7 +19575,7 @@ HTML = r"""<!doctype html>
     function drawPostQcCandidates(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
       (state.current.post_qc_candidates || []).forEach(group => {
-        if (group.review_status === 'rejected') return;
+        if (group.review_status === 'rejected' && !state.showRejected) return;
         const markerGroup = qcAnchorMarkerPoints(group, markerPositions);
         const lineStyle = candidateLineStyle(group);
         appendQcConnectorPolyline(svg, markerGroup, group, { kind: 'qc_survey_candidate', type: 'QC 巡检候选', data: group }, lineStyle, () => {
@@ -18752,7 +19589,7 @@ HTML = r"""<!doctype html>
     function drawCellCandidates(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
       visibleCellCandidates().forEach(row => {
-        if (row.review_status === 'rejected') return;
+        if (row.review_status === 'rejected' && !state.showRejected) return;
         const lif = markerPositions[`lif:${row.lif_peak_id}`];
         const ms = markerPositions[`ms760:${row.ms_event_id}`];
         if (!lif || !ms) return;
@@ -18787,11 +19624,10 @@ HTML = r"""<!doctype html>
     function drawManualAnnotations(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
       (state.current.annotations || [])
-        .filter(row => row.source === 'manual_created')
         .filter(row => manualBelongsToStage(row, state.stage))
         .filter(row => state.stage !== 'event_annotation' || eventRowKind(row) === 'qc')
         .forEach(row => {
-          if (row.review_status === 'rejected') return;
+          if (row.review_status === 'rejected' && !state.showRejected) return;
           const markerGroup = qcAnchorMarkerPoints(row, markerPositions);
           const style = candidateLineStyle(row);
           const detail = {
@@ -18810,10 +19646,9 @@ HTML = r"""<!doctype html>
     function drawManualCellAnnotations(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
       (state.current.annotations || [])
-        .filter(row => row.source === 'manual_created')
         .filter(row => manualBelongsToStage(row, 'cell_annotation'))
         .forEach(row => {
-          if (row.review_status === 'rejected') return;
+          if (row.review_status === 'rejected' && !state.showRejected) return;
           const lif = markerPositions[`lif:${row.lif_peak_id}`];
           const ms = markerPositions[`ms760:${row.ms_event_id}`];
           if (!lif || !ms) return;
@@ -18825,7 +19660,13 @@ HTML = r"""<!doctype html>
             y1: lif.y.toFixed(2),
             x2: ms.x.toFixed(2),
             y2: ms.y.toFixed(2),
-            stroke: row.review_status === 'pending' ? '#d97706' : baseColor,
+            stroke: row.needs_review === true
+              ? '#d97706'
+              : row.review_status === 'rejected'
+                ? '#98a2b3'
+                : row.review_status === 'pending'
+                  ? '#d97706'
+                  : baseColor,
             'stroke-width': selected ? 1.65 : style.width,
             'stroke-dasharray': style.dash,
             opacity: row.review_status === 'accepted' ? 0.42 : style.opacity,
@@ -18855,10 +19696,10 @@ HTML = r"""<!doctype html>
           const markerGroup = qcAnchorMarkerPoints(row, markerPositions);
           const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
           const style = {
-            stroke: '#111827',
-            width: selected ? 1.75 : 1.05,
-            dash: '',
-            opacity: selected ? 0.55 : 0.28
+            stroke: row.needs_review === true ? '#d97706' : '#111827',
+            width: row.needs_review === true ? 2.0 : selected ? 1.75 : 1.05,
+            dash: row.needs_review === true ? '4 3' : '',
+            opacity: row.needs_review === true ? 0.9 : selected ? 0.55 : 0.28
           };
           appendQcConnectorPolyline(svg, markerGroup, row, { kind: 'accepted_qc_survey', type: 'QC 巡检', data: row }, style, () => {
             state.selectedCandidateId = row.annotation_id || row.candidate_id;
@@ -18870,6 +19711,12 @@ HTML = r"""<!doctype html>
 
     function candidateLineStyle(row) {
       const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
+      if (row.needs_review === true) {
+        return { stroke: '#d97706', width: selected ? 2.3 : 2.0, dash: '4 3', opacity: 0.9 };
+      }
+      if (row.review_status === 'rejected') {
+        return { stroke: '#98a2b3', width: selected ? 1.7 : 1.2, dash: '2 4', opacity: 0.55 };
+      }
       if (row.review_status === 'accepted') {
         return { stroke: '#111827', width: 1.05, dash: '', opacity: 0.34 };
       }
@@ -19010,7 +19857,8 @@ HTML = r"""<!doctype html>
       const deviation = decisionDeviationSec(row);
       const lines = [
         `${detail.type}（${reviewDetailStatus(row)}）`,
-        deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`
+        deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`,
+        row.needs_review === true ? '需复核' : ''
       ];
       if (state.stage === 'qc_calibration' && row.component_ambiguous === true) {
         const alternatives = [row.ms_time_min, ...(row.alternative_ms_event_times_min || [])]
@@ -19030,7 +19878,8 @@ HTML = r"""<!doctype html>
       const deviation = decisionDeviationSec(row);
       return [
         `${channelDisplayLabel(row.lif_channel)} ${detail.type}（${reviewDetailStatus(row)}）`,
-        deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`
+        deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`,
+        row.needs_review === true ? '需复核' : ''
       ].filter(Boolean);
     }
 
@@ -19138,6 +19987,14 @@ HTML = r"""<!doctype html>
         state.axisFineTuneBaseShifts = null;
         state.axisFineTuneShifts = null;
       }
+      if (state.timeMode !== 'aligned' && state.timelineAdjustOpen) {
+        state.timelineAdjustOpen = false;
+        state.timelineBaseAxisShifts = null;
+        state.timelineAxisShifts = null;
+        state.timelineAxisRanges = null;
+        state.timelineBaseDeltaSec = null;
+        state.timelineDeltaSec = null;
+      }
       await loadWindow();
     });
     el('yAxisMode').addEventListener('change', () => {
@@ -19151,10 +20008,20 @@ HTML = r"""<!doctype html>
     document.querySelectorAll('.stage-tab').forEach(button => {
       button.addEventListener('click', async () => {
         hideLineContextMenu();
+        if (timelinePreviewRefreshTimer !== null) {
+          window.clearTimeout(timelinePreviewRefreshTimer);
+          timelinePreviewRefreshTimer = null;
+        }
         state.stage = button.dataset.stage;
         state.axisFineTuneOpen = false;
         state.axisFineTuneBaseShifts = null;
         state.axisFineTuneShifts = null;
+        state.timelineAdjustOpen = false;
+        state.timelineBaseAxisShifts = null;
+        state.timelineAxisShifts = null;
+        state.timelineAxisRanges = null;
+        state.timelineBaseDeltaSec = null;
+        state.timelineDeltaSec = null;
         state.showCrossChannelConflicts = false;
         el('showCrossChannelConflicts').checked = false;
         resetManualSelection();
@@ -19484,6 +20351,12 @@ HTML = r"""<!doctype html>
     el('axisFineTuneToggle').addEventListener('click', toggleAxisFineTune);
     el('discardAxisFineTune').addEventListener('click', discardAxisFineTune);
     el('applyAxisFineTune').addEventListener('click', applyAxisFineTune);
+    el('timelineAdjustToggle').addEventListener('click', toggleTimelineAdjustment);
+    el('timelineAdjustCancel').addEventListener('click', cancelTimelineAdjustment);
+    el('timelineAdjustApply').addEventListener('click', applyTimelineAdjustment);
+    el('timelineDeltaMinus').addEventListener('click', () => updateTimelineDeltaValue(Number(state.timelineDeltaSec || 0) - 0.25));
+    el('timelineDeltaPlus').addEventListener('click', () => updateTimelineDeltaValue(Number(state.timelineDeltaSec || 0) + 0.25));
+    el('timelineDeltaSlider').addEventListener('input', () => updateTimelineDeltaValue(Number(el('timelineDeltaSlider').value || 0)));
     el('estimateDelta').addEventListener('click', estimateLocalDelta);
     el('freezeDelta').addEventListener('click', freezeLocalDelta);
     el('deltaMinus').addEventListener('click', () => updateDeltaPreview(Number(el('deltaSlider').value || 0) - 0.25));
@@ -19838,6 +20711,39 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     requested,
                     str(payload.get("preview_hash") or ""),
                     clear_frozen_time_model=bool(payload.get("clear_frozen_time_model")),
+                )
+                self.send_json({"ok": True, **result})
+                return
+            if parsed.path == "/api/timeline-adjustment-preview":
+                requested = payload.get("axis_shifts_sec")
+                if not isinstance(requested, dict):
+                    raise BadRequest("请为项目中的每条 LIF 物理轴提供秒数")
+                try:
+                    delta_sec = float(payload.get("ms_local_delta_sec", 0.0))
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest("后段 MS Δt 必须是有效秒数") from exc
+                self.send_json(
+                    {
+                        "ok": True,
+                        "preview": self.data.timeline_adjustment_preview(
+                            requested,
+                            ms_local_delta_sec=delta_sec,
+                        ),
+                    }
+                )
+                return
+            if parsed.path == "/api/timeline-adjustment-apply":
+                requested = payload.get("axis_shifts_sec")
+                if not isinstance(requested, dict):
+                    raise BadRequest("请为项目中的每条 LIF 物理轴提供秒数")
+                try:
+                    delta_sec = float(payload.get("ms_local_delta_sec", 0.0))
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest("后段 MS Δt 必须是有效秒数") from exc
+                result = self.data.apply_timeline_adjustment(
+                    requested,
+                    ms_local_delta_sec=delta_sec,
+                    expected_preview_hash=str(payload.get("preview_hash") or ""),
                 )
                 self.send_json({"ok": True, **result})
                 return

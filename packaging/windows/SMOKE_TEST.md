@@ -1,4 +1,4 @@
-# Windows v0.4.12 Release Smoke Test
+# Windows v0.5.0 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -39,7 +39,7 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.4.12 project
+## 3. Create a v0.5.0 project
 
 Create only in a new empty project directory. Configure:
 
@@ -153,7 +153,11 @@ For all policies:
 - Third-stage candidates are accepted one at a time; there is no whole-window batch acceptance.
 - One MS event cannot simultaneously hold active QC and cell semantics.
 - If G1 and G2 both match one MS event, the ambiguous candidates are hidden from the normal list and plot. `Show conflicts` exposes one grouped card for explicit selection of one channel.
-- Changing only `post_qc_strategy` preserves old reviews for audit, makes old strategy-bound QC rows inactive/non-exportable, and does not alter front calibration.
+- Click `调整时间轴`; only one shared Green axis for G1/G2 and one shared Red axis for R1/R2 may be adjusted. MS remains the fixed physical reference, and downstream `MS Δt` is a separate control.
+- While dragging, tracks, peaks, time ticks, and existing connectors move in the same frame. Canceling preview performs no project write.
+- Applying a preview creates a new frozen time-model revision atomically. Accepted, pending, rejected, and manual Cell/QC relations keep the same raw peak/event identities and review states; unreviewed automatic candidates are invalidated and rebuilt.
+- Reviewed relations whose recomputed residual exceeds tolerance remain visible in their original state and are marked `需复核`; they are never silently deleted or changed back to pending.
+- Changing only `post_qc_strategy` preserves reviewed relationships and their raw identities for audit and projection; it does not alter front calibration.
 
 ## 8. Track and UMAP synchronization
 

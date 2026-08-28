@@ -1058,7 +1058,7 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
             self.assertTrue(app.is_qc_survey_annotation(stored))
             self.assertEqual(app.accepted_qc_survey_ms_event_ids(), {"ms_qc"})
 
-    def test_post_qc_strategy_change_stales_but_does_not_delete_old_review(self):
+    def test_post_qc_strategy_change_preserves_reviewed_relation_and_export(self):
         lif = pd.DataFrame([lif_peak("G2", "g2_qc", 25.0 * 60.0 - 5.0)])
         ms = pd.DataFrame([ms_event("ms_qc", 25.0 * 60.0)])
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -1085,10 +1085,10 @@ class CalibrationProtocolSchemaTest(unittest.TestCase):
 
             preserved = app.store.get(candidate["annotation_id"])
             self.assertEqual(preserved["review_status"], "accepted")
-            self.assertFalse(app.is_qc_survey_annotation(preserved))
+            self.assertTrue(app.is_qc_survey_annotation(preserved))
             exported = app.export_accepted_annotations_csv()
-            self.assertEqual(exported["row_count"], 0)
-            self.assertEqual(exported["skipped"][0]["reason"], "stale_post_qc_strategy_hash")
+            self.assertEqual(exported["row_count"], 1)
+            self.assertEqual(exported["skipped"], [])
 
     def test_same_ms_cross_channel_cell_candidates_require_explicit_arbitration(self):
         lif = pd.DataFrame(

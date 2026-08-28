@@ -20,7 +20,7 @@ def javascript_function(source: str, name: str, next_name: str) -> str:
 
 class V0411ReferenceLineContractTest(unittest.TestCase):
     def test_reference_line_control_is_adjacent_and_concise(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.13")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.5.0")
         weak_index = HTML.index('id="showWeakLifPeaks"')
         guide_index = HTML.index('id="verticalGuideEnabled"')
         show_index = HTML.index('id="go"')

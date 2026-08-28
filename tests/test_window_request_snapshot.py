@@ -189,7 +189,16 @@ class WindowRequestSnapshotRegressionTest(unittest.TestCase):
             second = app.window(24.0, 1.0, time_mode="aligned")
 
             self.assertEqual(second["time_model"]["time_model_version"], "tm-next")
-            self.assertEqual(second["annotations"], [])
+            self.assertEqual(len(second["annotations"]), 48)
+            self.assertTrue(
+                all(
+                    row["projection_time_model_version"] == "tm-next"
+                    for row in second["annotations"]
+                )
+            )
+            self.assertTrue(
+                all(row["review_status"] == "accepted" for row in second["annotations"])
+            )
 
     def test_qc_review_drops_invalidated_models_from_the_same_request_snapshot(self):
         case = CalibrationProtocolSchemaTest()

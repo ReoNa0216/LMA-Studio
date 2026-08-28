@@ -320,7 +320,7 @@ class UmapAppStateTest(unittest.TestCase):
             self.assertEqual(after["counts"]["unknown"], 1)
             self.assertNotEqual(before["revision"], after["revision"])
 
-    def test_disabled_post_qc_does_not_project_historical_qc_on_umap(self):
+    def test_disabled_post_qc_still_projects_reviewed_historical_qc_on_umap(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = make_app(Path(tmp), with_map=True)
             app.store.update_project_config(
@@ -345,9 +345,9 @@ class UmapAppStateTest(unittest.TestCase):
 
             self.assertEqual(
                 state["counts"],
-                {"cell": 0, "qc": 0, "unknown": 1, "conflict": 0},
+                {"cell": 0, "qc": 1, "unknown": 0, "conflict": 0},
             )
-            self.assertEqual(state["points"][0]["classification"], "unknown")
+            self.assertEqual(state["points"][0]["classification"], "qc")
 
     def test_main_csv_keeps_unannotated_event_map_rows_as_unknown(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

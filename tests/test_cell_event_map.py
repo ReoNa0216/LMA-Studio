@@ -652,7 +652,7 @@ class CellEventMapStateTest(unittest.TestCase):
             ]
         )
 
-    def test_state_uses_only_current_accepted_sqlite_semantics(self):
+    def test_state_uses_all_accepted_raw_identity_relations_across_model_revisions(self):
         annotations = [
             {
                 "annotation_id": "qc-a",
@@ -698,11 +698,12 @@ class CellEventMapStateTest(unittest.TestCase):
             annotation_start_min=40.0,
         )
 
-        self.assertEqual(state["counts"], {"cell": 1, "qc": 1, "unknown": 2, "conflict": 0})
+        self.assertEqual(state["counts"], {"cell": 2, "qc": 1, "unknown": 1, "conflict": 0})
         by_id = {point["ms_event_id"]: point for point in state["points"]}
         self.assertEqual(by_id["a"]["classification"], "qc")
         self.assertEqual(by_id["b"]["lif_channel"], "R2")
-        self.assertEqual(by_id["c"]["classification"], "unknown")
+        self.assertEqual(by_id["c"]["classification"], "cell")
+        self.assertEqual(by_id["c"]["lif_channel"], "G2")
 
     def test_conflict_is_explicit_and_revision_changes_after_revoke(self):
         accepted = [

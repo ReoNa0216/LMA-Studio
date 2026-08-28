@@ -72,7 +72,7 @@ class V0412AxisFineTuneContractTest(unittest.TestCase):
         }
 
     def test_version_and_compact_user_controls_are_present(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.13")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.5.0")
         self.assertIn('id="axisFineTuneToggle"', HTML)
         self.assertIn('id="axisFineTunePanel"', HTML)
         self.assertIn('id="axisFineTuneRows"', HTML)
@@ -299,7 +299,12 @@ class V0412AxisFineTuneContractTest(unittest.TestCase):
         load_body = HTML.split("async function loadWindow()", 1)[1].split("function updateMetrics", 1)[0]
         self.assertIn("preview_axis_shifts_sec", load_body)
         self.assertIn("state.axisFineTuneShifts", load_body)
-        self.assertNotIn("preview_ms_delta_sec=", load_body.split("preview_axis_shifts_sec", 1)[1])
+        calibration_branch = load_body.split("state.stage === 'qc_calibration'", 1)[1].split(
+            "state.stage === 'event_annotation'", 1
+        )[0]
+        self.assertNotIn("preview_ms_delta_sec=", calibration_branch)
+        self.assertIn("state.timelineAxisShifts", load_body)
+        self.assertIn("state.timelineDeltaSec", load_body)
         self.assertIn("'/api/qc-axis-preview'", HTML)
         self.assertIn("'/api/qc-axis-apply'", HTML)
 

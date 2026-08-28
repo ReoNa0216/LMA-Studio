@@ -808,7 +808,7 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertAlmostEqual(estimate["shift_sec"], 0.0, places=6)
         self.assertEqual(estimate["match_count"], 5)
 
-    def test_nonlegacy_two_anchor_layout_estimates_one_shift_per_physical_axis(self):
+    def test_nonlegacy_two_anchor_layout_keeps_green_and_red_as_physical_axes(self):
         lif_rows = []
         ms_rows = []
         for index, center in enumerate([60.0, 180.0, 300.0], start=1):
@@ -823,9 +823,9 @@ class ProjectManifestTest(unittest.TestCase):
             )
         layout = {
             "lif_channels": [
-                {"input_id": "lif_1_raw", "channel": "G1", "time_axis": "shared_axis", "detector": "green"},
-                {"input_id": "lif_2_raw", "channel": "R1", "time_axis": "shared_axis", "detector": "red"},
-                {"input_id": "lif_3_raw", "channel": "R2", "time_axis": "shared_axis", "detector": "red"},
+                {"input_id": "lif_1_raw", "channel": "G1", "time_axis": "green_axis", "detector": "green"},
+                {"input_id": "lif_2_raw", "channel": "G2", "time_axis": "green_axis", "detector": "green"},
+                {"input_id": "lif_3_raw", "channel": "R1", "time_axis": "red_axis", "detector": "red"},
             ],
             "qc_anchor_channels": ["G1", "R1"],
         }
@@ -837,9 +837,10 @@ class ProjectManifestTest(unittest.TestCase):
             acquisition_layout=layout,
         )
 
-        self.assertEqual(set(alignment["axes"]), {"shared_axis"})
-        self.assertAlmostEqual(alignment["axis_shifts_sec"]["shared_axis"], 3.0, delta=0.3)
-        self.assertEqual(alignment["channels"]["G1"]["shift_sec"], alignment["channels"]["R1"]["shift_sec"])
+        self.assertEqual(set(alignment["axes"]), {"green_axis", "red_axis"})
+        self.assertAlmostEqual(alignment["axis_shifts_sec"]["green_axis"], 3.1, delta=0.3)
+        self.assertAlmostEqual(alignment["axis_shifts_sec"]["red_axis"], 2.9, delta=0.3)
+        self.assertEqual(alignment["channels"]["G1"]["shift_sec"], alignment["channels"]["G2"]["shift_sec"])
 
     def test_axis_peak_clustering_cannot_bridge_through_duplicate_channel_peaks(self):
         peaks = pd.DataFrame(
@@ -1501,7 +1502,7 @@ class ProjectManifestTest(unittest.TestCase):
             self.assertIn("已保存", app._project_config_update_warning)
             self.assertEqual(app._project_config_update_time_model["status"], "unavailable")
 
-    def test_window_annotations_hide_stale_post_qc_manual_records(self):
+    def test_window_annotations_preserve_prior_model_post_qc_manual_records(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             store = AnnotationStore(Path(tmp) / "annotation.sqlite")
             store.upsert_time_model(
@@ -1566,7 +1567,11 @@ class ProjectManifestTest(unittest.TestCase):
 
             rows = app.window_annotations(40.0, 42.0)
 
-        self.assertEqual([row["annotation_id"] for row in rows], ["manual_qc:current"])
+        self.assertEqual(
+            [row["annotation_id"] for row in rows],
+            ["manual_qc:old", "manual_qc:current"],
+        )
+        self.assertTrue(all(row["projection_unavailable"] for row in rows))
 
     def test_html_hides_raw_rfu_lif_display_control(self):
         self.assertIn("LMA Studio", HTML)
