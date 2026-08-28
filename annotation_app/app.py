@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.4.12"
+APP_VERSION = "lma_studio_v0.4.13"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -7207,6 +7207,7 @@ def accepted_qc_alignment_refit(
         for _, row in ms_events.drop_duplicates("event_id", keep=False).iterrows()
     }
     axis_observations: dict[str, list[dict[str, Any]]] = {axis: [] for axis in required_axes}
+    axis_expected_counts: dict[str, int] = {axis: 0 for axis in required_axes}
     conflicts: list[dict[str, Any]] = []
     accepted_qc_records: list[dict[str, Any]] = []
 
@@ -7282,6 +7283,7 @@ def accepted_qc_alignment_refit(
         accepted_qc_records.append(record)
         anchor_ids = qc_anchor_peak_id_map(record)
         for axis in record_axes:
+            axis_expected_counts[axis] = axis_expected_counts.get(axis, 0) + 1
             selected_rows: list[pd.Series] = []
             selected_ids: dict[str, str] = {}
             invalid_reason = ""
@@ -7333,15 +7335,13 @@ def accepted_qc_alignment_refit(
                 continue
             lif_axis_time_sec = float(np.median(lif_times_sec))
             observed_shift_sec = float(ms_time_sec - lif_axis_time_sec)
-            if not math.isfinite(observed_shift_sec) or not (
-                SHIFT_SEARCH_MIN_SEC <= observed_shift_sec <= SHIFT_SEARCH_MAX_SEC
-            ):
+            if not math.isfinite(observed_shift_sec):
                 conflicts.append(
                     {
                         "annotation_id": annotation_id,
                         "ms_event_id": ms_event_id,
                         "time_axis": axis,
-                        "reason": "observed_shift_outside_supported_range",
+                        "reason": "invalid_observed_shift",
                         "observed_shift_sec": clean_value(observed_shift_sec),
                     }
                 )
@@ -7362,8 +7362,16 @@ def accepted_qc_alignment_refit(
 
     axis_models: dict[str, dict[str, Any]] = {}
     inlier_evidence: list[dict[str, Any]] = []
+    modeled_observations: list[dict[str, Any]] = []
+    review_items: list[dict[str, Any]] = []
     insufficient_axes: list[str] = []
+    axis_labels = {
+        "green_axis": "绿色轴",
+        "red_axis": "红色轴",
+    }
     for axis in required_axes:
+        axis_label = axis_labels.get(axis, "共享轴")
+        expected_count = int(axis_expected_counts.get(axis, 0))
         grouped_by_ms: dict[str, list[dict[str, Any]]] = {}
         for observation in axis_observations[axis]:
             grouped_by_ms.setdefault(str(observation["ms_event_id"]), []).append(observation)
@@ -7384,7 +7392,9 @@ def accepted_qc_alignment_refit(
             independent.append(selected)
         values = np.asarray([float(row["observed_shift_sec"]) for row in independent], dtype=float)
         if len(values) < QC_REFIT_MIN_EVIDENCE_PER_AXIS:
-            insufficient_axes.append(f"{axis}({len(values)} 条)")
+            insufficient_axes.append(
+                f"{axis_label}仅 {len(values)}/{expected_count} 组可用，至少需要 2 组独立关系"
+            )
             continue
         median_shift = float(np.median(values))
         mad = float(np.median(np.abs(values - median_shift)))
@@ -7393,12 +7403,14 @@ def accepted_qc_alignment_refit(
             max(QC_REFIT_MIN_OUTLIER_TOL_SEC, QC_REFIT_MAD_SCALE * 1.4826 * mad),
         )
         if len(values) == 2 and float(np.ptp(values)) > 2.0 * QC_REFIT_MIN_OUTLIER_TOL_SEC:
-            insufficient_axes.append(f"{axis}(2 条证据互相矛盾)")
+            insufficient_axes.append(f"{axis_label}的 2 组关系互相矛盾")
             continue
         inlier_mask = np.abs(values - median_shift) <= threshold + 1e-9
         inliers = [row for row, keep in zip(independent, inlier_mask.tolist()) if keep]
         if len(inliers) < QC_REFIT_MIN_EVIDENCE_PER_AXIS:
-            insufficient_axes.append(f"{axis}({len(inliers)} 条稳健内点)")
+            insufficient_axes.append(
+                f"{axis_label}仅 {len(inliers)}/{expected_count} 组一致"
+            )
             continue
         shift_sec = float(np.median([float(row["observed_shift_sec"]) for row in inliers]))
         residuals = np.asarray(
@@ -7409,20 +7421,35 @@ def accepted_qc_alignment_refit(
         p90_abs_residual = float(np.quantile(np.abs(residuals), 0.9))
         if p90_abs_residual > QC_REFIT_MAX_P90_RESIDUAL_SEC + 1e-9:
             insufficient_axes.append(
-                f"{axis}(P90 残差 {p90_abs_residual:.2f} sec 超过 {QC_REFIT_MAX_P90_RESIDUAL_SEC:g} sec)"
+                f"{axis_label}残差过大（P90 {p90_abs_residual:.2f} sec）"
             )
             continue
-        for row in inliers:
-            row["residual_sec"] = float(row["observed_shift_sec"] - shift_sec)
-            row["inlier"] = True
-            inlier_evidence.append(row)
+        for row, keep in zip(independent, inlier_mask.tolist()):
+            modeled = copy.deepcopy(row)
+            modeled["residual_sec"] = float(modeled["observed_shift_sec"] - shift_sec)
+            modeled["inlier"] = bool(keep)
+            if keep:
+                inlier_evidence.append(modeled)
+            else:
+                modeled["reason"] = "robust_outlier"
+                review_items.append(copy.deepcopy(modeled))
+            modeled_observations.append(modeled)
         outlier_count = len(independent) - len(inliers)
+        review_count = max(0, expected_count - len(inliers))
+        if len(inliers) * 2 <= expected_count:
+            insufficient_axes.append(
+                f"{axis_label}仅 {len(inliers)}/{expected_count} 组一致"
+            )
+            continue
         axis_models[axis] = {
             "shift_sec": shift_sec,
             "previous_shift_sec": previous_shifts[axis],
             "evidence_count": len(independent),
             "inlier_count": len(inliers),
             "outlier_count": outlier_count,
+            "expected_count": expected_count,
+            "review_count": review_count,
+            "support_ratio": float(len(inliers) / expected_count) if expected_count else 0.0,
             "median_abs_residual_sec": median_abs_residual,
             "p90_abs_residual_sec": p90_abs_residual,
             "mad_shift_sec": mad,
@@ -7430,9 +7457,7 @@ def accepted_qc_alignment_refit(
         }
     if insufficient_axes:
         raise BadRequest(
-            "已接受的 QC anchor 不足以稳定重算全部物理轴："
-            + "；".join(insufficient_axes)
-            + "。每条轴至少需要 2 个独立且一致的 accepted anchor。"
+            "重算未通过：" + "；".join(insufficient_axes) + "。请检查参考关系。"
         )
 
     axis_shifts = {axis: float(axis_models[axis]["shift_sec"]) for axis in required_axes}
@@ -7441,11 +7466,17 @@ def accepted_qc_alignment_refit(
         key=lambda row: (str(row["time_axis"]), float(row["ms_time_sec"]), str(row["annotation_id"])),
     )
     all_observations = sorted(
-        [copy.deepcopy(row) for axis in required_axes for row in axis_observations[axis]],
+        modeled_observations,
         key=lambda row: json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
     )
     conflict_payload = sorted(
         [copy.deepcopy(row) for row in conflicts],
+        key=lambda row: json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+    )
+    for row in conflict_payload:
+        review_items.append(copy.deepcopy(row))
+    review_payload = sorted(
+        review_items,
         key=lambda row: json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
     )
     accepted_annotation_ids = sorted(
@@ -7469,6 +7500,7 @@ def accepted_qc_alignment_refit(
         "accepted_annotation_ids": accepted_annotation_ids,
         "all_axis_observations": all_observations,
         "conflicts": conflict_payload,
+        "review_items": review_payload,
     }
     preview_hash = hashlib.sha256(
         json.dumps(signature_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -7492,6 +7524,9 @@ def accepted_qc_alignment_refit(
         "used_annotation_ids": used_annotation_ids,
         "conflict_count": len(conflicts),
         "conflicts": conflict_payload,
+        "review_count": len(review_payload),
+        "review_items": review_payload,
+        "apply_allowed": True,
         "preview_hash": preview_hash,
     }
 
@@ -7532,12 +7567,8 @@ def manual_qc_alignment_preview_model(
             value = float(requested_axis_shifts_sec[axis])
         except (TypeError, ValueError) as exc:
             raise BadRequest(f"{axis} 的人工平移必须是有效秒数") from exc
-        if not math.isfinite(value) or not (
-            SHIFT_SEARCH_MIN_SEC <= value <= SHIFT_SEARCH_MAX_SEC
-        ):
-            raise BadRequest(
-                f"{axis} 的人工平移必须在 {SHIFT_SEARCH_MIN_SEC:g} 到 {SHIFT_SEARCH_MAX_SEC:g} sec 之间"
-            )
+        if not math.isfinite(value):
+            raise BadRequest(f"{axis} 的人工平移必须是有效秒数")
         axis_shifts[axis] = value
 
     current_shifts = dict(current_alignment.get("axis_shifts_sec") or {})
@@ -7667,7 +7698,7 @@ def apply_qc_alignment_model(
     if not isinstance(raw_shifts, dict) or any(axis not in raw_shifts for axis in required_axes):
         raise BadRequest("QC alignment model 没有覆盖全部物理轴")
     axis_shifts = {axis: float(raw_shifts[axis]) for axis in required_axes}
-    if any(not math.isfinite(value) or abs(value) > max(abs(SHIFT_SEARCH_MIN_SEC), SHIFT_SEARCH_MAX_SEC) for value in axis_shifts.values()):
+    if any(not math.isfinite(value) for value in axis_shifts.values()):
         raise BadRequest("QC alignment model 包含无效物理轴平移")
 
     alignment = copy.deepcopy(automatic_alignment)
@@ -13269,6 +13300,73 @@ HTML = r"""<!doctype html>
       color: #475467;
       font-size: 12px;
     }
+    .qc-refit-summary {
+      display: grid;
+      gap: 5px;
+      margin-top: 6px;
+    }
+    .qc-refit-axis {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 6px;
+      color: #344054;
+    }
+    .qc-refit-axis strong,
+    .qc-refit-axis span {
+      white-space: nowrap;
+    }
+    .qc-refit-axis strong {
+      min-width: 0;
+      color: #111827;
+    }
+    .qc-refit-axis span {
+      flex: 0 0 auto;
+      font-size: 11px;
+    }
+    .qc-refit-review {
+      margin-top: 6px;
+      border: 1px solid #f5c26b;
+      border-radius: 6px;
+      background: #fffaf0;
+      color: #7a4b00;
+    }
+    .qc-refit-review summary {
+      cursor: pointer;
+      padding: 6px 8px;
+      font-weight: 700;
+    }
+    .qc-refit-review-list {
+      display: grid;
+      max-height: 150px;
+      overflow: auto;
+      padding: 0 8px 7px;
+      color: #667085;
+      font-variant-numeric: tabular-nums;
+      line-break: strict;
+      text-wrap: pretty;
+    }
+    .qc-refit-review-item {
+      display: grid;
+      gap: 2px;
+      padding: 6px 0;
+      border-top: 1px solid #f3dfb8;
+    }
+    .qc-refit-review-item:first-child { border-top: 0; }
+    .qc-refit-review-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: #344054;
+    }
+    .qc-refit-review-head strong,
+    .qc-refit-review-head span {
+      white-space: nowrap;
+    }
+    .qc-refit-review-reason {
+      color: #8a5a00;
+      white-space: nowrap;
+    }
     .axis-fine-tune-panel {
       margin-top: 8px;
       padding: 8px;
@@ -14244,6 +14342,10 @@ HTML = r"""<!doctype html>
       <div id="qcRefitPanel" class="manual-box" style="display:none; margin-top:8px;">
         <button id="previewQcRefit" class="small-button" style="width:100%;">用已接受参考峰预览重算</button>
         <div id="qcRefitStats" class="empty" style="margin-top:6px;">尚未生成重算预览。</div>
+        <details id="qcRefitReview" class="qc-refit-review" style="display:none;">
+          <summary id="qcRefitReviewSummary">需检查的参考关系</summary>
+          <div id="qcRefitReviewList" class="qc-refit-review-list"></div>
+        </details>
         <button id="applyQcRefit" class="small-button secondary" style="width:100%; margin-top:7px;" disabled>应用参考峰时间校正</button>
         <button id="axisFineTuneToggle" class="small-button secondary" style="width:100%; margin-top:7px;">微调 LIF 时间轴</button>
         <div id="axisFineTunePanel" class="axis-fine-tune-panel" style="display:none;">
@@ -14421,7 +14523,7 @@ HTML = r"""<!doctype html>
           <div id="importLifRows"></div>
           <div class="lif-import-actions">
             <button id="addImportLif" type="button" class="small-button secondary">＋ 添加 LIF</button>
-            <span id="importRoleSummary" class="qc-anchor-rule">细胞 0 · 共 0 个 LIF</span>
+            <span id="importRoleSummary" class="qc-anchor-rule">细胞 0，共 0 个 LIF</span>
           </div>
         </div>
         <div id="importDualRoleHelp" class="qc-anchor-rule" style="grid-column:2;">同一通道的 QC anchor 与 Cell pair 角色相互独立，可同时启用。</div>
@@ -14619,6 +14721,7 @@ HTML = r"""<!doctype html>
       axisFineTuneOpen: false,
       axisFineTuneBaseShifts: null,
       axisFineTuneShifts: null,
+      axisFineTuneRanges: null,
       manual: { anchors: {}, LIF: null, MS760: null },
       requestSeq: 0,
       actionBusy: false,
@@ -14795,7 +14898,7 @@ HTML = r"""<!doctype html>
       return [
         ...qcAnchorChannels(row).map(channel => `${channel} ${fmtMaybe(rawTimes[channel], 3)}`),
         `MS760 ${fmtMaybe(row?.ms_time_min, 3)}`,
-      ].join(' · ');
+      ].join('，');
     }
 
     function resetManualSelection() {
@@ -15176,6 +15279,7 @@ HTML = r"""<!doctype html>
       state.axisFineTuneOpen = false;
       state.axisFineTuneBaseShifts = null;
       state.axisFineTuneShifts = null;
+      state.axisFineTuneRanges = null;
       resetManualSelection();
       el('timeMode').value = state.timeMode;
       el('yAxisMode').value = state.yAxisMode;
@@ -15341,7 +15445,7 @@ HTML = r"""<!doctype html>
       });
       state.importSignatureChannels = state.importSignatureChannels.filter(channel => validChannels.has(channel));
       const cell = rows.filter(row => row.use_for_cell_annotation).length;
-      el('importRoleSummary').textContent = `细胞 ${cell} · 共 ${rows.length} 个 LIF`;
+      el('importRoleSummary').textContent = `细胞 ${cell}，共 ${rows.length} 个 LIF`;
       el('addImportLif').disabled = rows.length >= 4;
       renderImportSegments();
       renderImportPostQcControls();
@@ -15542,7 +15646,7 @@ HTML = r"""<!doctype html>
         renderImportSegments();
         const summaries = (result.channel_summaries || [])
           .map(row => `${row.channel} ${Number(row.merged_peak_count || 0).toLocaleString()} 峰`)
-          .join(' · ');
+          .join('，');
         const warnings = (result.warnings || []).join(' ');
         status.textContent = [
           result.can_apply_suggestions ? '已回填建议边界；可先创建草稿并在项目轨迹中核对。所有边界保持待确认，确认前不会用于校准。' : '证据不足，未形成可完整应用的有序方案。',
@@ -15941,6 +16045,13 @@ HTML = r"""<!doctype html>
       if (normalized === 'green_axis') return '绿色信号时间轴';
       if (normalized === 'red_axis') return '红色信号时间轴';
       return '共享信号时间轴';
+    }
+
+    function compactPhysicalAxisName(axis) {
+      const normalized = String(axis || '').trim().toLowerCase();
+      if (normalized === 'green_axis') return '绿色轴';
+      if (normalized === 'red_axis') return '红色轴';
+      return '共享轴';
     }
 
     function referenceModeLabel(mode) {
@@ -16356,7 +16467,7 @@ HTML = r"""<!doctype html>
           <span><strong>${escapeText(calibrationSegmentDisplayName(segment))}</strong><br><small>${escapeText((segment.reference_channels || []).join('/'))}</small></span>
           <label class="protocol-time-field"><span>开始时间 (min)</span><input data-cfg-segment-field="start_min" type="number" min="0" step="0.1" value="${escapeText(segment.start_min)}" aria-label="${escapeText(calibrationSegmentDisplayName(segment))} 开始时间"${legacy ? ' disabled' : ''} /></label>
           <label class="protocol-time-field"><span>结束时间 (min)</span><input data-cfg-segment-field="end_min" type="number" min="0" step="0.1" value="${escapeText(segment.end_min)}" aria-label="${escapeText(calibrationSegmentDisplayName(segment))} 结束时间"${legacy ? ' disabled' : ''} /></label>
-          <span class="config-protocol-description">${escapeText(referenceModeLabel(segment.reference_mode))} · ${(segment.time_axes || []).map(axis => escapeText(physicalAxisName(axis))).join('/')}</span>
+          <span class="config-protocol-description">${escapeText(referenceModeLabel(segment.reference_mode))}，${(segment.time_axes || []).map(axis => escapeText(physicalAxisName(axis))).join('/')}</span>
           <label class="protocol-confirm" title="全部参考段确认后解锁校准"><input data-cfg-segment-field="boundaries_confirmed" type="checkbox"${segment.boundaries_confirmed ? ' checked' : ''}${legacy ? ' disabled' : ''} /> 边界已确认</label>
         </div>
       `).join('');
@@ -16450,6 +16561,10 @@ HTML = r"""<!doctype html>
       el('qcRefitPanel').style.display = visible ? 'block' : 'none';
       if (!visible) return;
       renderAxisFineTunePanel();
+      const reviewBox = el('qcRefitReview');
+      const reviewSummary = el('qcRefitReviewSummary');
+      const reviewList = el('qcRefitReviewList');
+      reviewBox.style.display = 'none';
       const calibrationReady = calibrationBoundariesConfirmed();
       el('previewQcRefit').disabled = !calibrationReady || state.actionBusy || state.axisFineTuneOpen;
       if (!calibrationReady) {
@@ -16463,25 +16578,53 @@ HTML = r"""<!doctype html>
         || state.current?.project_config?.qc_alignment_model
         || state.meta?.project_config?.qc_alignment_model;
       const button = el('applyQcRefit');
-      button.disabled = !preview || state.actionBusy || state.axisFineTuneOpen;
+      button.disabled = !preview || preview.apply_allowed === false || state.actionBusy || state.axisFineTuneOpen;
       if (preview) {
-        const axes = Object.entries(preview.axes || {}).map(([axis, details]) => (
-          `${physicalAxisName(axis)}：${fmt(details.previous_shift_sec, 2)} → ${fmt(details.shift_sec, 2)} sec `
-          + `(${details.inlier_count || 0}/${details.evidence_count || 0} 条)`
-        ));
-        el('qcRefitStats').textContent = [
-          ...axes,
-          `使用 ${preview.used_annotation_count || 0} 条已接受人工记录`,
-          `冲突 ${preview.conflict_count || 0} 条`,
-          '预览尚未应用'
-        ].join('；');
+        const axes = Object.entries(preview.axes || {}).map(([axis, details]) => {
+          const expected = Number(details.expected_count ?? details.evidence_count ?? 0);
+          const inliers = Number(details.inlier_count || 0);
+          const shift = Number(details.shift_sec || 0);
+          return `<div class="qc-refit-axis"><strong>${escapeText(compactPhysicalAxisName(axis))} ${shift >= 0 ? '+' : ''}${escapeText(fmt(shift, 2))} sec</strong><span>采用 ${inliers}/${expected} 组</span></div>`;
+        });
+        el('qcRefitStats').className = 'qc-refit-summary';
+        el('qcRefitStats').innerHTML = axes.join('');
+        const reviewItems = Array.isArray(preview.review_items) ? preview.review_items : [];
+        if (reviewItems.length) {
+          const reasonLabel = reason => ({
+            robust_outlier: '未采用：偏离主要平移',
+            weak_lif_peak_not_training_evidence: '弱峰仅供人工查看',
+            missing_or_duplicate_lif_peak: 'LIF 峰已变化',
+            missing_or_non_primary_ms760_event: 'MS event 已变化',
+            duplicate_ms_event_has_conflicting_anchors: '同一 MS event 关系冲突',
+            same_axis_anchor_conflict: '同轴峰时间不一致',
+            lif_peak_outside_qc_range: '超出参考窗口'
+          }[String(reason || '')] || '关系需要复核');
+          reviewSummary.textContent = `需检查 ${reviewItems.length} 项`;
+          reviewList.innerHTML = reviewItems.map(row => {
+            const axis = row.time_axis ? compactPhysicalAxisName(row.time_axis) : '参考关系';
+            const msTime = Number(row.ms_time_sec);
+            const shift = Number(row.observed_shift_sec);
+            const msLabel = Number.isFinite(msTime) ? `MS ${escapeText(fmt(msTime / 60, 3))} min` : 'MS 时间不可用';
+            const shiftLabel = Number.isFinite(shift)
+              ? `该关系所需平移 ${shift >= 0 ? '+' : ''}${escapeText(fmt(shift, 2))} sec`
+              : '该关系的平移无法计算';
+            return `<div class="qc-refit-review-item">`
+              + `<div class="qc-refit-review-head"><strong>${escapeText(axis)}</strong><span>${msLabel}</span></div>`
+              + `<div>${shiftLabel}</div>`
+              + `<div class="qc-refit-review-reason">${escapeText(reasonLabel(row.reason))}</div>`
+              + `</div>`;
+          }).join('');
+          reviewBox.style.display = 'block';
+        }
         return;
       }
       if (active) {
         const axes = Object.entries(active.axis_shifts_sec || {}).map(([axis, shift]) => `${physicalAxisName(axis)} ${fmt(shift, 2)} sec`);
+        el('qcRefitStats').className = 'empty';
         el('qcRefitStats').textContent = `已应用参考峰时间校正：${axes.join('；')}`;
         return;
       }
+      el('qcRefitStats').className = 'empty';
       el('qcRefitStats').textContent = '尚未生成重算预览。';
     }
 
@@ -16519,6 +16662,38 @@ HTML = r"""<!doctype html>
       ));
     }
 
+    function axisFineTuneBounds(axis, currentValue) {
+      const active = state.current?.alignment?.qc_alignment_model
+        || state.meta?.alignment?.qc_alignment_model
+        || state.current?.project_config?.qc_alignment_model
+        || state.meta?.project_config?.qc_alignment_model
+        || {};
+      const models = [state.qcRefitPreview, active].filter(model => model && typeof model === 'object');
+      const values = [Number(currentValue)];
+      models.forEach(model => {
+        [...(model.all_axis_observations || []), ...(model.conflicts || [])].forEach(row => {
+          if (String(row?.time_axis || '') !== String(axis)) return;
+          const shift = Number(row?.observed_shift_sec);
+          if (Number.isFinite(shift)) values.push(shift);
+        });
+      });
+      const finite = values.filter(Number.isFinite);
+      const base = Number.isFinite(Number(currentValue)) ? Number(currentValue) : 0;
+      if (finite.length <= 1) {
+        return { min: Math.floor((base - 60) / 5) * 5, max: Math.ceil((base + 60) / 5) * 5 };
+      }
+      const low = Math.min(...finite);
+      const high = Math.max(...finite);
+      const pad = Math.max(5, Math.min(15, (high - low) * 0.25));
+      let min = Math.floor((low - pad) / 5) * 5;
+      let max = Math.ceil((high + pad) / 5) * 5;
+      if (max - min < 20) {
+        min = Math.floor((base - 10) / 5) * 5;
+        max = Math.ceil((base + 10) / 5) * 5;
+      }
+      return { min, max };
+    }
+
     function renderAxisFineTunePanel() {
       const toggle = el('axisFineTuneToggle');
       const panel = el('axisFineTunePanel');
@@ -16538,11 +16713,12 @@ HTML = r"""<!doctype html>
         const visibleName = channels.length ? `${compactName} ${channels.join('/')}` : compactName;
         const fullName = `${physicalAxisName(axis)}${channels.length ? `（${channels.join('/')}）` : ''}相对 MS 的总平移秒数`;
         const value = Number(shifts[axis] ?? base[axis] ?? 0);
+        const bounds = state.axisFineTuneRanges?.[axis] || axisFineTuneBounds(axis, value);
         return (
         `<div class="axis-fine-tune-row" data-axis="${escapeText(axis)}">`
         + `<div class="axis-fine-tune-heading"><strong title="${escapeText(fullName)}">${escapeText(visibleName)}</strong>`
         + `<output class="axis-fine-tune-value" data-axis-readout>${value >= 0 ? '+' : ''}${escapeText(fmt(value, 2))} sec</output></div>`
-        + `<input class="axis-fine-tune-slider" type="range" min="-60" max="60" step="0.05" value="${escapeText(String(value))}" title="${escapeText(fullName)}" aria-label="${escapeText(fullName)}" />`
+        + `<input class="axis-fine-tune-slider" type="range" min="${escapeText(String(bounds.min))}" max="${escapeText(String(bounds.max))}" step="0.05" value="${escapeText(String(value))}" title="${escapeText(fullName)}" aria-label="${escapeText(fullName)}" />`
         + `<div class="axis-fine-tune-nudges">`
         + `<button type="button" class="small-button secondary" data-axis-adjust="-0.25" aria-label="${escapeText(physicalAxisName(axis))} 减少 0.25 秒">−0.25 sec</button>`
         + `<button type="button" class="small-button secondary" data-axis-adjust="0.25" aria-label="${escapeText(physicalAxisName(axis))} 增加 0.25 秒">+0.25 sec</button>`
@@ -16577,6 +16753,9 @@ HTML = r"""<!doctype html>
       const axes = calibrationFineTuneAxes();
       state.axisFineTuneBaseShifts = Object.fromEntries(axes.map(axis => [axis, Number(allShifts[axis] || 0)]));
       state.axisFineTuneShifts = { ...state.axisFineTuneBaseShifts };
+      state.axisFineTuneRanges = Object.fromEntries(
+        axes.map(axis => [axis, axisFineTuneBounds(axis, state.axisFineTuneBaseShifts[axis])])
+      );
       state.axisFineTuneOpen = true;
       state.timeMode = 'aligned';
       el('timeMode').value = 'aligned';
@@ -16586,8 +16765,9 @@ HTML = r"""<!doctype html>
 
     function updateAxisFineTuneValue(axis, value) {
       if (!state.axisFineTuneOpen || state.actionBusy) return;
-      if (!Number.isFinite(value) || value < -60 || value > 60) {
-        alert('时间轴平移必须在 −60 到 +60 sec 之间。');
+      const bounds = state.axisFineTuneRanges?.[axis] || axisFineTuneBounds(axis, value);
+      if (!Number.isFinite(value) || value < bounds.min || value > bounds.max) {
+        alert(`当前可调范围为 ${fmt(bounds.min, 0)} 到 ${fmt(bounds.max, 0)} sec。`);
         renderAxisFineTunePanel();
         return;
       }
@@ -16609,6 +16789,7 @@ HTML = r"""<!doctype html>
       state.axisFineTuneOpen = false;
       state.axisFineTuneBaseShifts = null;
       state.axisFineTuneShifts = null;
+      state.axisFineTuneRanges = null;
       renderCurrentState();
       if (hadPreview && state.current) await loadWindow();
     }
@@ -16641,6 +16822,7 @@ HTML = r"""<!doctype html>
         state.axisFineTuneOpen = false;
         state.axisFineTuneBaseShifts = null;
         state.axisFineTuneShifts = null;
+        state.axisFineTuneRanges = null;
         await loadWindow();
         alert('LIF 时间轴微调已应用；已有人工标注已保留。请重新进行后段时间差校正。');
       } catch (err) {
@@ -16741,9 +16923,9 @@ HTML = r"""<!doctype html>
       el('attachMap').disabled = Boolean(state.actionBusy) || !value;
       el('attachMap').textContent = active ? 'Validate & switch' : 'Validate & enable';
       el('attachMapBadge').textContent = active
-        ? `Active · ${Number(mapInfo.row_count || 0).toLocaleString()} points`
+        ? `Active: ${Number(mapInfo.row_count || 0).toLocaleString()} points`
         : (eventMapActive
-            ? `Events · ${Number(mapInfo.row_count || 0).toLocaleString()} · UMAP not set`
+            ? `Events: ${Number(mapInfo.row_count || 0).toLocaleString()} (UMAP not set)`
             : 'Not set');
       el('attachMapReady').textContent = value
         ? `已选择：${filename}`
@@ -17084,7 +17266,7 @@ HTML = r"""<!doctype html>
       draw();
       const menu = el('lineContextMenu');
       menu.innerHTML = `
-        <div class="context-menu-title">${escapeText(sourceText(row.source))} · ${escapeText(statusText(row.review_status))}<br>${escapeText(rowSummary(row))}</div>
+        <div class="context-menu-title">${escapeText(sourceText(row.source))}（${escapeText(statusText(row.review_status))}）<br>${escapeText(rowSummary(row))}</div>
         ${actions.map(item => `<button data-action="${escapeText(item.action)}">${escapeText(item.label)}</button>`).join('')}
       `;
       menu.querySelectorAll('button[data-action]').forEach(button => {
@@ -17172,7 +17354,7 @@ HTML = r"""<!doctype html>
           : '';
         const reviewNote = ambiguousCalibrationMs
           ? ''
-          : candidateNeedsIndividualReview(row) ? ' · 需逐条审核' : '';
+          : candidateNeedsIndividualReview(row) ? '，需逐条审核' : '';
         const actions = canReview ? `
               ${ambiguousCalibrationMs ? '' : `<button data-action="accepted" data-id="${escapeText(id)}">接受</button>`}
               <button data-action="rejected" data-id="${escapeText(id)}">拒绝</button>
@@ -17192,7 +17374,7 @@ HTML = r"""<!doctype html>
         const first = group.rows[0] || {};
         const alternatives = group.rows.map(row => (
           `${channelDisplayLabel(row.lif_channel)} Δ${fmt(decisionDeviationSec(row), 3)}s`
-        )).join(' · ');
+        )).join('；');
         const actions = group.rows.map(row => `
           <button data-conflict-candidate-id="${escapeText(rowId(row))}">Use ${escapeText(row.lif_channel)}</button>
         `).join('');
@@ -18066,7 +18248,7 @@ HTML = r"""<!doctype html>
         node.setAttribute('x1', x.toFixed(3));
         node.setAttribute('x2', x.toFixed(3));
       }
-      readout.textContent = `${fmt(timeMin, 4)} min · ${state.verticalGuidePinned ? 'Fixed' : 'Move'}`;
+      readout.textContent = `${fmt(timeMin, 4)} min（${state.verticalGuidePinned ? 'Fixed' : 'Move'}）`;
     }
 
     function livePreviewDeltaSecForTrack(track) {
@@ -18827,7 +19009,7 @@ HTML = r"""<!doctype html>
       const row = detail.data;
       const deviation = decisionDeviationSec(row);
       const lines = [
-        `${detail.type} · ${reviewDetailStatus(row)}`,
+        `${detail.type}（${reviewDetailStatus(row)}）`,
         deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`
       ];
       if (state.stage === 'qc_calibration' && row.component_ambiguous === true) {
@@ -18847,7 +19029,7 @@ HTML = r"""<!doctype html>
       const row = detail.data;
       const deviation = decisionDeviationSec(row);
       return [
-        `${channelDisplayLabel(row.lif_channel)} ${detail.type} · ${reviewDetailStatus(row)}`,
+        `${channelDisplayLabel(row.lif_channel)} ${detail.type}（${reviewDetailStatus(row)}）`,
         deviation === null ? '' : `偏差 ${fmt(deviation, 2)} sec`
       ].filter(Boolean);
     }

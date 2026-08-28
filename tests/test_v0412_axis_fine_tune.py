@@ -72,7 +72,7 @@ class V0412AxisFineTuneContractTest(unittest.TestCase):
         }
 
     def test_version_and_compact_user_controls_are_present(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.4.12")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.4.13")
         self.assertIn('id="axisFineTuneToggle"', HTML)
         self.assertIn('id="axisFineTunePanel"', HTML)
         self.assertIn('id="axisFineTuneRows"', HTML)
@@ -142,7 +142,7 @@ class V0412AxisFineTuneContractTest(unittest.TestCase):
         for shifts in (
             {"green_axis": 4.0},
             {"green_axis": 4.0, "red_axis": -6.0, "other_axis": 1.0},
-            {"green_axis": 61.0, "red_axis": -6.0},
+            {"green_axis": float("inf"), "red_axis": -6.0},
         ):
             with self.subTest(shifts=shifts), self.assertRaises(BadRequest):
                 manual_qc_alignment_preview_model(

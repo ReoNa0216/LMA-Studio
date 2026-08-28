@@ -270,7 +270,7 @@ class DetectorV2AutomaticEvidenceBoundaryTest(unittest.TestCase):
             }
         )
 
-        with self.assertRaisesRegex(BadRequest, "green_axis|evidence|anchor"):
+        with self.assertRaisesRegex(BadRequest, "0/2"):
             accepted_qc_alignment_refit(
                 pd.DataFrame(peaks),
                 pd.DataFrame(events),

@@ -1742,7 +1742,7 @@ class ProjectManifestTest(unittest.TestCase):
             }
         ]
 
-        with self.assertRaisesRegex(BadRequest, "2 个独立"):
+        with self.assertRaisesRegex(BadRequest, "1/1"):
             accepted_qc_alignment_refit(
                 lif_peaks,
                 ms_events,
@@ -1777,7 +1777,7 @@ class ProjectManifestTest(unittest.TestCase):
                 }
             )
 
-        with self.assertRaisesRegex(BadRequest, "稳健内点|P90"):
+        with self.assertRaisesRegex(BadRequest, "1/3"):
             accepted_qc_alignment_refit(
                 pd.DataFrame(lif_rows),
                 pd.DataFrame(ms_rows),

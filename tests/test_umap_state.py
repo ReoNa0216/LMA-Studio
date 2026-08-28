@@ -223,7 +223,8 @@ class UmapAppStateTest(unittest.TestCase):
     def test_umap_page_exposes_responsive_axes_and_plain_language_controls(self):
         self.assertIn(">显示全部点</button>", UMAP_HTML)
         self.assertIn("不会修改任何标注", UMAP_HTML)
-        self.assertIn("滚轮缩放 · 拖动平移 · 单击定位事件", UMAP_HTML)
+        self.assertIn("滚轮缩放；拖动平移；单击定位事件", UMAP_HTML)
+        self.assertNotIn("·", UMAP_HTML)
         self.assertIn("function drawAxes()", UMAP_HTML)
         self.assertIn("ctx.fillText('UMAP1'", UMAP_HTML)
         self.assertIn("ctx.fillText('UMAP2'", UMAP_HTML)

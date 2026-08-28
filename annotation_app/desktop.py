@@ -297,7 +297,7 @@ class DesktopApi:
                 return {"ok": True, "created": False}
 
             window = self._webview.create_window(
-                f"{APP_DISPLAY_NAME} · UMAP",
+                f"{APP_DISPLAY_NAME} UMAP",
                 safe_url,
                 width=1200,
                 height=800,
@@ -343,7 +343,7 @@ def check_umap_window_runtime(*, webview_module: Any | None = None) -> dict[str,
     webview_module.settings["ALLOW_DOWNLOADS"] = False
     webview_module.settings["SHOW_DEFAULT_MENUS"] = False
     main_window = webview_module.create_window(
-        f"{APP_DISPLAY_NAME} · Window check",
+        f"{APP_DISPLAY_NAME} Window check",
         server.webview_url,
         width=640,
         height=420,

@@ -7,7 +7,7 @@ UMAP_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>LMA Studio · UMAP</title>
+  <title>LMA Studio UMAP</title>
   <style>
     :root {
       color-scheme: light;
@@ -164,7 +164,7 @@ UMAP_HTML = r"""<!doctype html>
       <canvas id="canvas" aria-label="单细胞事件 UMAP"></canvas>
       <div id="empty" class="empty"></div>
       <div id="tooltip" class="tooltip"></div>
-      <div class="gesture-hint">滚轮缩放 · 拖动平移 · 单击定位事件</div>
+      <div class="gesture-hint">滚轮缩放；拖动平移；单击定位事件</div>
     </section>
   </main>
   <script>
@@ -602,7 +602,7 @@ UMAP_HTML = r"""<!doctype html>
       matchedTimeEventIds = new Set([eventId]);
       const eventTime = pointMs760Time(point);
       if (Number.isFinite(eventTime)) timeQuery.value = String(Number(eventTime.toFixed(6)));
-      timeStatus.textContent = 'Track · 1 point';
+      timeStatus.textContent = 'Track: 1 point';
       draw();
     }
 
