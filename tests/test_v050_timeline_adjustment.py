@@ -58,7 +58,7 @@ def sqlite_state(db_path: Path) -> dict[str, list[tuple]]:
 
 class V050TimelineAdjustmentContractTest(unittest.TestCase):
     def test_version_is_v050(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.5.0")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.5.1")
 
     def test_preview_is_read_only_and_reports_candidate_rebuild(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

@@ -1,4 +1,4 @@
-# Windows v0.5.0 Release Smoke Test
+# Windows v0.5.1 Release Smoke Test
 
 Goal: verify that the packaged LMA Studio release can create and open current-standard projects, run the split calibration/post-QC workflow, reject retired peak-table projects without writes, and export the compact downstream CSV without requiring a user Python installation.
 
@@ -39,7 +39,7 @@ Expected:
 - A second launch reports that LMA Studio is already running.
 - Closing the main window terminates its loopback server and process.
 
-## 3. Create a v0.5.0 project
+## 3. Create a v0.5.1 project
 
 Create only in a new empty project directory. Configure:
 

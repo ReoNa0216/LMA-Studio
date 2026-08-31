@@ -82,7 +82,7 @@ def _evidence(shifts, *, weak_red_indexes=()):
 
 class V0413AcceptedEvidenceContractTest(unittest.TestCase):
     def test_candidate_version(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.5.0")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.5.1")
 
     def test_accepted_refit_uses_valid_shifts_beyond_automatic_search_range(self):
         layout, lif, ms, annotations = _evidence(

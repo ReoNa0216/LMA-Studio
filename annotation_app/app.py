@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.5.0"
+APP_VERSION = "lma_studio_v0.5.1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -13292,37 +13292,44 @@ class AppData:
             )
             if str(row.get("annotation_id")) not in represented_relation_ids
         ]
-        annotation_counts = {status: 0 for status in REVIEW_STATUSES}
-        for group in alignment_groups:
-            status = str(group.get("review_status", "pending"))
-            if status in annotation_counts:
-                annotation_counts[status] += 1
-        for row in annotations:
-            if row.get("source") != "manual_created":
-                continue
-            if self.manual_annotation_stage(row) != "qc_calibration":
-                continue
-            status = str(row.get("review_status", "pending"))
-            if status in annotation_counts:
-                annotation_counts[status] += 1
-        post_qc_counts = {status: 0 for status in REVIEW_STATUSES}
-        for group in post_qc_candidates:
-            status = str(group.get("review_status", "pending"))
-            if status in post_qc_counts:
-                post_qc_counts[status] += 1
-        for row in annotations:
-            if row.get("source") != "manual_created":
-                continue
-            if self.manual_annotation_stage(row) != "qc_survey":
-                continue
-            status = str(row.get("review_status", "pending"))
-            if status in post_qc_counts:
-                post_qc_counts[status] += 1
-        cell_counts = {status: 0 for status in REVIEW_STATUSES}
-        for group in cell_candidates:
-            status = str(group.get("review_status", "pending"))
-            if status in cell_counts:
-                cell_counts[status] += 1
+        def unique_review_counts(
+            stage: str,
+            *row_groups: list[dict[str, Any]],
+        ) -> dict[str, int]:
+            counts = {status: 0 for status in REVIEW_STATUSES}
+            seen_ids: set[str] = set()
+            for group in row_groups:
+                for row in group:
+                    if self.annotation_review_stage(row) != stage:
+                        continue
+                    relation_id = str(
+                        row.get("annotation_id") or row.get("candidate_id") or ""
+                    )
+                    if relation_id and relation_id in seen_ids:
+                        continue
+                    if relation_id:
+                        seen_ids.add(relation_id)
+                    status = str(row.get("review_status", "pending"))
+                    if status in counts:
+                        counts[status] += 1
+            return counts
+
+        annotation_counts = unique_review_counts(
+            "qc_calibration",
+            alignment_groups,
+            annotations,
+        )
+        post_qc_counts = unique_review_counts(
+            "qc_survey",
+            post_qc_candidates,
+            cell_qc_anchors,
+            annotations,
+        )
+        cell_counts = unique_review_counts(
+            "cell_annotation",
+            cell_candidates,
+            annotations,
+        )
 
         third_stage_lif_peak_ids: set[str] = set()
         for row in [*post_qc_candidates, *cell_candidates, *cell_qc_anchors, *annotations]:
@@ -13334,15 +13341,6 @@ class AppData:
                     third_stage_lif_peak_ids.add(str(peak_id))
             if row.get("lif_peak_id"):
                 third_stage_lif_peak_ids.add(str(row["lif_peak_id"]))
-        for row in annotations:
-            if row.get("source") != "manual_created":
-                continue
-            if self.manual_annotation_stage(row) != "cell_annotation":
-                continue
-            status = str(row.get("review_status", "pending"))
-            if status in cell_counts:
-                cell_counts[status] += 1
-
         return {
             "start_min": start_min,
             "end_min": end_min,
@@ -16932,6 +16930,7 @@ HTML = r"""<!doctype html>
         rows = [
           ...(state.current?.post_qc_candidates || []),
           ...visibleCellCandidates().filter(row => !isPendingCrossChannelConflict(row)),
+          ...(state.current?.cell_qc_anchors || []),
         ].filter(eventRowMatchesFilter);
       } else {
         rows = [...(state.current?.alignment_groups || [])];
@@ -16945,7 +16944,12 @@ HTML = r"""<!doctype html>
           candidate_id: row.annotation_id
         }));
       const combined = (state.stage === 'qc_calibration' || state.stage === 'event_annotation') ? [...rows, ...savedRows] : rows;
-      return combined
+      const byRelationId = new Map();
+      combined.forEach((row, index) => {
+        const id = String(rowId(row) || `anonymous:${index}`);
+        byRelationId.set(id, row);
+      });
+      return Array.from(byRelationId.values())
         .filter(row => state.showRejected || row.review_status !== 'rejected')
         .sort((a, b) => Number(a.ms_plot_time_min || a.ms_time_min || 0) - Number(b.ms_plot_time_min || b.ms_time_min || 0));
     }
@@ -18166,8 +18170,11 @@ HTML = r"""<!doctype html>
         const ambiguityNote = ambiguousCalibrationMs
           ? `多个可信 MS 峰：${alternativeMsTimes.map(value => fmt(value, 3)).join(', ')} min；请使用 Select peaks 人工选择`
           : '';
+        const retainedState = row.projection_revision_changed === true;
         const reviewNote = row.needs_review === true
-          ? '，需复核'
+          ? '，原状态保留，需复核'
+          : retainedState
+          ? '，原状态保留'
           : ambiguousCalibrationMs
           ? ''
           : candidateNeedsIndividualReview(row) ? '，需逐条审核' : '';
