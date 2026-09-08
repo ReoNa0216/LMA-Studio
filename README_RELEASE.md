@@ -1,79 +1,26 @@
 # LMA Studio v0.6.0 Release Notes
 
-Task 1 candidate: independent new MS analyses use `flame-ms-core==0.1.0`;
-MS Event Studio v2 reviewed packages can be imported without calling MS peaks
-again. Saved v0.4+ projects retain their stored events, labels, models and binding.
-See [Task 1 integration](docs/flame_task1.md) for the import and build contract.
-This source version does not by itself mean a public release or human UAT passed.
+LMA Studio v0.6.0 正式版，提供 Windows x64 和 macOS Apple Silicon 桌面包。
 
-### v0.6.0-rc3 项目分享候选
+## 本版更新
 
-- 新增顶部“打包分享项目”：一致数据库快照、排除 macOS 元数据、解压后继续工作。
-- 正式事件导入名称统一为“LMA 事件包”；沿用 v2 格式。
-- 包含 rc2 时间轴再审核修复。Windows/macOS 构建及课题组 UAT 以实际证据为准。
+- 新建独立 MS 分析使用共用的 `flame-ms-core 0.1.0` 内核。
+- 正式导入 MS Event Studio 的“LMA 事件包”v2，保留事件 ID、scan、时间、窗口、版本和审阅/纳入状态；读取 raw 用于展示，不重新检峰覆盖导入事件。
+- 修复已接受的自动 Cell/QC 关系在调整时间轴后无法再次审核的问题。已接受关系保持实线，时间偏差超限以橙色和“需复核”提示，原物理关系与审核决定保留。
+- 新增“打包分享项目”：选择保存位置即可生成一致的项目 ZIP 快照，自动排除 `__MACOSX`、`._*` 和 `.DS_Store`，同事解压后可继续工作。
 
-### v0.6.0-rc2 Windows 修复候选
+## 下载使用
 
-- 修复已人工接受的自动 Cell/QC 关系在调整时间轴后无法再次拒绝、待审或接受的问题。再审核保存原物理关系及来源，未审核自动候选仍按当前模型校验；无需重建旧项目。
-- 已接受关系保持实线，时间偏差超限使用橙色和“需复核”提示；待审及拒绝仍用各自虚线。
-- Windows 候选文件名为 `LMA-Studio-v0.6.0-rc2-windows-x64.zip`；应用版本仍为任务 1 的 `v0.6.0`。这是候选修订，不代表发布 macOS 新包或课题组人工 UAT 已通过。
+- Windows：完整解压 `LMA-Studio-v0.6.0-windows-x64.zip`，运行 `LMAStudio.exe`，保留全部随附文件。
+- macOS：解压 `LMA-Studio-v0.6.0-macos-arm64.zip`，打开 `LMA Studio.app`，适用于 Apple Silicon。
+- 两个 ZIP 均附 `.sha256` 校验文件。macOS 包为 ad-hoc 签名，未进行 Apple Developer ID 签名/公证；首次启动可能需在系统设置中允许打开。
 
-## 中文
+## 兼容与验证
 
-LMA Studio 是面向项目的本地 LIF-MS 人工辅助标注桌面应用。
+沿用现行峰识别标准的 v0.4.0 及后续项目保留已存事件、标注、模型和绑定，打开不会自动重算、重编号或刷新绑定；新版重分析应另建副本或项目。使用已退役峰识别标准的项目仍按既有规则拒绝打开。
 
-### 上一正式版下载（v0.5.1）
+发布工作流从同一标签构建两平台，通过完整自动测试和打包运行时检查后发布。开发阶段已完成真实数据与旧项目隔离副本回归、时间轴再审核回归、项目 ZIP 解压重开及科学内容核对。正式投稿项目不在本机，未声称逐项目验收。
 
-- `LMA-Studio-v0.5.1-windows-x64.zip`：Windows x64。完整解压后运行 `LMAStudio.exe`。
-- `LMA-Studio-v0.5.1-macos-arm64.zip`：Apple Silicon。解压后打开 `LMA Studio.app`。
-- 每个压缩包均提供对应的 `.sha256` 完整性校验文件。
+本版由维护者明确授权正式发布；课题组成员的实际标注 UAT 仍待完成。macOS CI 检查不替代真机可见交互验收。
 
-macOS 包采用 ad-hoc 签名，未使用 Apple Developer ID 签名或公证。首次打开时可能需要按住 Control 点击应用并选择“打开”。
-
-### v0.5.1 修复
-
-- 修复 Events / QC 调整时间轴后，已人工审核的自动 Cell/QC 关系未计入状态汇总、从而看起来由“已接受”变成“待审”的问题。
-- 保留的 QC 关系现在与 Cell 关系一样进入审核列表；同一关系在自动候选、保留关系和绘图数据之间按稳定关系 ID 去重。
-- 新模型生成的新组合仍保持待审，但会与原有审核决定分开呈现。跨时间模型的旧关系明确显示“原状态保留”，偏差超限时同时显示“需复核”。
-- SQLite 审核状态、原始峰/event 身份、UMAP 分类和固定 16 列 CSV 语义不变。
-
-### 验证
-
-- 完整自动化测试：460 项通过，2 项按环境条件跳过。回归覆盖已接受的自动 Cell 和 QC 关系、时间轴调整后的状态计数、候选列表去重、需复核标记、UMAP 与 CSV 身份保持。
-- 真实 HSC1 隔离副本保留了 120 条长时间标注关系及其 40/40/40 的已接受、待审、已拒绝状态；106 条超限关系继续标记需复核，40 条已接受 CSV 身份与 UMAP 分类保持不变。
-- 9 个现行标准真实项目副本全部通过加载、Raw/Aligned Track、关系投影、UMAP、固定 16 列导出与重开检查，原项目逐文件校验保持不变。
-- Windows 与 macOS 正式包均通过各自平台的完整测试和打包运行时检查后发布。
-
-### 数据边界
-
-源代码与应用包不包含用户项目、原始 LIF/MS 文件、SQLite 数据库、源或规范化 UMAP CSV、parquet 表、作者 CSV、h5ad、导出标注、凭据或本地绝对路径。
-
-## English
-
-LMA Studio is a local, project-based desktop application for human-assisted LIF-MS annotation review.
-
-### Downloads
-
-- `LMA-Studio-v0.5.1-windows-x64.zip`: Windows x64. Extract the complete archive and run `LMAStudio.exe`.
-- `LMA-Studio-v0.5.1-macos-arm64.zip`: Apple Silicon. Extract it and open `LMA Studio.app`.
-- A matching `.sha256` integrity file is provided for each archive.
-
-The macOS package is ad-hoc signed, not Apple Developer ID signed or notarized. First launch may require Control-clicking the app and choosing Open.
-
-### Fixes in v0.5.1
-
-- Fixed Events / QC status summaries omitting reviewed automatic Cell/QC relationships after a timeline adjustment, which made accepted decisions appear to have reverted to pending.
-- Retained QC relationships now appear in the review list like retained Cell relationships. Duplicate rows from generated candidates, retained decisions, and drawing data are collapsed by stable relationship ID.
-- Newly generated combinations remain pending and are presented separately from prior review decisions. Cross-model decisions explicitly say Original state preserved and also show Needs review when their residual exceeds tolerance.
-- SQLite review states, raw peak/event identities, UMAP classifications, and fixed 16-column CSV semantics are unchanged.
-
-### Validation
-
-- Full automated suite: 460 tests passed and 2 environment-dependent tests skipped. Coverage includes accepted automatic Cell and QC relationships, post-adjustment status counts, review-list deduplication, Needs review markers, and stable UMAP/CSV identities.
-- An isolated real HSC1 copy retained 120 long-session relationships and their 40/40/40 accepted, pending, and rejected states. All 106 excessive-residual relationships remained flagged for review, while 40 accepted CSV identities and UMAP classifications stayed unchanged.
-- Nine real current-standard project copies passed load, Raw/Aligned Track, relationship projection, UMAP, fixed 16-column export, and reopen checks, while every original project remained byte-for-byte unchanged.
-- Formal Windows and macOS packages are published only after each platform passes its complete test and packaged-runtime checks.
-
-### Data boundary
-
-The source tree and application packages contain no user projects, raw LIF/MS files, SQLite databases, source or canonical UMAP CSV files, parquet tables, author CSV files, h5ad files, exported annotations, credentials, or local absolute paths.
+源码与应用包不含用户原始数据或项目。项目 ZIP 包含项目内文件；项目外引用的 raw 不会自动打包。事件接口和使用说明见 [Task 1 integration](docs/flame_task1.md) 与 [项目分享](docs/project_sharing.md)。
