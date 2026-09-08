@@ -26,6 +26,6 @@ LMA 新建项目选择同名入口，并提供对应 MS raw 和 LIF 输入；不
 ## 实现与验证入口
 
 项目存储逻辑位于 `annotation_app/project_archive.py`，不进入科学 `flame-ms-core`。
-API：API_顶部“打包分享项目”。应用串行化自身编辑，MS 的后台打包注册与范围更新在同一会话锁下互斥；另检查打包期间文件清单、非数据库文件属性及 SQLite data_version。
+API：`POST /api/share-project`，携带所选父目录、当前项目 ID 与根目录，沿用写入 token。应用串行化自身编辑，MS 的后台打包注册与范围更新在同一会话锁下互斥；另检查打包期间文件清单、非数据库文件属性及 SQLite data_version。
 测试 `tests/test_project_archive.py` 覆盖 WAL、历史原字节、目录错误、写失败、并发修改、目标边界和不覆盖。
 真实隔离样例/浏览器往返证据及最终构建状态记录在共享上下文仓库的 Windows 交接；源码功能完成不等于用户 UAT 或 macOS 真机操作已通过。
