@@ -13651,7 +13651,9 @@ HTML = r"""<!doctype html>
       gap: 10px;
       min-width: 0;
     }
+    .header-actions button { flex-shrink: 0; }
     .header-export-hint {
+      min-width: 0;
       color: #cbd5e1;
       font-size: 12px;
       white-space: nowrap;
@@ -14856,10 +14858,14 @@ HTML = r"""<!doctype html>
         padding: 10px 12px;
       }
       .header-actions {
+        flex-wrap: wrap;
         width: 100%;
         justify-content: space-between;
       }
       .header-export-hint {
+        order: 1;
+        flex-basis: 100%;
+        overflow-wrap: anywhere;
         white-space: normal;
       }
       main {
@@ -14987,7 +14993,8 @@ HTML = r"""<!doctype html>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
       <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
-      <span id="exportHint" class="header-export-hint">全部事件均导出；未标注为 unknown，前段 QC anchor 留在审计库</span>
+      <span id="exportHint" class="header-export-hint" role="status" aria-live="polite" aria-atomic="true">全部事件均导出；未标注为 unknown，前段 QC anchor 留在审计库</span>
+      <button id="shareProjectZip" class="header-export-button">打包分享项目</button>
       <button id="exportAcceptedCsv" class="header-export-button">导出细胞/质控主 CSV</button>
     </div>
   </header>
@@ -15240,7 +15247,7 @@ HTML = r"""<!doctype html>
         <label for="importMsSource">MS 事件来源</label>
         <select id="importMsSource">
           <option value="raw">共用检峰内核＋事件 CSV</option>
-          <option value="package">MS Event Studio 审阅包</option>
+          <option value="package">LMA 事件包</option>
         </select>
         <label id="importEventSourceLabel" for="importCellEventMap">事件坐标 CSV</label>
         <div>
@@ -15399,10 +15406,10 @@ HTML = r"""<!doctype html>
       <section id="msPackageUpdatePanel" class="attach-map-panel" hidden>
         <p class="side-title">MS 上游审阅更新</p>
         <p>检查上游事件变化。当前项目保留事件、标注和时间模型；新版审阅结果导入独立新项目。</p>
-        <label for="msPackageUpdatePath">新版审阅包文件夹</label>
+        <label for="msPackageUpdatePath">新版 LMA 事件包文件夹</label>
         <div class="path-picker-row">
           <input id="msPackageUpdatePath" type="text" />
-          <button class="small-button secondary path-picker-button" data-picker-target="msPackageUpdatePath" data-picker-kind="directory" data-picker-title="选择新版审阅包" aria-label="选择新版审阅包">选择</button>
+          <button class="small-button secondary path-picker-button" data-picker-target="msPackageUpdatePath" data-picker-kind="directory" data-picker-title="选择新版 LMA 事件包" aria-label="选择新版 LMA 事件包">选择</button>
         </div>
         <button id="checkMsPackageUpdate" class="small-button secondary" type="button">检查事件变化</button>
         <p id="msPackageUpdateResult" role="status" aria-live="polite"></p>
@@ -15436,11 +15443,11 @@ HTML = r"""<!doctype html>
       const machine = this.value === 'package';
       const input = document.getElementById('importCellEventMap');
       input.value = '';
-      input.placeholder = machine ? '选择 MS Event Studio 导出的审阅包文件夹' : '选择包含 scan_start_time 的 CSV';
-      document.getElementById('importEventSourceLabel').textContent = machine ? '审阅包文件夹' : '事件坐标 CSV';
+      input.placeholder = machine ? '选择 MS Event Studio 导出的 LMA 事件包文件夹' : '选择包含 scan_start_time 的 CSV';
+      document.getElementById('importEventSourceLabel').textContent = machine ? 'LMA 事件包文件夹' : '事件坐标 CSV';
       const picker = document.querySelector('[data-picker-target="importCellEventMap"]');
       picker.dataset.pickerKind = machine ? 'directory' : 'file';
-      picker.dataset.pickerTitle = machine ? '选择 MS 审阅包文件夹' : '选择单细胞事件坐标 CSV';
+      picker.dataset.pickerTitle = machine ? '选择 LMA 事件包文件夹' : '选择单细胞事件坐标 CSV';
       picker.setAttribute('aria-label', picker.dataset.pickerTitle);
       document.getElementById('importEventSourceHelp').textContent = machine
         ? '保留完整事件身份与审阅结果。仅已保留事件参与标注；MS 原始文件用于显示与核对，不重新检峰。UMAP 可稍后导入。'
@@ -18478,6 +18485,38 @@ HTML = r"""<!doctype html>
       }
     }
 
+    async function shareProjectZip() {
+      if (state.actionBusy) return;
+      state.actionBusy = true;
+      const projectId = state.meta?.project_id;
+      const projectRoot = state.meta?.root;
+      const button = el('shareProjectZip');
+      const hint = el('exportHint');
+      button.disabled = true;
+      hint.textContent = '请选择 ZIP 保存位置。';
+      try {
+        const selected = await postJson('/api/select-path', {
+          kind: 'directory', title: '选择项目外的 ZIP 保存位置',
+        });
+        if (selected.cancelled || !selected.path) {
+          hint.textContent = '已取消打包，未生成 ZIP。';
+          return;
+        }
+        button.textContent = '正在打包…';
+        hint.textContent = '正在保存完整项目 ZIP，请保持应用打开。外部引用的原始数据需另行分享。';
+        const result = await postJson('/api/share-project', { parent_dir: selected.path, project_id: projectId, project_root: projectRoot });
+        hint.textContent = `项目 ZIP 已保存：${result.filename}（${result.file_count} 个文件）；解压后打开项目文件夹。`;
+      } catch (err) {
+        hint.textContent = `打包未完成：${err.message}`;
+        alert(`打包未完成：${err.message}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = '打包分享项目';
+        state.actionBusy = false;
+        if (state.meta?.project_id === projectId) button.focus();
+      }
+    }
+
     async function importProject() {
       if (state.actionBusy) return;
       state.actionBusy = true;
@@ -20238,6 +20277,7 @@ HTML = r"""<!doctype html>
     });
     el('createManual').addEventListener('click', () => createManualTriplet('accepted'));
     el('createManualPending').addEventListener('click', () => createManualTriplet('pending'));
+    el('shareProjectZip').addEventListener('click', shareProjectZip);
     el('exportAcceptedCsv').addEventListener('click', exportAcceptedCsv);
     el('openImportProject').addEventListener('click', () => setImportModal(true));
     el('openExistingProject').addEventListener('click', () => setOpenProjectModal(true));
@@ -20989,6 +21029,20 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True, "result": result, "summary": self.data.store.summary()})
                 return
+            if parsed.path == "/api/share-project":
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                parent_dir = str(payload.get("parent_dir", "")).strip()
+                if not parent_dir:
+                    raise BadRequest("请选择 ZIP 保存位置")
+                if payload.get("project_id") != self.data.project_identity() or payload.get("project_root") != str(self.data.project.project_dir):
+                    raise BadRequest("当前项目已改变，请重新选择打包项目")
+                from annotation_app.project_archive import share_project
+                with self.data.store._lock:
+                    result = share_project(self.data.project.project_dir, Path(parent_dir),
+                                           database=self.data.project.annotation_db_path)
+                self.send_json({"ok": True, **result})
+                return
             if parsed.path == "/api/export-accepted-csv":
                 result = self.data.export_accepted_annotations_csv()
                 self.send_csv_download(result["csv_text"], result["filename"])
@@ -21041,7 +21095,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 from annotation_app.ms_core import preview_package_update
                 incoming = str(payload.get("package_dir") or "").strip()
                 if not incoming:
-                    raise BadRequest("请选择新版审阅包文件夹")
+                    raise BadRequest("请选择新版 LMA 事件包文件夹")
                 try:
                     result = preview_package_update(self.data.project.project_dir, self.data.manifest or {}, Path(incoming))
                 except ValueError as exc:

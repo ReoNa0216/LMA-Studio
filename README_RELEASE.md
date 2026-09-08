@@ -6,6 +6,12 @@ again. Saved v0.4+ projects retain their stored events, labels, models and bindi
 See [Task 1 integration](docs/flame_task1.md) for the import and build contract.
 This source version does not by itself mean a public release or human UAT passed.
 
+### v0.6.0-rc3 项目分享候选
+
+- 新增顶部“打包分享项目”：一致数据库快照、排除 macOS 元数据、解压后继续工作。
+- 正式事件导入名称统一为“LMA 事件包”；沿用 v2 格式。
+- 包含 rc2 时间轴再审核修复。Windows/macOS 构建及课题组 UAT 以实际证据为准。
+
 ### v0.6.0-rc2 Windows 修复候选
 
 - 修复已人工接受的自动 Cell/QC 关系在调整时间轴后无法再次拒绝、待审或接受的问题。再审核保存原物理关系及来源，未审核自动候选仍按当前模型校验；无需重建旧项目。

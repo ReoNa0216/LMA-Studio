@@ -97,7 +97,7 @@ def prepare_imported_ms(package_dir: Path, raw_path: Path, project_dir: Path):
         shutil.copyfile(package_dir / name, destination / name)
     copied = read_event_package(destination)
     if copied.manifest_sha256 != package.manifest_sha256:
-        raise ValueError("MS 审阅包在导入期间发生变化")
+        raise ValueError("LMA 事件包在导入期间发生变化")
     entry = {"path": PACKAGE_PATH, "manifest_sha256": package.manifest_sha256,
              "core_version": CORE_VERSION, "inclusion_policy": "accepted_only",
              "event_versions": package.event_versions, "status_counts": package.manifest["status_counts"]}
@@ -116,7 +116,7 @@ def validate_import_binding(project_dir: Path, manifest: dict, events: pd.DataFr
     if entry is None:
         return
     if entry.get("path") != PACKAGE_PATH or entry.get("inclusion_policy") != "accepted_only":
-        raise ValueError("MS 审阅包绑定无效")
+        raise ValueError("LMA 事件包绑定无效")
     package = read_event_package(project_dir / PACKAGE_PATH)
     if package.manifest_sha256 != entry["manifest_sha256"] or package.event_versions != entry["event_versions"]:
         raise ValueError("上游事件版本已改变；不能覆盖当前项目标注，请在新项目导入")
@@ -127,7 +127,7 @@ def validate_import_binding(project_dir: Path, manifest: dict, events: pd.DataFr
 def preview_package_update(project_dir: Path, manifest: dict, incoming_dir: Path) -> dict:
     entry = manifest.get("ms_event_import")
     if not entry:
-        raise ValueError("当前项目没有导入 MS Event Studio 审阅包")
+        raise ValueError("当前项目没有导入 LMA 事件包")
     previous = read_event_package(project_dir / PACKAGE_PATH)
     if previous.manifest_sha256 != entry["manifest_sha256"]:
         raise ValueError("当前项目审阅包已被修改")

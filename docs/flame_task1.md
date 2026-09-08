@@ -12,11 +12,13 @@
 python scripts/resolve_flame_core.py --download
 ```
 
-CI 使用 `FLAME_MS_CORE_READ_TOKEN` secret 读取私有内核仓库（仅需该仓库 contents:read）；缺少跨仓权限将明确失败。没有将本机登录凭据复制到 secret。本轮本机已验证下载和哈希；不能据此宣称托管 CI 或 macOS 真机验收通过。
+CI 首选 `FLAME_MS_CORE_WHEEL_BASE64` secret 中的锁定 wheel（仅约 25 KB 的安装产物，不是登录凭据），解码后必须与 checkout 的 SHA256 相同。未配置时仍可用 `FLAME_MS_CORE_READ_TOKEN` 读取私有 release；权限不足明确失败。secret 不会公开安装包源码或写入 Git。最终托管构建与 Mac 真机验收状态以共享交接为准。
 
 ## 事件传递
 
-MS Event Studio 导出“完整审计数据包”，LMA 新建项目选择“MS Event Studio 审阅包”，提供原 MS 文件和 LIF 输入。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
+项目 ZIP 与事件包用途不同，见[项目分享](project_sharing.md)。
+
+MS Event Studio 导出“LMA 事件包”，LMA 新建项目选择“LMA 事件包”，提供原 MS 文件和 LIF 输入。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
 
 v2 包包含 `events.parquet`、`manifest.json`、`checksums.sha256`。完整合同见内核 `docs/event-package-v2.md`。原始自动身份包含 raw SHA、方法版本和 generation；当前事件身份、修订、原始及当前 scan/时间/支持窗、审阅状态分别保留。两个 Studio 的项目 UUID 可不同。
 

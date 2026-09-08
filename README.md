@@ -1,5 +1,9 @@
 # LMA Studio
 
+项目内新增“打包分享项目”，自动排除 macOS 系统元数据；MS→LMA 正式交换入口统一为“LMA 事件包”。操作与保存边界见[项目分享](docs/project_sharing.md)。
+CI 的锁定内核可由 `FLAME_MS_CORE_WHEEL_BASE64` secret 提供，仍强制校验 SHA256。
+
+
 LMA Studio (LIF-MS Annotation Studio) is a local desktop application for human-assisted LIF-MS annotation review.
 
 It opens its own native desktop window, lets users create or open project directories, review QC anchors and cell-level LIF-MS candidates, and export a downstream cell roster as CSV. The application stores review state in each project's local SQLite database.
