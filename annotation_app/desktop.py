@@ -630,7 +630,10 @@ def check_scientific_runtime() -> dict[str, Any]:
     ):
         raise RuntimeError("Bundled event-roster event table has an inconsistent ratio")
 
+    from flame_ms_core.smoke import check_runtime as check_ms_runtime
+
     return {
+        "flame_ms_core": check_ms_runtime(),
         "expat_version": str(expat.EXPAT_VERSION),
         "openssl_version": str(ssl.OPENSSL_VERSION),
         "sqlite_version": str(sqlite3.sqlite_version),

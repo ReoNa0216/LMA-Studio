@@ -1,4 +1,10 @@
-# LMA Studio v0.5.1 Release Notes
+# LMA Studio v0.6.0 Release Notes
+
+Task 1 candidate: independent new MS analyses use `flame-ms-core==0.1.0`;
+MS Event Studio v2 reviewed packages can be imported without calling MS peaks
+again. Saved v0.4+ projects retain their stored events, labels, models and binding.
+See [Task 1 integration](docs/flame_task1.md) for the import and build contract.
+This source version does not by itself mean a public release or human UAT passed.
 
 ## 中文
 

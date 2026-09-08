@@ -1,5 +1,9 @@
 # LMA Studio 项目目录说明
 
+任务 1 的审阅包项目另保存 `provenance/ms_event_package/`（manifest、events Parquet、SHA256 sidecar）。
+`lifms_project.json.ms_event_import` 绑定完整包与逐事件版本；`data/ms_events.parquet` 保留所有上游状态，
+`data/cell_event_map.csv` 只纳入 accepted。旧项目布局不迁移。详见 [任务 1](flame_task1.md)。
+
 ## 新建项目的当前目录
 
 当前版本新建的项目使用下面的简洁结构，不再把内部处理步骤或版本号写进用户目录：

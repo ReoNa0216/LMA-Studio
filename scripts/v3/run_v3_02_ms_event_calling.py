@@ -371,199 +371,14 @@ def init_marker_fields(current: dict) -> None:
 
 
 def parse_ms_scan_summary(path: Path, progress_every: int = 10000) -> tuple[pd.DataFrame, dict]:
-    started = time.time()
-    rows: list[dict] = []
-    metadata_spectrum_count = None
-    historical_label_seen = False
-    correct_label_seen = "Day0-G2_Day3-R2_Day9-R1" in path.name
-
-    bounds = {}
-    for marker in MARKERS:
-        tol_mz = marker.mz * TOLERANCE_PPM * 1e-6
-        bounds[marker.prefix] = (marker.mz, marker.mz - tol_mz, marker.mz + tol_mz)
-    pc34_marker = MARKERS[0]
-    support_tol_mz = pc34_marker.mz * EVENT_ROSTER_SUPPORT_TOLERANCE_PPM * 1e-6
-    support_prefix = "pc34_760_roster_support"
-    bounds[support_prefix] = (
-        pc34_marker.mz,
-        pc34_marker.mz - support_tol_mz,
-        pc34_marker.mz + support_tol_mz,
-    )
-
-    in_spectrum = False
-    current: dict = {}
-    array_mode: str | None = None
-    target_indices: dict[str, np.ndarray] = {}
-    target_mz_values: dict[str, np.ndarray] = {}
-    bytes_seen = 0
-
-    with path.open("r", encoding="ascii", errors="replace", newline="") as fh:
-        for line in fh:
-            bytes_seen += len(line.encode("ascii", errors="replace"))
-            stripped = line.strip()
-
-            if "Day0-G2_Day1-R2_Day3-R1" in stripped:
-                historical_label_seen = True
-            if "Day0-G2_Day3-R2_Day9-R1" in stripped:
-                correct_label_seen = True
-
-            if not in_spectrum:
-                match = RE_SPECTRUM_LIST.search(stripped)
-                if match:
-                    metadata_spectrum_count = int(match.group(1))
-                if stripped == "spectrum:":
-                    in_spectrum = True
-                    current = {}
-                    init_marker_fields(current)
-                    array_mode = None
-                    target_indices = {}
-                    target_mz_values = {}
-                continue
-
-            matched_metadata = False
-            for regex, key, caster in [
-                (RE_INDEX, "spectrum_index", int),
-                (RE_SCAN_ID, "scan_id", int),
-                (RE_ARRAY_LENGTH, "array_length", int),
-                (RE_BASE_PEAK_MZ, "base_peak_mz", float),
-                (RE_BASE_PEAK_INTENSITY, "base_peak_intensity", float),
-                (RE_TIC, "tic", float),
-                (RE_LOWEST_MZ, "lowest_observed_mz", float),
-                (RE_HIGHEST_MZ, "highest_observed_mz", float),
-            ]:
-                match = regex.search(stripped)
-                if match:
-                    current[key] = caster(match.group(1))
-                    matched_metadata = True
-                    break
-            if matched_metadata:
-                continue
-
-            match = RE_SCAN_START_TIME.search(stripped)
-            if match:
-                current["scan_start_time_min"] = float(match.group(1))
-                current["scan_start_time_sec"] = current["scan_start_time_min"] * 60.0
-                continue
-
-            if "cvParam: m/z array" in stripped:
-                array_mode = "mz"
-                continue
-
-            if "cvParam: intensity array" in stripped:
-                array_mode = "intensity"
-                continue
-
-            if "binary:" in stripped and array_mode == "mz":
-                mz_array = array_from_binary_line(stripped)
-                current["mz_array_length_parsed"] = int(len(mz_array))
-                for marker in MARKERS:
-                    target_mz, lower_mz, upper_mz = bounds[marker.prefix]
-                    left = int(np.searchsorted(mz_array, lower_mz, side="left"))
-                    right = int(np.searchsorted(mz_array, upper_mz, side="right"))
-                    indices = np.arange(left, right, dtype=int)
-                    mz_values = mz_array[left:right]
-                    target_indices[marker.prefix] = indices
-                    target_mz_values[marker.prefix] = mz_values
-                    current[f"{marker.prefix}_n_mz"] = int(len(mz_values))
-                    if len(mz_values) > 0:
-                        closest_pos = int(np.argmin(np.abs(mz_values - target_mz)))
-                        closest_mz = float(mz_values[closest_pos])
-                        current[f"{marker.prefix}_closest_mz"] = closest_mz
-                        current[f"{marker.prefix}_closest_ppm_error"] = (closest_mz - target_mz) / target_mz * 1e6
-                target_mz, lower_mz, upper_mz = bounds[support_prefix]
-                left = int(np.searchsorted(mz_array, lower_mz, side="left"))
-                right = int(np.searchsorted(mz_array, upper_mz, side="right"))
-                indices = np.arange(left, right, dtype=int)
-                mz_values = mz_array[left:right]
-                target_indices[support_prefix] = indices
-                target_mz_values[support_prefix] = mz_values
-                current[f"{support_prefix}_n_mz"] = int(len(mz_values))
-                if len(mz_values) > 0:
-                    closest_pos = int(np.argmin(np.abs(mz_values - target_mz)))
-                    closest_mz = float(mz_values[closest_pos])
-                    current[f"{support_prefix}_closest_mz"] = closest_mz
-                    current[f"{support_prefix}_closest_ppm_error"] = (
-                        (closest_mz - target_mz) / target_mz * 1e6
-                    )
-                array_mode = None
-                continue
-
-            if "binary:" in stripped and array_mode == "intensity":
-                any_marker_hit = any(len(v) > 0 for v in target_indices.values())
-                if any_marker_hit:
-                    intensity_array = array_from_binary_line(stripped)
-                    current["intensity_array_length_parsed_if_marker_hit"] = int(len(intensity_array))
-                    for marker in MARKERS:
-                        indices = target_indices.get(marker.prefix, np.asarray([], dtype=int))
-                        mz_values = target_mz_values.get(marker.prefix, np.asarray([], dtype=float))
-                        if len(indices) == 0:
-                            continue
-                        selected = intensity_array[indices]
-                        max_pos = int(np.argmax(selected))
-                        mz_at_max = float(mz_values[max_pos])
-                        current[f"{marker.prefix}_max_intensity"] = float(selected[max_pos])
-                        current[f"{marker.prefix}_sum_intensity"] = float(selected.sum())
-                        current[f"{marker.prefix}_mz_at_max_intensity"] = mz_at_max
-                        current[f"{marker.prefix}_ppm_error_at_max_intensity"] = (
-                            mz_at_max - marker.mz
-                        ) / marker.mz * 1e6
-                    support_indices = target_indices.get(
-                        support_prefix, np.asarray([], dtype=int)
-                    )
-                    support_mz_values = target_mz_values.get(
-                        support_prefix, np.asarray([], dtype=float)
-                    )
-                    if len(support_indices) > 0:
-                        selected = intensity_array[support_indices]
-                        max_pos = int(np.argmax(selected))
-                        mz_at_max = float(support_mz_values[max_pos])
-                        current[f"{support_prefix}_max_intensity"] = float(
-                            selected[max_pos]
-                        )
-                        current[f"{support_prefix}_sum_intensity"] = float(
-                            selected.sum()
-                        )
-                        current[f"{support_prefix}_mz_at_max_intensity"] = mz_at_max
-                        current[
-                            f"{support_prefix}_ppm_error_at_max_intensity"
-                        ] = (mz_at_max - pc34_marker.mz) / pc34_marker.mz * 1e6
-                else:
-                    current["intensity_array_length_parsed_if_marker_hit"] = np.nan
-
-                rows.append(current.copy())
-                if len(rows) % progress_every == 0:
-                    print(
-                        f"Parsed {len(rows)} spectra, read {fmt_size(bytes_seen)}, "
-                        f"elapsed {time.time() - started:.1f} sec",
-                        flush=True,
-                    )
-                in_spectrum = False
-                current = {}
-                array_mode = None
-                target_indices = {}
-                target_mz_values = {}
-
-    parse_summary = {
-        "path": project_display_path(path),
-        "size_bytes": path.stat().st_size,
-        "size_human": fmt_size(path.stat().st_size),
-        "metadata_spectrum_count": metadata_spectrum_count,
-        "parsed_spectrum_count": len(rows),
-        "historical_label_seen_in_ms_header": historical_label_seen,
-        "correct_label_seen_in_file_or_path": correct_label_seen,
-        "tolerance_ppm": TOLERANCE_PPM,
-        "event_roster_support_tolerance_ppm": (
-            EVENT_ROSTER_SUPPORT_TOLERANCE_PPM
-        ),
-        "elapsed_sec": time.time() - started,
-    }
-    for marker in MARKERS:
-        tol_mz = marker.mz * TOLERANCE_PPM * 1e-6
-        parse_summary[f"{marker.prefix}_target_mz"] = marker.mz
-        parse_summary[f"{marker.prefix}_lower_mz"] = marker.mz - tol_mz
-        parse_summary[f"{marker.prefix}_upper_mz"] = marker.mz + tol_mz
-
-    return pd.DataFrame(rows), parse_summary
+    from dataclasses import asdict
+    from flame_ms_core.parser import parse_ms_scan_summary as parse_shared
+    from annotation_app.ms_core import lma_scan_table
+    parsed = parse_shared(path, include_roster_support=True)
+    summary = asdict(parsed.summary)
+    summary.update({"path": project_display_path(path), "sha256": parsed.fingerprint.sha256,
+                    "event_roster_support_tolerance_ppm": 15.0})
+    return lma_scan_table(parsed.scans), summary
 
 
 def add_derived_columns(scan: pd.DataFrame) -> pd.DataFrame:
@@ -1456,17 +1271,24 @@ def run(project_dir: str | Path | None = None) -> None:
     scan = add_derived_columns(scan)
     dt_sec = float(scan["scan_step_sec"].median())
 
-    pc34_bin_summary, pc34_localmax = build_bin_summary(scan, "pc34_760_max_intensity", dt_sec)
-    pc34_params, quiet_bins = estimate_parameters(scan, "pc34_760_max_intensity", pc34_bin_summary, pc34_localmax, dt_sec)
-    pc34_peaks = call_peak_indices(
-        scan,
-        "pc34_760_max_intensity",
-        float(pc34_params["peak_height"]),
-        float(pc34_params["peak_prominence"]),
-        float(pc34_params["min_distance_sec"]),
-        dt_sec,
-    )
-    pc34_events = build_event_table(scan, pc34_peaks, pc34_params, "pc34_primary")
+    from flame_ms_core.detector import detect_events
+    from flame_ms_core.timebase import AnalysisRange
+    from annotation_app.ms_core import lma_event_table
+    detected = detect_events(scan, parse_summary["sha256"],
+        AnalysisRange(int(scan.scan_time_ns.iloc[0]), int(scan.scan_time_ns.iloc[-1])))
+    pc34_events = lma_event_table(detected.events, scan, imported=False)
+    pc34_bin_summary, quiet_bins = detected.bin_summary, detected.quiet_bins
+    pc34_params = {**detected.parameters, "signal_col": "pc34_760_max_intensity"}
+    # Prominence bases are local LMA roster-matching evidence, never caller
+    # identity or a reason to move the shared half-height support.
+    positions = pc34_events.scan_row_index.astype(int).to_numpy()
+    if len(positions):
+        _, left_bases, right_bases = peak_prominences(scan.pc34_760_max_intensity.to_numpy(float), positions)
+        pc34_events["left_base_sec"] = scan.scan_start_time_sec.iloc[left_bases].to_numpy()
+        pc34_events["right_base_sec"] = scan.scan_start_time_sec.iloc[right_bases].to_numpy()
+    else:
+        pc34_events["left_base_sec"] = pd.Series(dtype=float)
+        pc34_events["right_base_sec"] = pd.Series(dtype=float)
 
     tic_bin_summary, tic_localmax = build_bin_summary(scan, "log10_tic", dt_sec)
     tic_params, tic_quiet_bins = estimate_parameters(scan, "log10_tic", tic_bin_summary, tic_localmax, dt_sec)

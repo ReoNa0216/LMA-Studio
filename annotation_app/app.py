@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Local browser application for human-assisted LIF-MS annotation.
 
 The app loads first-principles preprocessing tables, slices synchronized LIF/MS
@@ -113,7 +113,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.5.1"
+APP_VERSION = "lma_studio_v0.6.0"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -2582,23 +2582,34 @@ def load_project_cell_event_map(
             expected_sha256=str(entry.get("sha256") or ""),
             allow_missing_coordinates=(schema_version >= 2),
         )
-        rebound = match_source_to_events(
-            frame[["scan_start_time", "UMAP1", "UMAP2"]],
-            ms_events,
-            tolerance_sec=float(
-                entry.get("match_tolerance_sec", DEFAULT_MATCH_TOLERANCE_SEC)
-            ),
-            # v0.4 schema-1 projects were originally bound by strict apex
-            # tolerance followed by an uncapped half-height support interval.
-            # Re-open them under that exact read-only meaning; the newer
-            # bounded support/basin policy applies only to schema-2 imports.
-            include_peak_basin=(schema_version >= 2),
-            max_peak_shape_apex_offset_sec=(
-                None
-                if schema_version == 1
-                else MAX_PEAK_SHAPE_APEX_OFFSET_SEC
-            ),
-        )
+        if (manifest or {}).get("ms_event_import"):
+            eligible = ms_events[ms_events["upstream_review_status"].eq("accepted")]
+            by_id = eligible.set_index(eligible["event_id"].astype(str), drop=False)
+            requested = frame["ms_event_id"].astype(str).tolist()
+            if len(requested) != len(by_id) or set(requested) != set(by_id.index):
+                raise BadRequest("审阅包的纳入事件与 LMA 标注事件表不一致")
+            bound = by_id.loc[requested]
+            if not np.allclose(frame["scan_start_time"].to_numpy(float), bound["time_min"].to_numpy(float), rtol=0, atol=1e-11):
+                raise BadRequest("审阅包事件的采集时间已改变")
+            rebound = pd.DataFrame({"ms_event_id": bound["event_id"].to_numpy(), "scan_id": bound["scan_id"].to_numpy()})
+        else:
+            rebound = match_source_to_events(
+                frame[["scan_start_time", "UMAP1", "UMAP2"]],
+                ms_events,
+                tolerance_sec=float(
+                    entry.get("match_tolerance_sec", DEFAULT_MATCH_TOLERANCE_SEC)
+                ),
+                # v0.4 schema-1 projects were originally bound by strict apex
+                # tolerance followed by an uncapped half-height support interval.
+                # Re-open them under that exact read-only meaning; the newer
+                # bounded support/basin policy applies only to schema-2 imports.
+                include_peak_basin=(schema_version >= 2),
+                max_peak_shape_apex_offset_sec=(
+                    None
+                    if schema_version == 1
+                    else MAX_PEAK_SHAPE_APEX_OFFSET_SEC
+                ),
+            )
     except CellEventMapError as exc:
         raise BadRequest(str(exc)) from exc
     if bool(frame.attrs.get("coordinates_available", True)) != coordinates_available:
@@ -3029,14 +3040,16 @@ class AnnotationStore:
         db_path: Path = DEFAULT_ANNOTATION_DB_PATH,
         *,
         default_project_config: dict[str, Any] | None = None,
+        initialize: bool = True,
     ) -> None:
         self.db_path = db_path
         self.legacy_state_path = self.db_path.parent / "annotation_state.json"
         self.default_project_config = copy.deepcopy(default_project_config or {})
         self._lock = threading.Lock()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-        self._migrate_legacy_json_if_needed()
+        if initialize:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_db()
+            self._migrate_legacy_json_if_needed()
 
     @contextlib.contextmanager
     def _connect(self):
@@ -3044,7 +3057,6 @@ class AnnotationStore:
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA busy_timeout = 30000")
             yield conn
             conn.commit()
@@ -3530,7 +3542,7 @@ class AnnotationStore:
     def project_config(self) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT key, value_json FROM project_config").fetchall()
-        return {str(row["key"]): json.loads(row["value_json"]) for row in rows}
+        return {**copy.deepcopy(self.default_project_config), **{str(row["key"]): json.loads(row["value_json"]) for row in rows}}
 
     def qc_alignment_model(self) -> dict[str, Any] | None:
         model = self.project_config().get(QC_ALIGNMENT_MODEL_KEY)
@@ -5757,6 +5769,8 @@ def build_qc_alignment_groups(
 
 def primary_pc34_events(ms_events: pd.DataFrame) -> pd.DataFrame:
     mask = pd.Series(True, index=ms_events.index)
+    if "upstream_review_status" in ms_events.columns:
+        mask &= ms_events["upstream_review_status"].eq("accepted")
     if "event_strategy" in ms_events.columns:
         mask &= ms_events["event_strategy"].eq("pc34_primary")
     if "primary_signal_col" in ms_events.columns:
@@ -6036,6 +6050,8 @@ def automatic_calibration_ms_evidence(ms_events: pd.DataFrame) -> pd.DataFrame:
 
 
 def is_primary_pc34_event(row: pd.Series) -> bool:
+    if "upstream_review_status" in row.index and row["upstream_review_status"] != "accepted":
+        return False
     if "event_strategy" in row.index and str(row.get("event_strategy")) != "pc34_primary":
         return False
     if "primary_signal_col" in row.index and str(row.get("primary_signal_col")) != "pc34_760_max_intensity":
@@ -6054,6 +6070,8 @@ def is_manual_cell_ms_event(row: pd.Series) -> bool:
     historical primary-event interpretation.
     """
 
+    if "upstream_review_status" in row.index and row["upstream_review_status"] != "accepted":
+        return False
     if "event_strategy" not in row.index or pd.isna(row.get("event_strategy")):
         return is_primary_pc34_event(row)
     strategy = str(row.get("event_strategy") or "").strip()
@@ -8297,12 +8315,14 @@ class AppData:
         return require_active_lif_peak_detection()
 
     @classmethod
-    def load(cls, project: ProjectPaths | None = None) -> "AppData":
+    def load(cls, project: ProjectPaths | None = None, *, _initialize_staging: bool = False) -> "AppData":
         project = project or ProjectPaths.from_args()
         manifest = read_project_manifest(project.project_dir)
         peak_detection = lif_peak_detection_from_manifest(manifest)
         validate_project_manifest_against_files(project.project_dir, manifest)
         project = project_with_manifest_paths(project, manifest)
+        if not project.annotation_db_path.is_file() and not _initialize_staging:
+            raise BadRequest("项目标注数据库缺失；请恢复完整项目副本。打开已有项目不会新建空数据库。")
         for path in [project.lif_traces_path, project.lif_peaks_path, project.ms_events_path, project.ms_scan_path]:
             require_file(path)
         intermediate_tables = intermediate_table_fingerprints(project)
@@ -8323,7 +8343,10 @@ class AppData:
             .sort_values(["time_min", "channel"])
             .reset_index(drop=True)
         )
-        ms_events = pd.read_parquet(project.ms_events_path).sort_values("time_min").reset_index(drop=True)
+        ms_events = pd.read_parquet(project.ms_events_path)
+        from annotation_app.ms_core import validate_import_binding
+        validate_import_binding(project.project_dir, manifest or {}, ms_events)
+        ms_events = ms_events.sort_values("time_min", kind="stable").reset_index(drop=True)
         ms_scan = pd.read_parquet(project.ms_scan_path).sort_values("scan_start_time_min").reset_index(drop=True)
         ms_events = annotate_calibration_ms_event_complexes(ms_events, ms_scan)
         cell_event_map, cell_event_map_info = load_project_cell_event_map(
@@ -8343,14 +8366,18 @@ class AppData:
         assert_no_legacy_annotation_state(project.annotation_db_path)
         annotation_count_before_load = sqlite_annotation_count(project.annotation_db_path)
         db_existed_before_load = project.annotation_db_path.exists()
-        allow_adopt = annotation_count_before_load == 0
+        allow_adopt = not db_existed_before_load
         if allow_adopt:
             validate_sqlite_input_manifest_against_files(project.annotation_db_path, project.project_dir, intermediate_tables)
-        binding_status = validate_sqlite_project_binding(
-            project.annotation_db_path,
-            binding,
-            allow_adopt=allow_adopt,
-        )
+        if (db_existed_before_load and int((manifest or {}).get("project_schema_version", 0)) < 3
+                and read_sqlite_project_binding(project.annotation_db_path) is None):
+            # Existing v0.3 fixtures/projects predate the binding. Their file
+            # and event references were checked above; opening must not migrate.
+            binding_status = "legacy_unbound_readonly"
+        else:
+            binding_status = validate_sqlite_project_binding(
+                project.annotation_db_path, binding, allow_adopt=allow_adopt,
+            )
         store_defaults = project_config_defaults_from_manifest(manifest)
         # A v0.3 project has neither of the split semantic objects.  They are
         # compatibility projections, not migrations: do not persist them on
@@ -8363,6 +8390,7 @@ class AppData:
         store = AnnotationStore(
             project.annotation_db_path,
             default_project_config=store_defaults,
+            initialize=not db_existed_before_load,
         )
         project_config = store.project_config()
         calibration_protocol = calibration_protocol_from_manifest(manifest, project_config)
@@ -8455,7 +8483,7 @@ class AppData:
                     "现有 time model 没有 calibration protocol 绑定，不能静默迁移到新协议；"
                     "请明确失效旧 time model 后重新校正"
                 )
-        elif existing_time_model is None and protocol_confirmed:
+        elif existing_time_model is None and protocol_confirmed and not db_existed_before_load:
             store.ensure_draft_time_model(
                 str(alignment["model"]),
                 current_layout_hash,
@@ -8522,6 +8550,9 @@ class AppData:
         return {
             "root": str(self.project.project_dir),
             "project_id": self.project_identity(),
+            "ms_event_import": ({"status_counts": (self.manifest or {})["ms_event_import"]["status_counts"],
+                                 "inclusion_policy": "accepted_only"}
+                                if (self.manifest or {}).get("ms_event_import") else None),
             "project": {
                 "project_dir": str(self.project.project_dir),
                 "raw_data_dir": str(self.project.raw_data_dir),
@@ -9385,6 +9416,7 @@ class AppData:
         annotation_start_min: float | None = None,
         local_delta_seed_window_min: float = DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
         cell_event_map_path: Path | None = None,
+        ms_event_package_path: Path | None = None,
         _staging_build: bool = False,
     ) -> "AppData | ProjectPaths":
         project_dir = project_dir.expanduser().resolve()
@@ -9418,12 +9450,19 @@ class AppData:
             raise BadRequest("项目保存路径不能使用当前代码仓库根目录；请新建独立项目目录")
         source_ms_fingerprint = raw_file_fingerprint(source_raw_paths["ms"])
         if not _staging_build:
-            if cell_event_map_path is None:
+            if cell_event_map_path is None and ms_event_package_path is None:
                 raise BadRequest(
                     "新项目必须选择事件表 CSV（scan_start_time 必需；UMAP1/UMAP2 可稍后附加）"
                 )
-            cell_event_map_path = cell_event_map_path.expanduser().resolve()
-            raw_file_fingerprint(cell_event_map_path, full_hash_limit_bytes=None)
+            if ms_event_package_path is not None:
+                from flame_ms_core.exchange import read_event_package
+                ms_event_package_path = ms_event_package_path.expanduser().resolve()
+                read_event_package(ms_event_package_path)
+                if cell_event_map_path is not None:
+                    raise BadRequest("审阅包与事件 CSV 请选择一种；UMAP 可在创建后导入")
+            else:
+                cell_event_map_path = cell_event_map_path.expanduser().resolve()
+                raw_file_fingerprint(cell_event_map_path, full_hash_limit_bytes=None)
             existing_outputs = [
                 project_dir / CANONICAL_TABLE_PATHS["lif_traces"],
                 project_dir / CANONICAL_TABLE_PATHS["lif_peaks"],
@@ -9452,6 +9491,7 @@ class AppData:
                     annotation_start_min=annotation_start_min,
                     local_delta_seed_window_min=local_delta_seed_window_min,
                     cell_event_map_path=cell_event_map_path,
+                    ms_event_package_path=ms_event_package_path,
                     _staging_build=True,
                 )
                 commit_staging_project(
@@ -9748,6 +9788,12 @@ class AppData:
             ("run_v3_01_lif_trace_physical_qc.py", "LIF 峰识别与质量检查"),
             ("run_v3_02_ms_event_calling.py", "MS event 识别与质量检查"),
         ]
+        imported_map = imported_metadata = imported_entry = None
+        if ms_event_package_path is not None:
+            from annotation_app.ms_core import prepare_imported_ms
+            imported_map, imported_metadata, imported_entry = prepare_imported_ms(
+                ms_event_package_path, effective_ms_path, project_dir)
+            scripts = scripts[:1]
         log_lines = []
         for script, display_name in scripts:
             try:
@@ -9789,28 +9835,31 @@ class AppData:
                 "LIF 原始文件在前处理期间发生变化，请确认文件不再被写入后重新创建项目: "
                 + ", ".join(changed_channels)
             )
-        if cell_event_map_path is None:
+        if cell_event_map_path is None and ms_event_package_path is None:
             raise BadRequest("内部错误：staging 项目缺少 cell event map source")
         try:
-            (
-                reconciled_ms_events,
-                canonical_map,
-                map_import_metadata,
-                roster_support_audit,
-            ) = reconcile_event_roster_supported_ms_events(
-                cell_event_map_path,
-                pd.read_parquet(existing_outputs[2]),
-                pd.read_parquet(existing_outputs[3]),
-                tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
-            )
-            reconciled_ms_events.to_parquet(existing_outputs[2], index=False)
-            if not roster_support_audit.empty:
-                roster_support_audit.to_csv(
-                    project_dir
-                    / CANONICAL_MS_DIAGNOSTICS_DIR
-                    / "event_roster_supported_events.csv",
-                    index=False,
+            if imported_map is not None:
+                canonical_map, map_import_metadata = imported_map, imported_metadata
+            else:
+                (
+                    reconciled_ms_events,
+                    canonical_map,
+                    map_import_metadata,
+                    roster_support_audit,
+                ) = reconcile_event_roster_supported_ms_events(
+                    cell_event_map_path,
+                    pd.read_parquet(existing_outputs[2]),
+                    pd.read_parquet(existing_outputs[3]),
+                    tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
                 )
+                reconciled_ms_events.to_parquet(existing_outputs[2], index=False)
+                if not roster_support_audit.empty:
+                    roster_support_audit.to_csv(
+                        project_dir
+                        / CANONICAL_MS_DIAGNOSTICS_DIR
+                        / "event_roster_supported_events.csv",
+                        index=False,
+                    )
             canonical_path = project_dir / CANONICAL_CELL_EVENT_MAP_PATH
             write_canonical_map(canonical_map, canonical_path)
             map_manifest_entry = cell_event_map_manifest_entry(
@@ -9854,10 +9903,15 @@ class AppData:
             storage_layout=canonical_storage_layout_manifest_entry(),
         )
 
+        if imported_entry is not None:
+            manifest_path = project_dir / "lifms_project.json"
+            created_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            created_manifest["ms_event_import"] = imported_entry
+            manifest_path.write_text(json.dumps(created_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         project = ProjectPaths.for_new_project(project_dir)
         if _staging_build:
             resolved = validate_staged_project_artifacts(project)
-            staged_app = cls.load(resolved)
+            staged_app = cls.load(resolved, _initialize_staging=True)
             expected_binding = project_table_binding(
                 intermediate_table_fingerprints(staged_app.project)
             )
@@ -13158,6 +13212,9 @@ class AppData:
         ]
         event_cols = [
             "event_id",
+            "upstream_review_status",
+            "origin",
+            "revision",
             "event_strategy",
             "scan_id",
             "time_min",
@@ -14786,7 +14843,9 @@ HTML = r"""<!doctype html>
         height: 680px;
       }
     }
-    @media (max-width: 760px) {
+    #importDualRoleHelp { grid-column: 2; }
+    #checkMsPackageUpdate { margin-top: 10px; }
+    @media (max-width: 1000px) {
       .modal-backdrop {
         padding: 12px 8px;
       }
@@ -14801,6 +14860,7 @@ HTML = r"""<!doctype html>
         grid-template-columns: minmax(0, 1fr);
         gap: 7px;
       }
+      #importDualRoleHelp { grid-column: 1 / -1; }
       .import-grid > label {
         margin-top: 5px;
         font-weight: 700;
@@ -15145,19 +15205,24 @@ HTML = r"""<!doctype html>
             <span id="importRoleSummary" class="qc-anchor-rule">细胞 0，共 0 个 LIF</span>
           </div>
         </div>
-        <div id="importDualRoleHelp" class="qc-anchor-rule" style="grid-column:2;">同一通道的 QC anchor 与 Cell pair 角色相互独立，可同时启用。</div>
+        <div id="importDualRoleHelp" class="qc-anchor-rule">同一通道的 QC anchor 与 Cell pair 角色相互独立，可同时启用。</div>
         <label for="importMs">MS 文件</label>
         <div class="path-picker-row">
           <input id="importMs" type="text" placeholder="选择 MS 原始文件" />
           <button class="small-button secondary path-picker-button" aria-label="选择 MS 原始文件" data-picker-target="importMs" data-picker-kind="file" data-picker-role="ms" data-picker-title="选择 MS 原始文件">选择</button>
         </div>
-        <label for="importCellEventMap">事件坐标 CSV</label>
+        <label for="importMsSource">MS 事件来源</label>
+        <select id="importMsSource">
+          <option value="raw">共用检峰内核＋事件 CSV</option>
+          <option value="package">MS Event Studio 审阅包</option>
+        </select>
+        <label id="importEventSourceLabel" for="importCellEventMap">事件坐标 CSV</label>
         <div>
           <div class="path-picker-row">
-            <input id="importCellEventMap" type="text" placeholder="选择包含 scan_start_time 的 CSV" />
+            <input id="importCellEventMap" type="text" aria-describedby="importEventSourceHelp" placeholder="选择包含 scan_start_time 的 CSV" />
             <button class="small-button secondary path-picker-button" aria-label="选择单细胞事件坐标 CSV" data-picker-target="importCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择单细胞事件坐标 CSV">选择</button>
           </div>
-          <div class="coordinate-source-help">必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
+          <div id="importEventSourceHelp" class="coordinate-source-help">必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。CellNumber、batch、Type 等其他列可以保留，导入时会忽略。</div>
         </div>
         <span>LIF 峰识别方式</span>
         <div id="importLifPeakDetectorStandard" class="detector-standard-card">
@@ -15305,6 +15370,17 @@ HTML = r"""<!doctype html>
           <span id="attachMapReady" class="attach-map-ready">尚未选择文件</span>
         </div>
       </div>
+      <section id="msPackageUpdatePanel" class="attach-map-panel" hidden>
+        <p class="side-title">MS 上游审阅更新</p>
+        <p>检查上游事件变化。当前项目保留事件、标注和时间模型；新版审阅结果导入独立新项目。</p>
+        <label for="msPackageUpdatePath">新版审阅包文件夹</label>
+        <div class="path-picker-row">
+          <input id="msPackageUpdatePath" type="text" />
+          <button class="small-button secondary path-picker-button" data-picker-target="msPackageUpdatePath" data-picker-kind="directory" data-picker-title="选择新版审阅包" aria-label="选择新版审阅包">选择</button>
+        </div>
+        <button id="checkMsPackageUpdate" class="small-button secondary" type="button">检查事件变化</button>
+        <p id="msPackageUpdateResult" role="status" aria-live="polite"></p>
+      </section>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
         <button id="saveConfig" class="small-button">保存项目配置</button>
@@ -15313,6 +15389,37 @@ HTML = r"""<!doctype html>
   </div>
 
   <script>
+    let msPackagePreviewRequest = 0;
+    document.getElementById('checkMsPackageUpdate').addEventListener('click', async function () {
+      const result = document.getElementById('msPackageUpdateResult');
+      const request = ++msPackagePreviewRequest;
+      const packagePath = document.getElementById('msPackageUpdatePath').value.trim();
+      const projectMeta = state.meta;
+      const stillCurrent = () => request === msPackagePreviewRequest
+        && projectMeta === state.meta
+        && packagePath === document.getElementById('msPackageUpdatePath').value.trim();
+      this.disabled = true;
+      try {
+        const response = await postJson('/api/ms-package-update-preview', {package_dir: packagePath});
+        if (!stillCurrent()) return;
+        result.textContent = `${response.message} 新增 ${response.added.length}，移除 ${response.removed.length}，变化 ${response.changed.length}，未变 ${response.unchanged.length}。`;
+      } catch (error) { if (stillCurrent()) result.textContent = `检查失败：${error.message}`; }
+      finally { if (request === msPackagePreviewRequest) this.disabled = false; }
+    });
+    document.getElementById('importMsSource').addEventListener('change', function () {
+      const machine = this.value === 'package';
+      const input = document.getElementById('importCellEventMap');
+      input.value = '';
+      input.placeholder = machine ? '选择 MS Event Studio 导出的审阅包文件夹' : '选择包含 scan_start_time 的 CSV';
+      document.getElementById('importEventSourceLabel').textContent = machine ? '审阅包文件夹' : '事件坐标 CSV';
+      const picker = document.querySelector('[data-picker-target="importCellEventMap"]');
+      picker.dataset.pickerKind = machine ? 'directory' : 'file';
+      picker.dataset.pickerTitle = machine ? '选择 MS 审阅包文件夹' : '选择单细胞事件坐标 CSV';
+      picker.setAttribute('aria-label', picker.dataset.pickerTitle);
+      document.getElementById('importEventSourceHelp').textContent = machine
+        ? '保留完整事件身份与审阅结果。仅已保留事件参与标注；MS 原始文件用于显示与核对，不重新检峰。UMAP 可稍后导入。'
+        : '必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。其他列导入时忽略。';
+    });
     const state = {
       meta: null,
       start: 0,
@@ -15889,6 +15996,11 @@ HTML = r"""<!doctype html>
     }
 
     function applyLoadedProjectMeta(projectMeta) {
+      msPackagePreviewRequest += 1;
+      el('checkMsPackageUpdate').disabled = false;
+      el("msPackageUpdatePanel").hidden = !projectMeta.ms_event_import;
+      el("msPackageUpdatePath").value = "";
+      el("msPackageUpdateResult").textContent = "";
       state.meta = projectMeta;
       state.current = null;
       syncBootstrapMode();
@@ -16543,6 +16655,7 @@ HTML = r"""<!doctype html>
 
     async function init() {
       state.meta = await fetchJson('/api/meta');
+      el('msPackageUpdatePanel').hidden = !state.meta.ms_event_import;
       syncBootstrapMode();
       state.start = Math.max(0, state.meta.time_min_min);
       applyStageWindowWidth();
@@ -18412,7 +18525,7 @@ HTML = r"""<!doctype html>
         if (!Number.isFinite(seedWindow) || seedWindow <= 0) throw new Error('自动估计 MS 时间差的范围必须大于 0。');
         const postQcStrategy = postQcStrategyPayload();
         if (!el('importProjectDir').value.trim() || !el('importMs').value.trim() || !el('importCellEventMap').value.trim()) {
-          throw new Error('请选择项目保存路径、MS 原始文件和事件坐标 CSV。');
+          throw new Error('请选择项目保存路径、MS 原始文件及对应的事件 CSV 或审阅包。');
         }
         const unconfirmedCount = calibrationProtocol.segments.filter(segment => !segment.boundaries_confirmed).length;
         if (unconfirmedCount) {
@@ -18428,7 +18541,8 @@ HTML = r"""<!doctype html>
           annotation_start_min: annotationStart,
           local_delta_seed_window_min: seedWindow,
           post_qc_strategy: postQcStrategy,
-          cell_event_map_path: el('importCellEventMap').value,
+          cell_event_map_path: el('importMsSource').value === 'raw' ? el('importCellEventMap').value : '',
+          ms_event_package_path: el('importMsSource').value === 'package' ? el('importCellEventMap').value : '',
         });
         applyLoadedProjectMeta(result.meta);
         await loadWindow();
@@ -19925,6 +20039,7 @@ HTML = r"""<!doctype html>
       return [
         detail.type,
         `${fmtMaybe(d.raw_time_min ?? d.time_min, 3)} min`,
+        d.upstream_review_status ? `MS 审阅：${({accepted: '已保留', rejected: '已排除', pending: '待定', unreviewed: '未审阅'})[d.upstream_review_status] || d.upstream_review_status}` : '',
         Number.isFinite(Number(intensity)) ? `强度 ${fmt(intensity, 1)}` : '',
         calibrationEvidence,
         d.collision_risk_high || d.low_quality_scan_window ? '相邻事件或信号质量需注意' : ''
@@ -20888,6 +21003,17 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True, **result})
                 return
+            if parsed.path == "/api/ms-package-update-preview":
+                from annotation_app.ms_core import preview_package_update
+                incoming = str(payload.get("package_dir") or "").strip()
+                if not incoming:
+                    raise BadRequest("请选择新版审阅包文件夹")
+                try:
+                    result = preview_package_update(self.data.project.project_dir, self.data.manifest or {}, Path(incoming))
+                except ValueError as exc:
+                    raise BadRequest(str(exc)) from exc
+                self.send_json({"ok": True, **result})
+                return
             if parsed.path == "/api/import-project":
                 lif_inputs_payload = payload.get("lif_inputs")
                 uses_dynamic_lif_inputs = isinstance(lif_inputs_payload, list) and bool(lif_inputs_payload)
@@ -20908,6 +21034,8 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                         "ms_path",
                         "cell_event_map_path",
                     ]
+                if str(payload.get("ms_event_package_path") or "").strip():
+                    required = [key for key in required if key != "cell_event_map_path"]
                 missing = [key for key in required if not str(payload.get(key, "")).strip()]
                 if missing:
                     raise BadRequest(f"缺少导入路径字段: {', '.join(missing)}")
@@ -20965,7 +21093,8 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                                 DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
                             )
                         ),
-                        cell_event_map_path=Path(str(payload["cell_event_map_path"])),
+                        cell_event_map_path=Path(str(payload["cell_event_map_path"])) if payload.get("cell_event_map_path") else None,
+                        ms_event_package_path=Path(str(payload["ms_event_package_path"])) if payload.get("ms_event_package_path") else None,
                     )
                 else:
                     new_data = AppData.create_project_from_raw_inputs(
@@ -20983,7 +21112,8 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                             if isinstance(payload.get("lif_peak_detection"), dict)
                             else None
                         ),
-                        cell_event_map_path=Path(str(payload["cell_event_map_path"])),
+                        cell_event_map_path=Path(str(payload["cell_event_map_path"])) if payload.get("cell_event_map_path") else None,
+                        ms_event_package_path=Path(str(payload["ms_event_package_path"])) if payload.get("ms_event_package_path") else None,
                     )
                 self.__class__.data = new_data
                 self.send_json({"ok": True, "meta": new_data.meta()})

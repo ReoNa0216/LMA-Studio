@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 python_bin="${PYTHON_BIN:-python3}"
-version="${LMA_STUDIO_VERSION:-v0.5.1}"
+version="${LMA_STUDIO_VERSION:-v0.6.0-rc1}"
 
 cd "$repo_root"
 
@@ -13,6 +13,10 @@ if [[ "$machine" != "arm64" ]]; then
   exit 1
 fi
 
+core_wheel="${FLAME_MS_CORE_WHEEL:-$repo_root/../flame-ms-core/dist/flame_ms_core-0.1.0-py3-none-any.whl}"
+"$python_bin" scripts/resolve_flame_core.py --wheel "$core_wheel"
+"$python_bin" -m pip install --no-deps --force-reinstall "$core_wheel"
+shasum -a 256 "$core_wheel"
 "$python_bin" -m pip install --upgrade pip wheel setuptools
 "$python_bin" -m pip install -r packaging/macos/requirements-macos.txt
 "$python_bin" -m unittest discover -s tests -q

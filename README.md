@@ -6,7 +6,12 @@ It opens its own native desktop window, lets users create or open project direct
 
 ## Current Scope
 
-- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and an event-list CSV containing `scan_start_time`. `UMAP1` and `UMAP2` are optional and may be attached later; unrelated source columns are allowed and ignored.
+Task 1 adds a formal MS Event Studio reviewed-package input. Its accepted events
+form the event roster; all upstream statuses and physical evidence are retained.
+Independent new calling also uses `flame-ms-core==0.1.0`. Existing projects are
+not recalculated. See [the integration and build guide](docs/flame_task1.md).
+
+- Create a new annotation project from 2-4 LIF raw files, 1 MS raw file, and either a reviewed MS Event Studio package or an event-list CSV containing `scan_start_time`. `UMAP1` and `UMAP2` are optional and may be attached later; unrelated CSV source columns are allowed and ignored.
 - Open an existing project containing the manifest-bound preprocessing parquet tables and annotation SQLite path; both the compact current layout and unchanged v0.4.0 paths are supported.
 - Configure each channel's signal color, sample label, and cell-annotation role. A channel may simultaneously serve as a front `QC anchor` and an Events-stage `Cell pair` source; the two uses are independent. Shared acquisition-time groups are assigned automatically, so users never type internal axis names.
 - Use one project-wide adaptive two-tier LIF peak standard. High-confidence peaks are the only evidence used by automatic calibration, time-difference estimation, QC, candidate generation, and model fitting. Weak candidate peaks are optional display evidence for manual cell pairing only.
@@ -17,7 +22,7 @@ It opens its own native desktop window, lets users create or open project direct
 - Adjust the frozen timeline again from Events / QC through an explicit preview-and-apply flow. Existing Cell/QC decisions remain bound to raw peak and MS-event IDs and move with the projected tracks; unreviewed automatic candidates are rebuilt, while reviewed large-residual relations are retained and flagged for re-review.
 - Match dense calibration evidence with a deterministic order-preserving sequence matcher, preventing physically impossible crossed peak assignments while retaining explicit ambiguity handling.
 - Review three explicit UI stages: segmented front calibration, generic unlabeled post-run delta, and event annotation / QC survey.
-- Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist matched from the coordinate CSV.
+- Restrict every new project's third-stage candidates and manual writes to a canonical `ms_event_id` whitelist from accepted package events or the matched coordinate CSV.
 - Keep that event-list gate strict while making failures actionable: if any row is unmatched, ambiguous, or reuses an event, project creation rolls back and the new-project window offers a complete row-level diagnostic CSV without copying identity/author columns.
 - Keep the established automatic MS760 caller on its ±12 ppm core trace. If a whitelist row has no core event, a separately gated ±15 ppm review lane may expose an exact resolved peak above the project background's upper-decile review bound for manual Cell pairing only; it never enters automatic calibration, time-difference, QC, or Cell-candidate evidence.
 - Open a separate synchronized UMAP window. Accepted cell colors use the same shared high-contrast channel palette as Track; the QC legend is omitted when the active event stage has no QC, clicking a point focuses the same event in the main track window, and an MS760 time lookup can outline matching points without changing annotations. A different coordinate CSV for the same MS-event population can be validated and imported from project configuration to switch, for example, between pre- and post-batch-correction views without changing annotations or the time model.

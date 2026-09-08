@@ -837,11 +837,11 @@ class CanonicalProjectStorageTest(unittest.TestCase):
                 real_load = AppData.load
                 load_count = 0
 
-                def fail_only_after_publish(project):
+                def fail_only_after_publish(project, **kwargs):
                     nonlocal load_count
                     load_count += 1
                     if load_count == 1:
-                        return real_load(project)
+                        return real_load(project, **kwargs)
                     raise RuntimeError("synthetic post-publish reopen failure")
 
                 with mock.patch(
