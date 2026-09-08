@@ -11948,8 +11948,33 @@ class AppData:
         clear_qc_alignment_model: bool = False,
     ) -> dict[str, Any]:
         existing = self.store.get(annotation_id)
-        if existing and existing.get("source") == "manual_created":
+        # Stored third-stage auto rows are human decisions, not disposable
+        # candidates. Re-review their original physical relation even when a
+        # new time model no longer proposes it. Front-QC and unsaved candidates
+        # retain the current candidate/evidence validation below.
+        saved_auto = bool(
+            existing
+            and existing.get("source") == "auto_candidate"
+            and self.annotation_review_stage(existing) in {"cell_annotation", "qc_survey"}
+        )
+        if existing and (existing.get("source") == "manual_created" or saved_auto):
             projected_existing = self.project_saved_relation(existing)
+            if review_status == "accepted" and projected_existing.get("projection_unavailable"):
+                raise BadRequest("原始峰身份无法解析，不能接受该关系；请检查项目数据。")
+            if saved_auto:
+                if window_start_min is None or window_end_min is None:
+                    raise BadRequest("Reviewing a saved automatic relation requires its active window")
+                visible_ids = {
+                    str(row.get("annotation_id"))
+                    for row in self.window_annotations(
+                        float(window_start_min),
+                        float(window_end_min),
+                        context_start_min=float(window_start_min) - WINDOW_CONTEXT_MARGIN_MIN,
+                        context_end_min=float(window_end_min) + WINDOW_CONTEXT_MARGIN_MIN,
+                    )
+                }
+                if annotation_id not in visible_ids:
+                    raise BadRequest(f"Saved candidate_id outside active window: {annotation_id}")
             payload = {
                 key: value
                 for key, value in projected_existing.items()
@@ -11986,10 +12011,11 @@ class AppData:
             )
             row = self.store.upsert_review(
                 annotation_id=annotation_id,
-                source="manual_created",
+                source=str(existing["source"]),
                 review_status=review_status,
                 payload=payload,
-                action=f"manual_annotation_{review_status}",
+                action=(f"auto_candidate_{review_status}" if saved_auto
+                        else f"manual_annotation_{review_status}"),
                 window_start_min=window_start_min,
                 window_end_min=window_end_min,
                 time_mode=time_mode,
@@ -19595,6 +19621,7 @@ HTML = r"""<!doctype html>
         if (state.eventFilter !== 'cell') {
           drawPostQcCandidates(svg, markerPositions);
           drawManualAnnotations(svg, markerPositions);
+          drawAcceptedQcSurveyAnnotations(svg, markerPositions);
         }
         if (state.eventFilter !== 'qc') {
           drawCellCandidates(svg, markerPositions);
@@ -19716,15 +19743,16 @@ HTML = r"""<!doctype html>
         if (!lif || !ms) return;
         const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
         const accepted = row.review_status === 'accepted';
+        const rejected = row.review_status === 'rejected';
         const baseColor = row.cross_channel_candidate_conflict && !accepted ? '#d97706' : colorForChannel(row.lif_channel);
         const line = svgEl('line', {
           x1: lif.x.toFixed(2),
           y1: lif.y.toFixed(2),
           x2: ms.x.toFixed(2),
           y2: ms.y.toFixed(2),
-          stroke: baseColor,
+          stroke: rejected ? '#98a2b3' : baseColor,
           'stroke-width': accepted ? 1.05 : (selected ? 1.8 : 1.25),
-          'stroke-dasharray': accepted ? '' : '6 4',
+          'stroke-dasharray': accepted ? '' : rejected ? '2 4' : '6 4',
           opacity: accepted ? 0.40 : 0.68,
           'pointer-events': 'visibleStroke',
           cursor: 'pointer'
@@ -19781,11 +19809,9 @@ HTML = r"""<!doctype html>
             y1: lif.y.toFixed(2),
             x2: ms.x.toFixed(2),
             y2: ms.y.toFixed(2),
-            stroke: row.needs_review === true
-              ? '#d97706'
-              : row.review_status === 'rejected'
-                ? '#98a2b3'
-                : row.review_status === 'pending'
+            stroke: row.review_status === 'rejected'
+              ? '#98a2b3'
+              : row.needs_review === true || row.review_status === 'pending'
                   ? '#d97706'
                   : baseColor,
             'stroke-width': selected ? 1.65 : style.width,
@@ -19811,15 +19837,20 @@ HTML = r"""<!doctype html>
 
     function drawAcceptedQcSurveyAnnotations(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
+      const drawnIds = new Set([
+        ...(state.current.post_qc_candidates || []),
+        ...(state.current.annotations || [])
+      ].map(row => row.annotation_id || row.candidate_id));
       (state.current.cell_qc_anchors || [])
         .filter(isAcceptedQcSurveyRow)
+        .filter(row => !drawnIds.has(row.annotation_id || row.candidate_id))
         .forEach(row => {
           const markerGroup = qcAnchorMarkerPoints(row, markerPositions);
           const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
           const style = {
             stroke: row.needs_review === true ? '#d97706' : '#111827',
             width: row.needs_review === true ? 2.0 : selected ? 1.75 : 1.05,
-            dash: row.needs_review === true ? '4 3' : '',
+            dash: '',
             opacity: row.needs_review === true ? 0.9 : selected ? 0.55 : 0.28
           };
           appendQcConnectorPolyline(svg, markerGroup, row, { kind: 'accepted_qc_survey', type: 'QC 巡检', data: row }, style, () => {
@@ -19832,11 +19863,14 @@ HTML = r"""<!doctype html>
 
     function candidateLineStyle(row) {
       const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
-      if (row.needs_review === true) {
-        return { stroke: '#d97706', width: selected ? 2.3 : 2.0, dash: '4 3', opacity: 0.9 };
-      }
       if (row.review_status === 'rejected') {
         return { stroke: '#98a2b3', width: selected ? 1.7 : 1.2, dash: '2 4', opacity: 0.55 };
+      }
+      // Line pattern represents the saved review status. A changed time model
+      // may add an amber warning, but cannot turn an accepted line into pending.
+      if (row.needs_review === true) {
+        return { stroke: '#d97706', width: selected ? 2.3 : 2.0,
+          dash: row.review_status === 'accepted' ? '' : '6 4', opacity: 0.9 };
       }
       if (row.review_status === 'accepted') {
         return { stroke: '#111827', width: 1.05, dash: '', opacity: 0.34 };
