@@ -20750,6 +20750,16 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             if parsed.path == "/umap":
                 self.send_text(UMAP_HTML)
                 return
+            if parsed.path == "/predictions":
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                from annotation_app.label_predictions import current_review
+                run_id = parse_qs(parsed.query).get("run_id", [""])[0]
+                try:
+                    self.send_text(current_review(self.data, run_id))
+                except (ValueError, FileNotFoundError) as exc:
+                    raise BadRequest(str(exc)) from exc
+                return
             if parsed.path == "/favicon.ico":
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.send_header("Content-Length", "0")
