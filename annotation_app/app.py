@@ -66,6 +66,7 @@ from annotation_app.cell_event_map import (
     write_canonical_map,
 )
 from annotation_app.umap_page import UMAP_HTML
+from annotation_app.feature_umap import FeatureAnalysis, AnalysisJob, unpack_results
 from annotation_app.visual_palette import signal_palette_json
 from scripts.v3.lif_peak_detection import (
     lif_peak_detection_hash,
@@ -315,6 +316,8 @@ def choose_native_path(kind: str, title: str = "", initial_dir: str = "", file_r
                 )
             if file_role == "ms":
                 filetypes = [("MS raw files", "*.txt *.csv"), ("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
+            elif file_role == "ms_results":
+                filetypes = [("MS 分析结果 ZIP", "*.zip")]
             elif file_role == "cell_event_map":
                 filetypes = [("Cell event coordinate CSV", "*.csv"), ("CSV files", "*.csv"), ("All files", "*.*")]
             else:
@@ -8526,6 +8529,15 @@ class AppData:
             cell_event_map_info=cell_event_map_info,
         )
 
+    @property
+    def feature_analysis(self):
+        if not hasattr(self, "_feature_analysis"):
+            object.__setattr__(self, "_feature_analysis", FeatureAnalysis(self))
+        return self._feature_analysis
+
+    def display_event_map(self):
+        return self.feature_analysis.event_map()
+
     def meta(self) -> dict[str, Any]:
         min_time = float(
             min(
@@ -8550,6 +8562,7 @@ class AppData:
         return {
             "root": str(self.project.project_dir),
             "project_id": self.project_identity(),
+            "feature_analysis": self.feature_analysis.overview(),
             "ms_event_import": ({"status_counts": (self.manifest or {})["ms_event_import"]["status_counts"],
                                  "inclusion_policy": "accepted_only"}
                                 if (self.manifest or {}).get("ms_event_import") else None),
@@ -8576,8 +8589,8 @@ class AppData:
                 "available": self.cell_event_map is not None,
                 "coordinates_available": self.cell_event_map_coordinates_available(),
                 "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
-                "sha256": str((self.cell_event_map_info or {}).get("sha256") or ""),
-                "source_name": str((self.cell_event_map_info or {}).get("source_name") or ""),
+                "sha256": self.cell_event_map_sha256(),
+                "source_name": "原生 UMAP" if self.feature_analysis.state["view"] == "native" else str((self.cell_event_map_info or {}).get("source_name") or ""),
                 "source_sha256": str((self.cell_event_map_info or {}).get("source_sha256") or ""),
                 "attach_allowed": self.cell_event_map is None,
                 "replace_allowed": self.cell_event_map is not None,
@@ -8645,11 +8658,17 @@ class AppData:
         return hashlib.sha256(str(self.project.project_dir.resolve()).encode("utf-8")).hexdigest()
 
     def cell_event_map_sha256(self) -> str:
-        return str((self.cell_event_map_info or {}).get("sha256") or "")
+        base = str((self.cell_event_map_info or {}).get("sha256") or "")
+        analysis = self.feature_analysis
+        if analysis.state["view"] == "native":
+            return hashlib.sha256((base + str(analysis.state["embedding"])).encode()).hexdigest()
+        return base
 
     def cell_event_map_coordinates_available(self) -> bool:
         if self.cell_event_map is None:
             return False
+        if self.feature_analysis.state["view"] == "native":
+            return self.feature_analysis.coordinates is not None
         configured = (self.cell_event_map_info or {}).get("coordinates_available")
         if isinstance(configured, bool):
             return configured
@@ -8670,35 +8689,37 @@ class AppData:
             )
 
     def projected_cell_event_map_state(self) -> dict[str, Any]:
-        if self.cell_event_map is None:
-            raise BadRequest("当前项目没有单细胞 event map")
-        frozen = self.frozen_time_model()
-        config = self.project_config()
-        annotations = self.store.records()
-        state = project_annotation_state(
-            self.cell_event_map,
-            annotations,
-            active_time_model_version=(
-                str(frozen.get("time_model_version") or "") if frozen else None
-            ),
-            annotation_start_min=float(
-                config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
-            ),
-        )
-        state.update(
-            {
-                "project_id": self.project_identity(),
-                "map_sha256": self.cell_event_map_sha256(),
-                "coordinates_available": self.cell_event_map_coordinates_available(),
-                "channel_identity_prior": self.channel_identity_prior,
-            }
-        )
-        state["revision"] = state_revision(
-            project_id=state["project_id"],
-            map_sha256=state["map_sha256"],
-            projected_state=state,
-        )
-        return state
+        with self.feature_analysis.lock:
+            if self.cell_event_map is None:
+                raise BadRequest("当前项目没有单细胞 event map")
+            frozen = self.frozen_time_model()
+            config = self.project_config()
+            annotations = self.store.records()
+            state = project_annotation_state(
+                self.display_event_map(),
+                annotations,
+                active_time_model_version=(
+                    str(frozen.get("time_model_version") or "") if frozen else None
+                ),
+                annotation_start_min=float(
+                    config.get("annotation_start_min", DEFAULT_ANNOTATION_START_MIN)
+                ),
+            )
+            state.update(
+                {
+                    "project_id": self.project_identity(),
+                    "map_sha256": self.cell_event_map_sha256(),
+                    "coordinates_available": self.cell_event_map_coordinates_available(),
+                    "coordinate_source": self.feature_analysis.state["view"],
+                    "channel_identity_prior": self.channel_identity_prior,
+                }
+            )
+            state["revision"] = state_revision(
+                project_id=state["project_id"],
+                map_sha256=state["map_sha256"],
+                projected_state=state,
+            )
+            return state
 
     def cell_event_map_revision(self) -> dict[str, Any]:
         state = self.projected_cell_event_map_state()
@@ -9194,9 +9215,8 @@ class AppData:
         cell_number = None
         event_id = str(row.get("ms_event_id") or "")
         if self.cell_event_map is not None and stage in {"qc_survey", "cell_annotation"}:
-            coordinate_rows = self.cell_event_map[
-                self.cell_event_map["ms_event_id"].astype(str).eq(event_id)
-            ]
+            display_map = self.display_event_map()
+            coordinate_rows = display_map[display_map["ms_event_id"].astype(str).eq(event_id)]
             if not coordinate_rows.empty:
                 coordinate_umap1 = float(coordinate_rows.iloc[0]["UMAP1"])
                 coordinate_umap2 = float(coordinate_rows.iloc[0]["UMAP2"])
@@ -9417,8 +9437,22 @@ class AppData:
         local_delta_seed_window_min: float = DEFAULT_LOCAL_DELTA_SEED_WINDOW_MIN,
         cell_event_map_path: Path | None = None,
         ms_event_package_path: Path | None = None,
+        _feature_source: Path | None = None,
         _staging_build: bool = False,
     ) -> "AppData | ProjectPaths":
+        if ms_event_package_path is not None and Path(ms_event_package_path).is_file():
+            with unpack_results(ms_event_package_path) as feature_source:
+                return cls.create_project_from_raw_inputs(
+                    project_dir=project_dir, ms_path=ms_path, raw_input_mode=raw_input_mode,
+                    lif_g2_path=lif_g2_path, lif_r1_path=lif_r1_path, lif_r2_path=lif_r2_path,
+                    g2_identity=g2_identity, r1_identity=r1_identity, r2_identity=r2_identity,
+                    lif_inputs=lif_inputs, qc_anchor_channels=qc_anchor_channels,
+                    calibration_protocol=calibration_protocol, post_qc_strategy=post_qc_strategy,
+                    lif_peak_detection=lif_peak_detection, annotation_start_min=annotation_start_min,
+                    local_delta_seed_window_min=local_delta_seed_window_min,
+                    cell_event_map_path=cell_event_map_path,
+                    ms_event_package_path=feature_source / "source_events", _feature_source=feature_source,
+                    _staging_build=_staging_build)
         project_dir = project_dir.expanduser().resolve()
         mode = normalize_raw_input_mode(raw_input_mode)
         try:
@@ -9492,6 +9526,7 @@ class AppData:
                     local_delta_seed_window_min=local_delta_seed_window_min,
                     cell_event_map_path=cell_event_map_path,
                     ms_event_package_path=ms_event_package_path,
+                    _feature_source=_feature_source,
                     _staging_build=True,
                 )
                 commit_staging_project(
@@ -9912,6 +9947,8 @@ class AppData:
         if _staging_build:
             resolved = validate_staged_project_artifacts(project)
             staged_app = cls.load(resolved, _initialize_staging=True)
+            if _feature_source is not None:
+                staged_app.feature_analysis.import_matrix(_feature_source)
             expected_binding = project_table_binding(
                 intermediate_table_fingerprints(staged_app.project)
             )
@@ -15247,7 +15284,8 @@ HTML = r"""<!doctype html>
         <label for="importMsSource">MS 事件来源</label>
         <select id="importMsSource">
           <option value="raw">共用检峰内核＋事件 CSV</option>
-          <option value="package">LMA 事件包</option>
+          <option value="bundle">MS 分析结果 ZIP（含矩阵）</option>
+          <option value="package">LMA 事件包文件夹</option>
         </select>
         <label id="importEventSourceLabel" for="importCellEventMap">事件坐标 CSV</label>
         <div>
@@ -15381,6 +15419,8 @@ HTML = r"""<!doctype html>
         <div id="cfgPostQcHint" class="qc-anchor-rule"></div>
         <div id="cfgScheduledQcWindows" class="protocol-editor" style="margin-top:8px;"></div>
       </section>
+      __NATIVE_FEATURE_PANEL__
+      <details><summary>已有坐标 CSV（可选）</summary>
       <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
         <div class="attach-map-heading">
           <p class="side-title">UMAP coordinates</p>
@@ -15403,6 +15443,7 @@ HTML = r"""<!doctype html>
           <span id="attachMapReady" class="attach-map-ready">尚未选择文件</span>
         </div>
       </div>
+      </details>
       <section id="msPackageUpdatePanel" class="attach-map-panel" hidden>
         <p class="side-title">MS 上游审阅更新</p>
         <p>检查上游事件变化。当前项目保留事件、标注和时间模型；新版审阅结果导入独立新项目。</p>
@@ -15440,17 +15481,19 @@ HTML = r"""<!doctype html>
       finally { if (request === msPackagePreviewRequest) this.disabled = false; }
     });
     document.getElementById('importMsSource').addEventListener('change', function () {
-      const machine = this.value === 'package';
+      const bundle = this.value === 'bundle';
+      const machine = this.value !== 'raw';
       const input = document.getElementById('importCellEventMap');
       input.value = '';
-      input.placeholder = machine ? '选择 MS Event Studio 导出的 LMA 事件包文件夹' : '选择包含 scan_start_time 的 CSV';
-      document.getElementById('importEventSourceLabel').textContent = machine ? 'LMA 事件包文件夹' : '事件坐标 CSV';
+      input.placeholder = bundle ? '选择包含矩阵的 MS 分析结果 ZIP' : machine ? '选择 MS Event Studio 导出的 LMA 事件包文件夹' : '选择包含 scan_start_time 的 CSV';
+      document.getElementById('importEventSourceLabel').textContent = bundle ? 'MS 分析结果 ZIP' : machine ? 'LMA 事件包文件夹' : '事件坐标 CSV';
       const picker = document.querySelector('[data-picker-target="importCellEventMap"]');
-      picker.dataset.pickerKind = machine ? 'directory' : 'file';
-      picker.dataset.pickerTitle = machine ? '选择 LMA 事件包文件夹' : '选择单细胞事件坐标 CSV';
+      picker.dataset.pickerKind = machine && !bundle ? 'directory' : 'file';
+      picker.dataset.pickerRole = bundle ? 'ms_results' : 'cell_event_map';
+      picker.dataset.pickerTitle = bundle ? '选择 MS 分析结果 ZIP' : machine ? '选择 LMA 事件包文件夹' : '选择单细胞事件坐标 CSV';
       picker.setAttribute('aria-label', picker.dataset.pickerTitle);
       document.getElementById('importEventSourceHelp').textContent = machine
-        ? '保留完整事件身份与审阅结果。仅已保留事件参与标注；MS 原始文件用于显示与核对，不重新检峰。UMAP 可稍后导入。'
+        ? '沿用 MS 审阅事件；ZIP 中的矩阵会一并导入。创建后可原生计算 UMAP，无需坐标 CSV。'
         : '必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。其他列导入时忽略。';
     });
     const state = {
@@ -16545,6 +16588,7 @@ HTML = r"""<!doctype html>
       if (!open && state.configSaveBusy) return;
       if (open) {
         renderConfigInputs(true);
+        refreshFeaturePanel();
         setConfigSaveStatus('');
         const manageMap = Boolean(state.meta?.cell_event_map?.manage_allowed);
         el('attachMapPanel').style.display = manageMap ? 'block' : 'none';
@@ -16599,11 +16643,11 @@ HTML = r"""<!doctype html>
         if (state.meta?.cell_event_map?.manage_allowed) {
           setConfigSaveStatus(
             state.meta?.cell_event_map?.available
-              ? '事件列表已经可用于 Track 标注；如需 UMAP，请选择含成对二维坐标的 CSV，再点击“Validate & enable”。'
+              ? '可在下方导入 MS 矩阵并计算原生 UMAP，也可展开已有坐标 CSV。'
               : '当前项目尚未启用事件列表和 UMAP 坐标。请选择 CSV，再点击“Validate & enable”。',
             'warning'
           );
-          window.setTimeout(() => el('attachCellEventMap').focus(), 0);
+          window.setTimeout(() => el('nativeFeaturePanel').scrollIntoView({block:'center'}), 0);
         } else {
           setConfigSaveStatus(
             '当前项目没有事件坐标 map，且缺少可附加 map 的项目清单。UMAP 暂不可用；旧标注工作流仍可继续使用。',
@@ -17874,6 +17918,8 @@ HTML = r"""<!doctype html>
       status.className = `config-save-status${type ? ` ${type}` : ''}`;
     }
 
+    __NATIVE_FEATURE_SCRIPT__
+
     function updateAttachMapControls() {
       const input = el('attachCellEventMap');
       const value = input.value.trim();
@@ -18607,7 +18653,7 @@ HTML = r"""<!doctype html>
           local_delta_seed_window_min: seedWindow,
           post_qc_strategy: postQcStrategy,
           cell_event_map_path: el('importMsSource').value === 'raw' ? el('importCellEventMap').value : '',
-          ms_event_package_path: el('importMsSource').value === 'package' ? el('importCellEventMap').value : '',
+          ms_event_package_path: el('importMsSource').value !== 'raw' ? el('importCellEventMap').value : '',
         });
         applyLoadedProjectMeta(result.meta);
         await loadWindow();
@@ -20632,6 +20678,8 @@ HTML = r"""<!doctype html>
 </html>
 """
 
+from annotation_app.feature_panel import FEATURE_PANEL, FEATURE_SCRIPT
+HTML = HTML.replace("__NATIVE_FEATURE_PANEL__", FEATURE_PANEL).replace("__NATIVE_FEATURE_SCRIPT__", FEATURE_SCRIPT)
 HTML = HTML.replace("__LMA_SIGNAL_COLORS__", signal_palette_json())
 
 
@@ -20768,6 +20816,14 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/meta":
                 self.send_json(self.data.meta())
                 return
+            if parsed.path == "/api/feature-umap":
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                job = self.server.analysis_job.snapshot()
+                if job.get("project_id") != self.data.project_identity():
+                    job = {"status": "idle", "message": ""}
+                self.send_json({**self.data.feature_analysis.overview(), "job": job})
+                return
             if parsed.path == "/api/cell-event-map":
                 if not isinstance(self.data, AppData):
                     raise BadRequest("请先打开项目")
@@ -20860,6 +20916,29 @@ class AnnotationHandler(BaseHTTPRequestHandler):
             if self.headers.get("X-Annotation-Write-Token") != WRITE_TOKEN:
                 raise BadRequest("Missing or invalid annotation write token")
             payload = self.read_json()
+            if self.server.analysis_job.snapshot()["status"] == "running":
+                raise BadRequest("UMAP 正在计算；完成前请保持当前项目，可继续查看波形")
+            if parsed.path.startswith("/api/feature-umap/"):
+                if not isinstance(self.data, AppData):
+                    raise BadRequest("请先打开项目")
+                if payload.get("project_id") != self.data.project_identity():
+                    raise BadRequest("项目已切换，请重新打开矩阵面板")
+                analysis = self.data.feature_analysis
+                if parsed.path == "/api/feature-umap/import":
+                    with unpack_results(Path(str(payload.get("source_path", "")))) as source:
+                        result = analysis.import_matrix(source)
+                    self.server.analysis_job.clear()
+                elif parsed.path == "/api/feature-umap/run":
+                    if not analysis.record:
+                        raise BadRequest("请先导入矩阵")
+                    result = self.server.analysis_job.start(self.data, payload.get("parameters", {}), self.server.request_activity)
+                elif parsed.path == "/api/feature-umap/view":
+                    result = analysis.select_view(str(payload.get("view", "")))
+                    self.server.analysis_job.clear()
+                else:
+                    raise BadRequest("未知矩阵操作")
+                self.send_json({"ok": True, **result})
+                return
             if parsed.path == "/api/review":
                 annotation_id = str(payload.get("annotation_id", ""))
                 review_status = str(payload.get("review_status", ""))
@@ -21074,6 +21153,8 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 if not source_path:
                     raise BadRequest("source_path is required")
                 new_data = self.data.attach_cell_event_map(Path(source_path))
+                if new_data.feature_analysis.record:
+                    new_data.feature_analysis.select_view("base")
                 self.__class__.data = new_data
                 self.send_json(
                     {
@@ -21275,6 +21356,7 @@ class LocalHTTPServer(HTTPServer):
 
     def __init__(self, server_address: tuple[str, int], handler_class: type[AnnotationHandler]) -> None:
         self.request_activity = RequestActivity()
+        self.analysis_job = AnalysisJob()
         super().__init__(server_address, handler_class)
 
 

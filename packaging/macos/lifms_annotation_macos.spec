@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules, copy_metadata
 
 
 repo_root = Path(SPECPATH).parents[1]
@@ -38,6 +38,11 @@ binaries += collect_dynamic_libs("scipy")
 
 hiddenimports = []
 hiddenimports += collect_submodules("flame_ms_core")
+for package in ("scanpy", "anndata", "umap", "pynndescent"):
+    hiddenimports += collect_submodules(package, filter=production_submodule)
+for distribution in ("scanpy", "anndata", "umap-learn", "scikit-learn", "numba", "numpy", "scipy"):
+    datas += copy_metadata(distribution)
+datas += collect_data_files("scanpy")
 hiddenimports += collect_submodules("pyarrow", filter=production_submodule)
 hiddenimports += collect_submodules("scipy", filter=production_submodule)
 hiddenimports += [
@@ -60,14 +65,12 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
+    # JIT functions need real source filenames for the writable user cache.
+    module_collection_mode={"scanpy": "py", "umap": "py", "pynndescent": "py"},
     hookspath=[],
     hooksconfig={"matplotlib": {"backends": "Agg"}},
     runtime_hooks=[],
     excludes=[
-        "anndata",
-        "scanpy",
-        "sklearn",
-        "seaborn",
         "jupyter",
         "IPython",
         "pytest",

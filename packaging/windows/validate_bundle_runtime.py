@@ -123,6 +123,7 @@ def audit_bundle(
     bundle_internal: Path,
     *,
     python_prefix: Path | None = None,
+    python_base_prefix: Path | None = None,
 ) -> dict[str, Any]:
     toc = ast.literal_eval(analysis_toc.read_text(encoding="utf-8"))
     rows = list(dict.fromkeys(iter_toc_rows(toc)))
@@ -134,14 +135,26 @@ def audit_bundle(
     errors: list[str] = []
     pyexpat_source = by_destination.get("pyexpat.pyd")
     selected_prefix = python_prefix.resolve() if python_prefix is not None else None
+    runtime_prefix = selected_prefix
+    if python_base_prefix is not None and selected_prefix is not None:
+        base = python_base_prefix.resolve()
+        if base != selected_prefix:
+            config = selected_prefix / "pyvenv.cfg"
+            values = dict(line.split("=", 1) for line in config.read_text(encoding="utf-8").splitlines() if "=" in line) if config.is_file() else {}
+            home = next((value.strip() for key, value in values.items() if key.strip() == "home"), "")
+            if not home or Path(home).resolve() != base:
+                errors.append("Python base prefix does not match the selected virtual environment")
+            else:
+                runtime_prefix = base
     if pyexpat_source is None:
         errors.append("Analysis TOC does not contain pyexpat.pyd")
     elif selected_prefix is None:
         selected_prefix = pyexpat_source.parent.parent.resolve()
-    elif not is_within(pyexpat_source, selected_prefix):
+        runtime_prefix = selected_prefix
+    elif not is_within(pyexpat_source, runtime_prefix):
         errors.append(
             f"pyexpat.pyd: foreign source {pyexpat_source}; "
-            f"expected a file below {selected_prefix}"
+            f"expected a file below {runtime_prefix}"
         )
 
     dependencies: dict[str, Any] = {}
@@ -149,7 +162,7 @@ def audit_bundle(
         for name in CORE_RUNTIME_DLLS:
             source = by_destination.get(name.casefold())
             bundled = bundle_internal / name
-            expected = preferred_runtime_dll(selected_prefix, name)
+            expected = preferred_runtime_dll(runtime_prefix, name)
             item: dict[str, Any] = {
                 "source": str(source) if source else None,
                 "bundled": str(bundled),
@@ -177,7 +190,7 @@ def audit_bundle(
                     errors.append(
                         f"{name}: bundled hash differs from selected environment"
                     )
-            elif source is not None and not is_within(source, selected_prefix):
+            elif source is not None and not is_within(source, runtime_prefix):
                 errors.append(f"{name}: foreign source {source}")
 
     scientific_binary_count = 0
@@ -282,6 +295,7 @@ def audit_bundle(
         "analysis_toc": str(analysis_toc.resolve()),
         "bundle_internal": str(bundle_internal.resolve()),
         "selected_python_prefix": str(selected_prefix) if selected_prefix else None,
+        "python_runtime_prefix": str(runtime_prefix) if runtime_prefix else None,
         "dependencies": dependencies,
         "scientific_binaries": {
             "count": scientific_binary_count,
@@ -314,6 +328,8 @@ def main() -> int:
         default=Path(sys.prefix),
         help="Prefix of the exact interpreter used to build the bundle",
     )
+    parser.add_argument("--python-base-prefix", type=Path, default=None,
+                        help="sys.base_prefix from the selected build interpreter; verified against pyvenv.cfg")
     args = parser.parse_args()
     if not args.analysis_toc.is_file():
         parser.error(f"Analysis TOC not found: {args.analysis_toc}")
@@ -323,6 +339,7 @@ def main() -> int:
         args.analysis_toc,
         args.bundle_internal,
         python_prefix=args.python_prefix,
+        python_base_prefix=args.python_base_prefix,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1

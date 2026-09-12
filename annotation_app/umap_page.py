@@ -155,6 +155,8 @@ UMAP_HTML = r"""<!doctype html>
         <span id="timeStatus" class="time-status" aria-live="polite"></span>
       </form>
       <span class="spacer"></span>
+      <label for="colorBy">着色</label>
+      <select id="colorBy" aria-label="UMAP 着色方式"><option value="annotation">人工标注</option><option value="time">采集时间</option></select>
       <div id="legend" class="legend"></div>
       <button id="fit" class="fit-button" type="button"
               title="恢复缩放和位置以显示全部事件点；不会修改任何标注"
@@ -187,6 +189,9 @@ UMAP_HTML = r"""<!doctype html>
     const timeStatus = document.getElementById('timeStatus');
     let payload = null;
     let points = [];
+    let timeExtent = [0, 1];
+    const colorBy = document.getElementById('colorBy');
+    colorBy.addEventListener('change', () => { renderLegend(payload); draw(); });
     let revision = '';
     let projectKey = '';
     let view = { scale: 1, tx: 0, ty: 0 };
@@ -218,6 +223,12 @@ UMAP_HTML = r"""<!doctype html>
     }
 
     function pointColor(point) {
+      if (colorBy.value === 'time') {
+        const t = Math.max(0, Math.min(1, (Number(point.scan_start_time) - timeExtent[0]) / (timeExtent[1] - timeExtent[0] || 1)));
+        const stops = [[68,1,84],[33,145,140],[253,231,37]];
+        const index = t < 0.5 ? 0 : 1, weight = index === 0 ? t * 2 : t * 2 - 1;
+        return `rgb(${stops[index].map((value,i) => Math.round(value + weight * (stops[index+1][i]-value))).join(',')})`;
+      }
       if (point.classification === 'qc') return COLORS.qc;
       if (point.classification === 'cell') return stableColor(point.lif_channel);
       return COLORS.unknown;
@@ -514,7 +525,13 @@ UMAP_HTML = r"""<!doctype html>
     }
 
     function renderLegend(data) {
-      const counts = data?.counts || {};
+      const times = points.map(p => Number(p.scan_start_time)).filter(Number.isFinite);
+      timeExtent = times.length ? times.reduce((a,t) => [Math.min(a[0],t), Math.max(a[1],t)], [Infinity,-Infinity]) : [0,1];
+      if (colorBy.value === 'time') {
+        legend.textContent = `${timeExtent[0].toFixed(3)} → ${timeExtent[1].toFixed(3)} min（紫 → 黄）`;
+        return;
+      }
+      const counts = points.reduce((counts,p) => { counts[p.classification] = (counts[p.classification] || 0) + 1; return counts; }, {});
       const channels = [...new Set(points.filter(p => p.classification === 'cell').map(p => p.lif_channel).filter(Boolean))].sort();
       const items = [
         ['未标注', COLORS.unknown, counts.unknown || 0],
@@ -557,11 +574,12 @@ UMAP_HTML = r"""<!doctype html>
           revision = String(data.revision || '');
           identity.textContent = 'UMAP 尚未配置';
           legend.innerHTML = '';
-          setEmpty('事件列表可用于 Track 标注，但尚未配置二维 UMAP 坐标。可在主窗口的配置中附加坐标 CSV。');
+          setEmpty('事件列表可用于 Track 标注，但尚未配置二维 UMAP 坐标。可在主窗口配置中导入矩阵并计算 UMAP，或附加坐标 CSV。');
           draw();
           return;
         }
-        points = Array.isArray(data.points) ? data.points : [];
+        points = Array.isArray(data.points) ? data.points.filter(p => Number.isFinite(p.UMAP1) && Number.isFinite(p.UMAP2)) : [];
+        if (identityChanged) colorBy.value = data.coordinate_source === 'native' ? 'time' : 'annotation';
         revision = String(data.revision || '');
         identity.textContent = `${points.length.toLocaleString()} 个事件点`;
         setEmpty(points.length ? '' : '当前项目没有事件坐标点。');

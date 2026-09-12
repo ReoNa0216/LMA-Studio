@@ -172,6 +172,24 @@ class WindowsBundleValidatorTest(unittest.TestCase):
             len(result["scientific_binaries"]["foreign_sources"]), 1
         )
 
+    def test_venv_base_runtime_is_verified_but_scientific_files_stay_isolated(self):
+        base = self.root / 'base'
+        self.pyexpat_source = base / 'DLLs/pyexpat.pyd'
+        self._write(self.pyexpat_source, b'official-pyexpat')
+        self._write(self.prefix / 'pyvenv.cfg', f'home = {base.resolve()}\n'.encode())
+        self._write_toc()
+        with mock.patch.object(self.validator,'imported_dll_names',return_value={'python311.dll'}), mock.patch.object(self.validator,'pe_machine',return_value=0x8664):
+            result = self.validator.audit_bundle(self.toc,self.bundle,python_prefix=self.prefix,python_base_prefix=base)
+            self.assertTrue(result['ok'],result['errors'])
+            wrong = self.validator.audit_bundle(self.toc,self.bundle,python_prefix=self.prefix,python_base_prefix=self.root/'foreign')
+            self.assertFalse(wrong['ok'])
+            self.scientific_source = base / 'Lib/site-packages/numpy/_core/_multiarray_umath.pyd'
+            self._write(self.scientific_source,b'numpy-extension')
+            self._write_toc()
+            foreign = self.validator.audit_bundle(self.toc,self.bundle,python_prefix=self.prefix,python_base_prefix=base)
+            self.assertFalse(foreign['ok'])
+            self.assertEqual(len(foreign['scientific_binaries']['foreign_sources']),1)
+
 
 if __name__ == "__main__":
     unittest.main()

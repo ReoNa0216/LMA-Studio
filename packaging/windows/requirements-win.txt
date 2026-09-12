@@ -6,3 +6,8 @@ scipy>=1.11,<2
 matplotlib>=3.8,<4
 pywebview==6.2.1
 pyinstaller==6.22.0
+
+# Native MS matrix -> PCA/neighbors/UMAP, pinned to the validated API.
+scanpy==1.11.5
+anndata==0.12.17
+umap-learn==0.5.9.post2

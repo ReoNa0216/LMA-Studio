@@ -58,6 +58,11 @@ def user_state_dir() -> Path:
 
 
 def configure_logging() -> Path:
+    # Frozen UMAP/Numba uses a per-user cache, never the project or install dir.
+    # Isolate it from caches created by unrelated Python/Conda installations.
+    cache_dir = user_state_dir() / "cache/numba"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_dir))
     log_dir = user_state_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "lma-studio.log"
@@ -179,6 +184,8 @@ class WebViewPathDialog:
             dialog_type = self.webview.FileDialog.OPEN
             if file_role == "ms":
                 file_types = ("MS raw files (*.txt;*.csv)", "All files (*.*)")
+            elif file_role == "ms_results":
+                file_types = ("MS 分析结果 ZIP (*.zip)",)
             elif file_role == "cell_event_map":
                 file_types = ("Cell event coordinate CSV (*.csv)", "All files (*.*)")
             else:
@@ -631,8 +638,17 @@ def check_scientific_runtime() -> dict[str, Any]:
         raise RuntimeError("Bundled event-roster event table has an inconsistent ratio")
 
     from flame_ms_core.smoke import check_runtime as check_ms_runtime
+    from annotation_app.feature_umap import compute_embedding
+    import anndata as ad
+    probe_values = np.random.default_rng(1).uniform(1., 100., (12, 8))
+    probe_values[0, 0] = np.nan
+    probe_matrix = ad.AnnData(probe_values.copy())
+    probe_xy, probe_record = compute_embedding(probe_matrix, {})
+    if len(probe_xy) != 12 or not np.isnan(probe_matrix.X[0, 0]):
+        raise RuntimeError("Native UMAP changed the source matrix or lost events")
 
     return {
+        "native_umap": {"events": len(probe_xy), "actual": probe_record["actual"], "dependencies": probe_record["dependencies"]},
         "flame_ms_core": check_ms_runtime(),
         "expat_version": str(expat.EXPAT_VERSION),
         "openssl_version": str(ssl.OPENSSL_VERSION),
@@ -737,6 +753,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception as exc:
         LOGGER.exception("Desktop startup failed")
+        if '--check-runtime' in (argv if argv is not None else sys.argv[1:]):
+            return 1
         show_native_message(f"LMA Studio 无法启动：\n{exc}\n\n诊断日志：{log_path}", error=True)
         return 1
     finally:

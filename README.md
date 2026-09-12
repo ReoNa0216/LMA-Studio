@@ -2,13 +2,15 @@
 
 Development-only independent label prediction loop: [operator guide and boundaries](docs/label_predictions.md).
 
-项目内新增“打包分享项目”，自动排除 macOS 系统元数据；MS→LMA 正式交换入口统一为“LMA 事件包”。操作与保存边界见[项目分享](docs/project_sharing.md)。
+项目内新增“打包分享项目”，自动排除 macOS 系统元数据；MS→LMA 可通过一个分析 ZIP 同时传递事件与矩阵，也保留仅传事件的“LMA 事件包”。操作与保存边界见[项目分享](docs/project_sharing.md)。
 CI 的锁定内核可由 `FLAME_MS_CORE_WHEEL_BASE64` secret 提供，仍强制校验 SHA256。
 
 
 LMA Studio (LIF-MS Annotation Studio) is a local desktop application for human-assisted LIF-MS annotation review.
 
 It opens its own native desktop window, lets users create or open project directories, review QC anchors and cell-level LIF-MS candidates, and export a downstream cell roster as CSV. The application stores review state in each project's local SQLite database.
+
+原生 UMAP：新建时选择“MS 分析结果 ZIP（含矩阵）”，或在已有正式事件包项目的“配置 → 矩阵与原生 UMAP”导入。计算后可直接查看、按采集时间着色及定位事件，无需再准备 UMAP CSV。旧项目继续使用原坐标；详细计算及兼容边界见 [接入说明](docs/flame_task1.md)。
 
 ## Current Scope
 

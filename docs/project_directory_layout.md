@@ -36,6 +36,7 @@ MyProject/
 
 - `data/` 是应用浏览、匹配和 UMAP 映射所需的数据。
 - `annotations/` 是人工标注、时间模型和用户导出。
+- `analysis/feature_umap/` 仅导入矩阵后出现：`matrices/<记录哈希>/` 保存经校验的原始矩阵包，`embeddings/<记录哈希>/` 保存独立坐标和计算记录，`state.json` 保存当前选择。无矩阵的旧项目不创建该目录。分享项目时须一并保留。
 - `provenance/` 记录输入、项目参数和处理过程。
 - `diagnostics/` 是峰识别与 MS event 识别的质量检查，不代表 QC 身份或细胞类型。
 - `raw_inputs/` 只在用户明确选择复制模式时保存原始 LIF/MS 文件。
