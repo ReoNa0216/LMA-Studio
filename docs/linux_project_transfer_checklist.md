@@ -53,6 +53,8 @@ Keep these with the project when present:
 - `reports/`
 - `annotation_app/annotations/exports/`
 - `raw_inputs/` when the project used copy-into-project mode
+- `analysis/feature_umap/` when a matrix or native embedding has been attached
+- `provenance/ms_event_package/` for reviewed-package projects
 
 External raw inputs do not need to be copied merely to browse a complete project, but they are required for exact reprocessing. Their recorded fingerprints must still describe the original files.
 

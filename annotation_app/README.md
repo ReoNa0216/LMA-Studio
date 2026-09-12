@@ -70,6 +70,10 @@ The automatic/core MS760 caller remains on the established ±12 ppm trace and ke
 
 Roster-supported events are whitelist-bound and manual-Cell-only. They are excluded from automatic calibration, shift/delta estimation, post-run QC, automatic Cell candidates, and model refits. Opening an existing formal v0.4 project never reruns either caller: its manifest-bound MS event and scan tables remain active, so existing annotations and candidates do not change merely because the software was upgraded. Rebuilding from raw input uses the current caller and may add manual-review evidence, while established core apices must remain unchanged.
 
+## Analysis export ZIP
+
+The desktop `POST /api/export-results` exports a custom-named ZIP outside the project through `results_export.py`. It contains `cells_and_qc.csv`, `export_record.json`, and optionally `labeled_matrix.h5ad`. Matrix rows join accepted annotations by stable MS event ID; unknown stays unknown. Confirmed front rows are excluded from the export copy only, later accepted QC is retained as `is_qc`, and X/NaN/var remain unchanged. The current native UMAP selection and scope are checked; stale coordinates are omitted from both CSV and H5AD. Export is read-only, checks source hashes, and publishes without overwriting an existing ZIP.
+
 ## Compact CSV contract
 
 The main event-roster CSV intentionally contains only 16 columns:

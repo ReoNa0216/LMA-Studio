@@ -8,7 +8,7 @@ CI 的锁定内核可由 `FLAME_MS_CORE_WHEEL_BASE64` secret 提供，仍强制�
 
 LMA Studio (LIF-MS Annotation Studio) is a local desktop application for human-assisted LIF-MS annotation review.
 
-It opens its own native desktop window, lets users create or open project directories, review QC anchors and cell-level LIF-MS candidates, and export a downstream cell roster as CSV. The application stores review state in each project's local SQLite database.
+It opens its own native desktop window, lets users create or open project directories, review QC anchors and cell-level LIF-MS candidates, and export one analysis ZIP containing the cell/QC CSV and an optional labeled H5AD. The application stores review state in each project's local SQLite database.
 
 原生 UMAP：新建时选择“LMA 事件包 ZIP（可含矩阵）”，或在已有正式事件包项目的“配置 → 矩阵与原生 UMAP”导入。计算后可直接查看、按采集时间着色及定位事件，无需再准备 UMAP CSV。旧项目继续使用原坐标；详细计算及兼容边界见 [接入说明](docs/flame_task1.md)。
 
