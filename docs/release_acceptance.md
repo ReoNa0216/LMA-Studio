@@ -1,6 +1,6 @@
 # LMA Studio 当前版本验收指南
 
-本指南保留现有工作流验收，并用于 v0.6.0 之后的 Feature / 原生 UMAP 开发候选。当前候选尚未发布或由用户签收。
+本指南用于 v0.7.0 的 Feature / 原生 UMAP / 带标签矩阵导出。Windows 工程桌面验收已完成，用户于 2026-09-13 授权正式发布；macOS 真机可见交互仍未验收。
 本轮 Windows 简短联合步骤见相邻 MS 仓库 `docs/guided_test_zh.md`；完整 MPP 测试副本位于父工作区 `studio-validation/MPP/`。
 当前自动测试为 509 项；Windows 507 通过、2 跳过，macOS 503 通过、6 跳过。两平台打包科学运行检查已通过。Windows 桌面导出验收记录见父工作区 `studio-validation/validation.json`；macOS 没有可用真机，可见交互验收仍未完成。
 版本历史由 Git tag 和 `README_RELEASE.md` 保存。任务 1 新入口与依赖见 [接入说明](flame_task1.md)。

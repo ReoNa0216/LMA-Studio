@@ -72,7 +72,7 @@ class V0412AxisFineTuneContractTest(unittest.TestCase):
         }
 
     def test_version_and_compact_user_controls_are_present(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.6.0")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.7.0")
         self.assertIn('id="axisFineTuneToggle"', HTML)
         self.assertIn('id="axisFineTunePanel"', HTML)
         self.assertIn('id="axisFineTuneRows"', HTML)

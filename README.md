@@ -42,7 +42,7 @@ not recalculated. See [the integration and build guide](docs/flame_task1.md).
 
 ## Desktop Releases
 
-The current formal desktop release is [v0.6.0](https://github.com/ReoNa0216/LMA-Studio/releases/tag/v0.6.0). Projects created by v0.4.0-v0.4.11 with the active peak-recognition standard remain manifest-compatible and are not migrated when opened. Projects using the retired peak-recognition standard remain intentionally blocked and must be rebuilt from their original inputs.
+The current formal desktop release is [v0.7.0](https://github.com/ReoNa0216/LMA-Studio/releases/tag/v0.7.0). Projects created by v0.4.0-v0.4.11 with the active peak-recognition standard remain manifest-compatible and are not migrated when opened. Projects using the retired peak-recognition standard remain intentionally blocked and must be rebuilt from their original inputs.
 
 Windows x64:
 
@@ -95,7 +95,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.6.0 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.7.0 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload test artifacts and may explicitly publish a public prerelease candidate. Formal GitHub Release publication remains tag-triggered after both desktop release gates pass.

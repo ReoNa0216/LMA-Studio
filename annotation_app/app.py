@@ -114,7 +114,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.6.0"
+APP_VERSION = "lma_studio_v0.7.0"
 APP_DISPLAY_NAME = "LMA Studio"
 
 

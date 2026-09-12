@@ -10,7 +10,7 @@ from tests.test_v050_timeline_adjustment import make_app
 
 class V051ReviewStateProjectionContractTest(unittest.TestCase):
     def test_version_is_v051(self):
-        self.assertEqual(APP_VERSION, "lma_studio_v0.6.0")
+        self.assertEqual(APP_VERSION, "lma_studio_v0.7.0")
 
     def test_reviewed_auto_cell_remains_accepted_in_events_counts_after_rebuild(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
