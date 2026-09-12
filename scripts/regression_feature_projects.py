@@ -1,4 +1,4 @@
-"""Exercise a real MS analysis ZIP through a new LMA project and native UMAP.
+"""Exercise a real LMA handoff ZIP through a new LMA project and native UMAP.
 
 Reads an existing LMA manifest for raw inputs and channel configuration only.
 Original labels, original coordinates and time models are never copied into
@@ -65,6 +65,8 @@ def main():
             local_delta_seed_window_min=manifest['annotation_config']['local_delta_seed_window_min'])
         creation_seconds = time.monotonic() - started
     assert isinstance(app, AppData)
+    with unpack_results(Path(ms['zip'])) as package:
+        app.feature_analysis.import_matrix(package)
     analysis = app.feature_analysis
     assert sha256(analysis.matrix_path / 'native_matrix.h5ad') == ms['matrix_sha256']
     incoming = ad.read_h5ad(ms['matrix_path'])

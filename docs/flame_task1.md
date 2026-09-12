@@ -18,7 +18,7 @@ CI 首选 `FLAME_MS_CORE_WHEEL_BASE64` secret 中的锁定 wheel（仅约 25 KB 
 
 项目 ZIP 与事件包用途不同，见[项目分享](project_sharing.md)。
 
-MS Event Studio 导出“分析结果”并勾选矩阵后，LMA 新建项目选择“MS 分析结果 ZIP（含矩阵）”，一次导入事件和矩阵，并提供原 MS 文件和 LIF 输入。只传事件时仍可使用“LMA 事件包”文件夹。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
+MS Event Studio 导出“分析结果”并勾选矩阵后，LMA 新建项目选择“LMA 事件包 ZIP（含矩阵）”，一次导入事件和矩阵，并提供原 MS 文件和 LIF 输入。只传事件时仍可使用“LMA 事件包”文件夹。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
 
 v2 包包含 `events.parquet`、`manifest.json`、`checksums.sha256`。完整合同见内核 `docs/event-package-v2.md`。原始自动身份包含 raw SHA、方法版本和 generation；当前事件身份、修订、原始及当前 scan/时间/支持窗、审阅状态分别保留。两个 Studio 的项目 UUID 可不同。
 
@@ -68,3 +68,5 @@ madata_hrgc.obs['UMAP2'] = madata_hrgc.obsm['X_umap'][:, 1]
 MPP 沿用原项目已有的 1,023 个保留事件；LSK 与 CAR-T 仅在新测试副本中以工程审计批量保留真实检出事件，用于负载检查，不能作为人工审阅或标签真值。三组首次 UMAP 约 21–27 秒；CAR-T 16.8 GB 原始 MS 的首次 LMA 建项约 13.3 分钟，重开约 7 秒。数据规模测试不证明生物学分群准确率，也不代表未取得的投稿项目或 macOS 已验收。
 
 可复用检查脚本为本仓库 `scripts/regression_feature_projects.py` 与 MS 仓库 `scripts/validate_real_features.py`；当前项目、结果和统一验证记录集中于父工作区 `studio-validation/`，入口为 `validation.json`，界面证据为 `ui-matrix.zip`。人工步骤见 MS 仓库 `docs/guided_test_zh.md`。Windows 用户联合 UAT、双平台 Release 完成后再更新共享交接。
+
+当前交接入口：MS「传给 LMA Studio」导出 `ms-lma-handoff-v1` ZIP，内含正式 v2 `events/` 和可选 `features/`。LMA 新建项目校验交接记录、事件 manifest、矩阵记录及其事件一致性；无矩阵也可建项。配置中的「补充或更新矩阵…」只接收相同事件与版本。分析 ZIP 不再用于交接，旧保存项目和正式 v2 文件夹仍按已有接口打开。本轮三套真实项目再次完成新交接 ZIP 的矩阵接入、UMAP 与重开；独立小样例验证 MS 实际导出的含/无矩阵 ZIP 新建 LMA、重开和误选分析 ZIP 拒绝。

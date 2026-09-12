@@ -49,6 +49,8 @@ def fixture(root):
     (output / 'execution_record.json').write_text(json.dumps(record),encoding='utf-8')
     archive = root / 'analysis.zip'
     with zipfile.ZipFile(archive,'w') as z:
+        z.writestr('handoff_record.json', json.dumps(dict(schema='ms-lma-handoff-v1', feature_result_id='test', event_manifest_sha256=package.manifest_sha256, feature_record_sha256=sha256(output/'execution_record.json'))))
+        for path in package_dir.iterdir(): z.write(path, 'events/'+path.name)
         for path in output.rglob('*'):
             if path.is_file(): z.write(path, 'features/' + path.relative_to(output).as_posix())
     request['ms_event_package_path'] = archive
@@ -133,6 +135,36 @@ class FeatureUmapTest(unittest.TestCase):
             class Legacy:
                 manifest = {}
             with self.assertRaisesRegex(ValueError,'独立项目'): validate_matrix(source,Legacy())
+
+    def test_handoff_without_matrix_and_analysis_zip_rejection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request, source, archive = fixture(root)
+            events_only = root / 'events-only.zip'
+            package = read_event_package(source/'source_events')
+            with zipfile.ZipFile(events_only, 'w') as z:
+                z.writestr('handoff_record.json', json.dumps(dict(schema='ms-lma-handoff-v1',
+                    feature_result_id=None, event_manifest_sha256=package.manifest_sha256)))
+                for path in (source/'source_events').iterdir(): z.write(path, 'events/'+path.name)
+            request['ms_event_package_path'] = events_only
+            with patch('annotation_app.app.run_preprocessing_script', side_effect=MachineImportTest.lif_only):
+                app = AppData.create_project_from_raw_inputs(**request)
+            self.assertFalse(app.feature_analysis.overview()['available'])
+            self.assertEqual(app.manifest['ms_event_import']['event_versions'], package.event_versions)
+            self.assertFalse(AppData.load(app.project).feature_analysis.overview()['available'])
+            with self.assertRaisesRegex(ValueError, '不含矩阵'):
+                with unpack_results(events_only): pass
+            wrong = root/'analysis.zip'
+            with zipfile.ZipFile(wrong, 'w') as z:
+                z.writestr('analysis_record.json', '{}')
+            with self.assertRaisesRegex(ValueError, '传给 LMA'):
+                with unpack_results(wrong): pass
+            for bad in (None, [], dict(schema='ms-lma-handoff-v1', event_manifest_sha256='wrong')):
+                with zipfile.ZipFile(wrong, 'w') as z:
+                    z.writestr('handoff_record.json', json.dumps(bad))
+                    for path in (source/'source_events').iterdir(): z.write(path, 'events/'+path.name)
+                with self.assertRaises(ValueError):
+                    with unpack_results(wrong): pass
 
     def test_job_blocks_duplicate_and_tracks_desktop_close(self):
         with tempfile.TemporaryDirectory() as temp:

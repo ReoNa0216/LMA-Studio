@@ -57,11 +57,16 @@ def safe_path(root, name):
 
 
 @contextmanager
-def unpack_results(source):
-    """Only unpack the declared features tree, with no executable deserialization."""
+def unpack_handoff(source):
+    """Read the explicit Studio handoff, preserving formal event identity."""
     with tempfile.TemporaryDirectory(prefix="lma-ms-results-") as temporary:
         root = Path(temporary)
         with zipfile.ZipFile(source) as archive:
+            if 'handoff_record.json' not in archive.namelist():
+                raise ValueError('请选择 MS Event Studio「传给 LMA Studio」导出的事件包 ZIP；分析结果 ZIP 不用于项目交接')
+            record = json.loads(archive.read('handoff_record.json'))
+            if not isinstance(record, dict) or record.get('schema') != 'ms-lma-handoff-v1':
+                raise ValueError('不支持的 LMA 事件包格式')
             names = set()
             for item in archive.infolist():
                 path = safe_path(root, item.filename.rstrip("/"))
@@ -69,14 +74,32 @@ def unpack_results(source):
                 if key in names or stat.S_ISLNK(item.external_attr >> 16):
                     raise ValueError("结果包含重复路径或链接")
                 names.add(key)
-                if item.filename.startswith("features/") and not item.is_dir():
+                if item.filename.startswith(("features/", "events/")) and not item.is_dir():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     with archive.open(item) as src, path.open("xb") as dst:
                         shutil.copyfileobj(src, dst)
         feature_root = root / "features"
-        if not (feature_root / "execution_record.json").is_file():
-            raise ValueError("ZIP 中没有矩阵；请在 MS Event Studio 导出分析结果时勾选矩阵")
-        validate_matrix(feature_root)
+        package = read_event_package(root / 'events')
+        if package.manifest_sha256 != record.get('event_manifest_sha256'):
+            raise ValueError('事件包校验失败')
+        if record.get('feature_result_id') is not None:
+            if sha256(feature_root / 'execution_record.json') != record.get('feature_record_sha256'):
+                raise ValueError('矩阵记录校验失败')
+            validate_matrix(feature_root)
+            evidence = read_event_package(feature_root / 'source_events')
+            if evidence.manifest_sha256 != package.manifest_sha256:
+                raise ValueError('矩阵与交接事件不一致')
+        elif feature_root.exists():
+            raise ValueError('事件包包含未声明的矩阵')
+        yield root
+
+
+@contextmanager
+def unpack_results(source):
+    with unpack_handoff(source) as root:
+        feature_root = root / 'features'
+        if not feature_root.is_dir():
+            raise ValueError('此事件包不含矩阵；请在 MS Event Studio「传给 LMA Studio」时勾选矩阵')
         yield feature_root
 
 
@@ -103,7 +126,7 @@ def validate_matrix(root, app=None):
     if app is not None:
         entry = (app.manifest or {}).get("ms_event_import")
         if not entry:
-            raise ValueError("当前项目没有可核对的 MS 事件身份；请用 MS 结果 ZIP 创建独立项目。原项目仍可继续使用")
+            raise ValueError("当前项目没有可核对的 MS 事件身份；请用 LMA 事件包 ZIP 创建独立项目。原项目仍可继续使用")
         current = read_event_package(app.project.project_dir / PACKAGE_PATH)
         if current.manifest_sha256 != entry["manifest_sha256"] or current.event_versions != entry["event_versions"]:
             raise ValueError("当前项目上游事件已改变，请重新打开并检查项目")

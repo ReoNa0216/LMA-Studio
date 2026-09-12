@@ -66,7 +66,7 @@ from annotation_app.cell_event_map import (
     write_canonical_map,
 )
 from annotation_app.umap_page import UMAP_HTML
-from annotation_app.feature_umap import FeatureAnalysis, AnalysisJob, unpack_results
+from annotation_app.feature_umap import FeatureAnalysis, AnalysisJob, unpack_results, unpack_handoff
 from annotation_app.visual_palette import signal_palette_json
 from scripts.v3.lif_peak_detection import (
     lif_peak_detection_hash,
@@ -317,7 +317,7 @@ def choose_native_path(kind: str, title: str = "", initial_dir: str = "", file_r
             if file_role == "ms":
                 filetypes = [("MS raw files", "*.txt *.csv"), ("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
             elif file_role == "ms_results":
-                filetypes = [("MS 分析结果 ZIP", "*.zip")]
+                filetypes = [("LMA 事件包 ZIP", "*.zip")]
             elif file_role == "cell_event_map":
                 filetypes = [("Cell event coordinate CSV", "*.csv"), ("CSV files", "*.csv"), ("All files", "*.*")]
             else:
@@ -9441,7 +9441,7 @@ class AppData:
         _staging_build: bool = False,
     ) -> "AppData | ProjectPaths":
         if ms_event_package_path is not None and Path(ms_event_package_path).is_file():
-            with unpack_results(ms_event_package_path) as feature_source:
+            with unpack_handoff(ms_event_package_path) as handoff:
                 return cls.create_project_from_raw_inputs(
                     project_dir=project_dir, ms_path=ms_path, raw_input_mode=raw_input_mode,
                     lif_g2_path=lif_g2_path, lif_r1_path=lif_r1_path, lif_r2_path=lif_r2_path,
@@ -9451,7 +9451,8 @@ class AppData:
                     lif_peak_detection=lif_peak_detection, annotation_start_min=annotation_start_min,
                     local_delta_seed_window_min=local_delta_seed_window_min,
                     cell_event_map_path=cell_event_map_path,
-                    ms_event_package_path=feature_source / "source_events", _feature_source=feature_source,
+                    ms_event_package_path=handoff / "events",
+                    _feature_source=handoff / 'features' if (handoff / 'features').is_dir() else None,
                     _staging_build=_staging_build)
         project_dir = project_dir.expanduser().resolve()
         mode = normalize_raw_input_mode(raw_input_mode)
@@ -15284,7 +15285,7 @@ HTML = r"""<!doctype html>
         <label for="importMsSource">MS 事件来源</label>
         <select id="importMsSource">
           <option value="raw">共用检峰内核＋事件 CSV</option>
-          <option value="bundle">MS 分析结果 ZIP（含矩阵）</option>
+          <option value="bundle">LMA 事件包 ZIP（可含矩阵）</option>
           <option value="package">LMA 事件包文件夹</option>
         </select>
         <label id="importEventSourceLabel" for="importCellEventMap">事件坐标 CSV</label>
@@ -15485,15 +15486,15 @@ HTML = r"""<!doctype html>
       const machine = this.value !== 'raw';
       const input = document.getElementById('importCellEventMap');
       input.value = '';
-      input.placeholder = bundle ? '选择包含矩阵的 MS 分析结果 ZIP' : machine ? '选择 MS Event Studio 导出的 LMA 事件包文件夹' : '选择包含 scan_start_time 的 CSV';
-      document.getElementById('importEventSourceLabel').textContent = bundle ? 'MS 分析结果 ZIP' : machine ? 'LMA 事件包文件夹' : '事件坐标 CSV';
+      input.placeholder = bundle ? '选择 MS Event Studio 导出的 LMA 事件包 ZIP' : machine ? '选择 MS Event Studio 导出的 LMA 事件包文件夹' : '选择包含 scan_start_time 的 CSV';
+      document.getElementById('importEventSourceLabel').textContent = bundle ? 'LMA 事件包 ZIP' : machine ? 'LMA 事件包文件夹' : '事件坐标 CSV';
       const picker = document.querySelector('[data-picker-target="importCellEventMap"]');
       picker.dataset.pickerKind = machine && !bundle ? 'directory' : 'file';
       picker.dataset.pickerRole = bundle ? 'ms_results' : 'cell_event_map';
-      picker.dataset.pickerTitle = bundle ? '选择 MS 分析结果 ZIP' : machine ? '选择 LMA 事件包文件夹' : '选择单细胞事件坐标 CSV';
+      picker.dataset.pickerTitle = bundle ? '选择 LMA 事件包 ZIP' : machine ? '选择 LMA 事件包文件夹' : '选择单细胞事件坐标 CSV';
       picker.setAttribute('aria-label', picker.dataset.pickerTitle);
       document.getElementById('importEventSourceHelp').textContent = machine
-        ? '沿用 MS 审阅事件；ZIP 中的矩阵会一并导入。创建后可原生计算 UMAP，无需坐标 CSV。'
+        ? '沿用 MS 审阅事件。ZIP 如含矩阵会一并导入，之后可计算原生 UMAP；不含矩阵也可先完成对齐标注。'
         : '必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。其他列导入时忽略。';
     });
     const state = {

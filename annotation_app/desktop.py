@@ -185,7 +185,7 @@ class WebViewPathDialog:
             if file_role == "ms":
                 file_types = ("MS raw files (*.txt;*.csv)", "All files (*.*)")
             elif file_role == "ms_results":
-                file_types = ("MS 分析结果 ZIP (*.zip)",)
+                file_types = ("LMA 事件包 ZIP (*.zip)",)
             elif file_role == "cell_event_map":
                 file_types = ("Cell event coordinate CSV (*.csv)", "All files (*.*)")
             else:

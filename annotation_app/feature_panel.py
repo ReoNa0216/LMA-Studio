@@ -5,7 +5,7 @@ FEATURE_PANEL = r'''
         <p id="nativeFeatureTitle" class="side-title">矩阵与原生 UMAP</p>
         <p id="nativeFeatureSummary" class="attach-map-copy">正在读取矩阵…</p>
         <div class="attach-map-actions">
-          <button id="importNativeFeatures" class="small-button secondary" type="button">导入 MS 结果 ZIP…</button>
+          <button id="importNativeFeatures" class="small-button secondary" type="button">补充或更新矩阵…</button>
         </div>
         <details style="margin-top:12px;">
           <summary>UMAP 计算设置</summary>
@@ -49,8 +49,8 @@ FEATURE_SCRIPT = r'''
       nativeBusy = info.job?.status === 'running';
       el('nativeFeatureSummary').textContent = info.available
         ? `${info.events.toLocaleString()} 个事件 × ${info.features.toLocaleString()} 个 feature。矩阵已保存在项目中。`
-        : (info.can_import ? '导入包含矩阵的 MS 分析结果 ZIP，即可在本项目计算 UMAP。'
-          : '原项目继续使用已有坐标。原生矩阵需用 MS 分析结果 ZIP 创建独立项目，以核对同一批事件。');
+        : (info.can_import ? '可从 LMA 事件包 ZIP 补充矩阵，仅接受与本项目相同的事件及版本。'
+          : '原项目继续使用已有坐标。原生矩阵需用 LMA 事件包 ZIP 创建独立项目，以核对同一批事件。');
       el('importNativeFeatures').disabled = nativeBusy || !info.can_import;
       el('runNativeUmap').disabled = nativeBusy || !info.available;
       el('runNativeUmap').textContent = nativeBusy ? '计算中…' : info.has_umap ? '重新计算 UMAP' : '计算 UMAP';
@@ -98,7 +98,7 @@ FEATURE_SCRIPT = r'''
       state.actionBusy = true;
       el('importNativeFeatures').disabled = true;
       try {
-        const picked = await postJson('/api/select-path', {kind:'file', file_role:'ms_results', title:'选择 MS 分析结果 ZIP'});
+        const picked = await postJson('/api/select-path', {kind:'file', file_role:'ms_results', title:'选择 LMA 事件包 ZIP'});
         if (picked.cancelled || !picked.path || project !== state.meta.project_id) return;
         el('nativeFeatureStatus').textContent = '正在核对事件与矩阵…';
         await postJson('/api/feature-umap/import', {project_id:project, source_path:picked.path});
