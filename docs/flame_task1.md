@@ -18,7 +18,7 @@ CI 首选 `FLAME_MS_CORE_WHEEL_BASE64` secret 中的锁定 wheel（仅约 25 KB 
 
 项目 ZIP 与事件包用途不同，见[项目分享](project_sharing.md)。
 
-MS Event Studio 导出“分析结果”并勾选矩阵后，LMA 新建项目选择“LMA 事件包 ZIP（含矩阵）”，一次导入事件和矩阵，并提供原 MS 文件和 LIF 输入。只传事件时仍可使用“LMA 事件包”文件夹。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
+MS Event Studio 选择“传给 LMA Studio”，生成 `ms-lma-handoff-v1` ZIP，内含正式 v2 `events/` 和可选 `features/`。LMA 新建项目选择“LMA 事件包 ZIP（可含矩阵）”，并提供原 MS 文件和 LIF 输入；无矩阵也可建项。已发布的正式 v2 文件夹仍可导入，分析 ZIP 不用于交接。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
 
 v2 包包含 `events.parquet`、`manifest.json`、`checksums.sha256`。完整合同见内核 `docs/event-package-v2.md`。原始自动身份包含 raw SHA、方法版本和 generation；当前事件身份、修订、原始及当前 scan/时间/支持窗、审阅状态分别保留。两个 Studio 的项目 UUID 可不同。
 
@@ -36,11 +36,11 @@ v0.4.0+ 项目加载沿用已保存事件、配对、标签、模型、名单顺
 
 ## 验收证据
 
-当前构建、真实数据与旧项目的最终结果见共享仓库 `handoff/WINDOWS_STATUS.md` 及任务 1 验收报告。本机原项目不等于尚未取得的正式投稿项目，不能宣称逐投稿项目验收。Windows 人工 UAT 后再安排 macOS 真机可见验收。
+当前 Windows 候选及真实数据回归见父工作区 `studio-validation/validation.json`；共享交接待用户验收和双平台 Release 完成后更新。本机原项目不等于尚未取得的正式投稿项目，不能宣称逐投稿项目验收。Windows 人工 UAT 后再安排 macOS 真机可见验收。
 
 ## 矩阵与原生 UMAP（Windows 联合验收候选）
 
-MS 的分析 ZIP 内包含原始 HRGC 矩阵和完整 v2 事件包。LMA 新建时一起接收；已有正式 v2 项目在“配置 → 矩阵与原生 UMAP”导入同一 ZIP。必须匹配原 MS SHA256、完整上游事件版本及矩阵逐行事件 ID；不按时间近似补绑。QC 排除允许矩阵是事件名单的子集。旧 CSV 项目仍可照常打开及使用原坐标，但无法证明正式事件身份时，应另建项目接入矩阵。
+MS 的 LMA 交接 ZIP 可包含原始 HRGC 矩阵和完整 v2 事件包。LMA 新建时一起接收；已有正式 v2 项目在“配置 → 矩阵与原生 UMAP”导入同一 ZIP。必须匹配原 MS SHA256、完整上游事件版本及矩阵逐行事件 ID；不按时间近似补绑。提取时手动填写的 QC 时间段可使矩阵成为事件名单的子集；MS 不自动识别 QC。旧 CSV 项目仍可照常打开及使用原坐标，但无法证明正式事件身份时，应另建项目接入矩阵。
 
 “计算 UMAP”在后台执行并显示进度。结果保存在项目内；重开无需重算。配置中可切换“原有坐标 / 原生 UMAP”，CSV 导出使用当前视图的坐标；矩阵未包含的事件坐标留空。切换不修改事件名单、人工标注、配对或时间模型。原生视图默认按采集时间着色，也可查看人工标注，点击点仍定位同一事件。
 
@@ -63,10 +63,10 @@ madata_hrgc.obs['UMAP2'] = madata_hrgc.obsm['X_umap'][:, 1]
 
 原参考 UMAP 分支没有显式 PCA，邻居计算会依赖自动表示选择或已有 PCA；产品在独立副本显式计算，所有随机阶段均传入种子 1。`mc.pp.fill_nan_values` 的实现和原环境未交付，因此只实现用户明确给出的零填充策略，不宣称历史流程逐值复现。首轮仅 UMAP，不扩展 t-SNE/Leiden。
 
-2026-09-12 本机完整真实数据回归：MPP 1,023 × 3,549、LSK 1,794 × 2,888、CAR-T-Bez 1,389 × 7,837（事件 × features），均通过 MS 提取、分析 ZIP、LMA 新建导入及原生 UMAP。实际参数均为 50 PCs / 15 neighbors / seed 1；三组重开、坐标切换、重复导入、独立重算及 CSV 坐标检查通过，矩阵值/NaN/轴/事件身份保持一致，原项目文件不变，新 LMA 标签均为 unknown。错项目矩阵导入被拒绝且项目不变。另有 4 个 HSC 和 6 个 CAR-T 旧项目副本通过现有工作流兼容检查，10 个原项目持久文件哈希不变。
+2026-09-12 本机完整真实数据回归：MPP 1,023 × 3,549、LSK 1,794 × 2,888、CAR-T-Bez 1,389 × 7,837（事件 × features），均通过 MS 提取、独立分析 ZIP、LMA 交接及原生 UMAP。实际参数均为 50 PCs / 15 neighbors / seed 1（在配置的“UMAP 计算设置”内查看）；三组重开、坐标切换、重复导入、独立重算及 CSV 坐标检查通过，矩阵值/NaN/轴/事件身份保持一致，原项目文件不变，新 LMA 标签均为 unknown。错项目矩阵导入被拒绝且项目不变。另有 4 个 HSC 和 6 个 CAR-T 旧项目副本通过现有工作流兼容检查，10 个原项目持久文件哈希不变。
 
 MPP 沿用原项目已有的 1,023 个保留事件；LSK 与 CAR-T 仅在新测试副本中以工程审计批量保留真实检出事件，用于负载检查，不能作为人工审阅或标签真值。三组首次 UMAP 约 21–27 秒；CAR-T 16.8 GB 原始 MS 的首次 LMA 建项约 13.3 分钟，重开约 7 秒。数据规模测试不证明生物学分群准确率，也不代表未取得的投稿项目或 macOS 已验收。
 
 可复用检查脚本为本仓库 `scripts/regression_feature_projects.py` 与 MS 仓库 `scripts/validate_real_features.py`；当前项目、结果和统一验证记录集中于父工作区 `studio-validation/`，入口为 `validation.json`，界面证据为 `ui-matrix.zip`。人工步骤见 MS 仓库 `docs/guided_test_zh.md`。Windows 用户联合 UAT、双平台 Release 完成后再更新共享交接。
 
-当前交接入口：MS「传给 LMA Studio」导出 `ms-lma-handoff-v1` ZIP，内含正式 v2 `events/` 和可选 `features/`。LMA 新建项目校验交接记录、事件 manifest、矩阵记录及其事件一致性；无矩阵也可建项。配置中的「补充或更新矩阵…」只接收相同事件与版本。分析 ZIP 不再用于交接，旧保存项目和正式 v2 文件夹仍按已有接口打开。本轮三套真实项目再次完成新交接 ZIP 的矩阵接入、UMAP 与重开；独立小样例验证 MS 实际导出的含/无矩阵 ZIP 新建 LMA、重开和误选分析 ZIP 拒绝。
+独立小样例验证 MS 实际导出的含/无矩阵 ZIP 新建 LMA、重开和误选分析 ZIP 拒绝。

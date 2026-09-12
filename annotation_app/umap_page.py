@@ -53,6 +53,10 @@ UMAP_HTML = r"""<!doctype html>
       max-width: 100%;
       white-space: nowrap;
     }
+    .color-control { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    .color-control label { font-size: 12px; font-weight: 650; color: var(--muted); }
+    .color-control select { height: 32px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font-family: inherit; font-size: 12px; }
+    .color-control select:focus-visible { outline: 2px solid #2f6fed; outline-offset: 2px; }
     .time-search label { font-size: 12px; font-weight: 650; }
     .time-search input {
       height: 32px;
@@ -155,8 +159,10 @@ UMAP_HTML = r"""<!doctype html>
         <span id="timeStatus" class="time-status" aria-live="polite"></span>
       </form>
       <span class="spacer"></span>
-      <label for="colorBy">着色</label>
-      <select id="colorBy" aria-label="UMAP 着色方式"><option value="annotation">人工标注</option><option value="time">采集时间</option></select>
+      <div class="color-control">
+        <label for="colorBy">着色</label>
+        <select id="colorBy" aria-label="UMAP 着色方式"><option value="annotation">人工标注</option><option value="time">采集时间</option></select>
+      </div>
       <div id="legend" class="legend"></div>
       <button id="fit" class="fit-button" type="button"
               title="恢复缩放和位置以显示全部事件点；不会修改任何标注"

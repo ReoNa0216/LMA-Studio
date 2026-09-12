@@ -123,7 +123,7 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(HTML, r"CellNumber.*batch.*其他列.*保留.*忽略")
 
     def test_export_copy_explains_full_roster_and_unknown_rows(self):
-        self.assertIn("全部事件均导出", HTML)
+        self.assertIn("全部细胞事件及后段 QC", HTML)
         self.assertIn("未标注为 unknown", HTML)
         self.assertIn("前段 QC anchor 留在审计库", HTML)
 

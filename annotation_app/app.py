@@ -13690,14 +13690,8 @@ HTML = r"""<!doctype html>
       min-width: 0;
     }
     .header-actions button { flex-shrink: 0; }
-    .header-export-hint {
-      min-width: 0;
-      color: #cbd5e1;
-      font-size: 12px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
+    .export-status { margin: 0; padding: 8px 18px; color: #344054; background: #eef2f6; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    .export-status:empty { display: none; }
     .header-export-button {
       height: 34px;
       border-color: #fff;
@@ -14422,6 +14416,30 @@ HTML = r"""<!doctype html>
       background: #f8fafc;
       color: #344054;
     }
+    .config-disclosure {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border: 1px solid #d7deea;
+      border-radius: 10px;
+      background: #f8fafc;
+    }
+    .config-disclosure > summary {
+      cursor: pointer;
+      color: #344054;
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1.5;
+    }
+    .config-disclosure > summary:focus-visible {
+      outline: 2px solid #2f6fed;
+      outline-offset: 4px;
+      border-radius: 3px;
+    }
+    .config-disclosure[open] > summary { margin-bottom: 12px; }
+    .coordinate-import > .attach-map-panel { margin: 0; padding: 0; border: 0; background: none; }
+    #nativeFeaturePanel .attach-map-actions { flex-wrap: wrap; }
+    #nativeFeaturePanel .attach-map-actions label { font-size: 12px; }
+    #nativeFeaturePanel .attach-map-actions select { font: inherit; font-size: 12px; }
     .attach-map-heading {
       display: flex;
       align-items: center;
@@ -14887,25 +14905,11 @@ HTML = r"""<!doctype html>
       height: 42px;
       font-size: 14px;
     }
+    @media (max-width: 760px) {
+      header { height: auto; min-height: 64px; align-items: flex-start; flex-direction: column; gap: 8px; padding: 10px 12px; }
+      .header-actions { flex-wrap: wrap; width: 100%; justify-content: flex-start; gap: 8px; }
+    }
     @media (max-width: 1100px) {
-      header {
-        height: auto;
-        min-height: 72px;
-        align-items: flex-start;
-        flex-direction: column;
-        padding: 10px 12px;
-      }
-      .header-actions {
-        flex-wrap: wrap;
-        width: 100%;
-        justify-content: space-between;
-      }
-      .header-export-hint {
-        order: 1;
-        flex-basis: 100%;
-        overflow-wrap: anywhere;
-        white-space: normal;
-      }
       main {
         grid-template-columns: 1fr;
       }
@@ -15031,11 +15035,11 @@ HTML = r"""<!doctype html>
       <button id="openExistingProject" class="header-secondary-button">打开项目</button>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
       <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
-      <span id="exportHint" class="header-export-hint" role="status" aria-live="polite" aria-atomic="true">全部事件均导出；未标注为 unknown，前段 QC anchor 留在审计库</span>
-      <button id="shareProjectZip" class="header-export-button">打包分享项目</button>
-      <button id="exportAcceptedCsv" class="header-export-button">导出细胞/质控主 CSV</button>
+      <button id="shareProjectZip" class="header-secondary-button" title="打包为项目 ZIP，供 LMA Studio 继续使用">分享项目</button>
+      <button id="exportAcceptedCsv" class="header-export-button" title="导出 CSV：全部细胞事件及后段 QC；未标注为 unknown，前段 QC anchor 留在审计库">导出细胞与 QC</button>
     </div>
   </header>
+  <p id="exportHint" class="export-status" role="status" aria-live="polite" aria-atomic="true"></p>
 
   <section id="bootstrapScreen" class="bootstrap-screen" aria-labelledby="bootstrapTitle">
     <div class="bootstrap-panel">
@@ -15381,7 +15385,7 @@ HTML = r"""<!doctype html>
       <div class="modal-head">
         <div>
           <p id="projectConfigTitle" class="modal-title">配置</p>
-          <div class="empty">设置前段参考窗口、事件起点与后段质控巡检。修改已锁定时间模型所依赖的参数时，软件会先说明哪些结果需要重算。</div>
+          <div class="empty">设置参考时间段、事件起点和后段 QC。</div>
         </div>
         <button id="closeConfigProject" class="small-button secondary">关闭</button>
       </div>
@@ -15390,17 +15394,16 @@ HTML = r"""<!doctype html>
         <span>事件标注起点(min)</span><input id="cfgAnnotationStart" type="number" step="0.1" />
         <span>自动估计时间差的范围(min)</span><input id="cfgSeedWindow" type="number" step="0.5" />
       </div>
-      <section class="import-section">
-        <div class="import-section-title"><span>LIF 峰识别规则（项目创建时固定）</span></div>
+      <details class="config-disclosure">
+        <summary>LIF 峰识别规则（只读）</summary>
         <div class="detector-config-grid">
           <span>识别方式</span><output id="cfgLifPeakStandard">-</output>
           <span>识别规则</span><output id="cfgLifPeakDetectorDetails">-</output>
         </div>
-        <div class="qc-anchor-rule">识别规则与项目中间表固定绑定，本页只读，不会把其他规则静默套用到已有峰表。技术审计信息保存在项目说明文件中。</div>
-      </section>
+      </details>
       <section id="cfgProtocolPanel" class="import-section">
         <div class="import-section-title"><span>前段分段参考窗口</span></div>
-        <div class="qc-anchor-rule">通道与顺序保持不变；可先保存待确认边界。全部勾选“边界已确认”后，才会计算前段校准并解锁后段阶段。</div>
+        <div class="qc-anchor-rule">核对全部时间段并确认边界后启用校准；未确认时可先保存。</div>
         <div id="cfgCalibrationSegments" class="protocol-editor"></div>
       </section>
       <section id="cfgPostQcPanel" class="import-section">
@@ -15421,14 +15424,14 @@ HTML = r"""<!doctype html>
         <div id="cfgScheduledQcWindows" class="protocol-editor" style="margin-top:8px;"></div>
       </section>
       __NATIVE_FEATURE_PANEL__
-      <details><summary>已有坐标 CSV（可选）</summary>
+      <details class="config-disclosure coordinate-import"><summary>导入已有坐标 CSV（可选）</summary>
       <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
         <div class="attach-map-heading">
           <p class="side-title">UMAP coordinates</p>
           <span id="attachMapBadge" class="attach-map-badge">Not set</span>
         </div>
         <p class="attach-map-copy">
-          导入另一份 CSV 即可切换批次校正前/后的坐标视图。仅更新 UMAP 与导出坐标；标注、峰和时间模型不变。
+          用于外部计算的坐标；仅更新坐标视图与导出，不改标注。
         </p>
         <label class="attach-map-label" for="attachCellEventMap">Coordinate CSV</label>
         <div class="path-picker-row">
@@ -15437,7 +15440,7 @@ HTML = r"""<!doctype html>
         </div>
         <div id="attachMapRequirements" class="attach-map-requirements">
           启用 UMAP 需要：<code>scan_start_time</code>、<code>UMAP1</code>（也可命名为 <code>UMAP</code>）、<code>UMAP2</code>；
-          其他列忽略。软件保存项目内副本，不依赖原 CSV 路径。<span id="attachMapProjectName"></span>
+          其他列忽略。<span id="attachMapProjectName"></span>
         </div>
         <div class="attach-map-actions">
           <button id="attachMap" type="button" class="small-button" disabled>Validate &amp; enable</button>
@@ -15445,9 +15448,9 @@ HTML = r"""<!doctype html>
         </div>
       </div>
       </details>
-      <section id="msPackageUpdatePanel" class="attach-map-panel" hidden>
-        <p class="side-title">MS 上游审阅更新</p>
-        <p>检查上游事件变化。当前项目保留事件、标注和时间模型；新版审阅结果导入独立新项目。</p>
+      <details id="msPackageUpdatePanel" class="config-disclosure attach-map-panel" hidden>
+        <summary>检查 MS 审阅更新</summary>
+        <p>仅预览事件变化；更新后的事件需另建项目。</p>
         <label for="msPackageUpdatePath">新版 LMA 事件包文件夹</label>
         <div class="path-picker-row">
           <input id="msPackageUpdatePath" type="text" />
@@ -15455,7 +15458,7 @@ HTML = r"""<!doctype html>
         </div>
         <button id="checkMsPackageUpdate" class="small-button secondary" type="button">检查事件变化</button>
         <p id="msPackageUpdateResult" role="status" aria-live="polite"></p>
-      </section>
+      </details>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
         <button id="saveConfig" class="small-button">保存项目配置</button>
@@ -16073,6 +16076,7 @@ HTML = r"""<!doctype html>
     }
 
     function applyLoadedProjectMeta(projectMeta) {
+      el('exportHint').textContent = '';
       msPackagePreviewRequest += 1;
       el('checkMsPackageUpdate').disabled = false;
       el("msPackageUpdatePanel").hidden = !projectMeta.ms_event_import;
@@ -16858,7 +16862,7 @@ HTML = r"""<!doctype html>
     }
 
     function updateExportHint() {
-      el('exportHint').textContent = '全部事件均导出；未标注为 unknown，前段 QC anchor 留在审计库';
+      if (!state.actionBusy) el('exportHint').textContent = '';
     }
 
     function postQcModeLabel(mode) {
@@ -18558,7 +18562,7 @@ HTML = r"""<!doctype html>
         alert(`打包未完成：${err.message}`);
       } finally {
         button.disabled = false;
-        button.textContent = '打包分享项目';
+        button.textContent = '分享项目';
         state.actionBusy = false;
         if (state.meta?.project_id === projectId) button.focus();
       }

@@ -1603,7 +1603,6 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertIn('选择与当前 MS 对应的 .csv', HTML)
         self.assertIn('Validate &amp; enable', HTML)
         self.assertIn('Validate & switch', HTML)
-        self.assertIn('软件保存项目内副本，不依赖原 CSV 路径', HTML)
         self.assertIn("activeSourceName = String(mapInfo.source_name || '').trim()", HTML)
         self.assertIn('/api/replace-cell-event-map', HTML)
         self.assertIn("notifyStateChannel(replacing ? 'map-replaced' : 'map-attached')", HTML)

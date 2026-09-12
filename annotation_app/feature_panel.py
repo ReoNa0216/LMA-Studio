@@ -14,7 +14,8 @@ FEATURE_PANEL = r'''
             <label for="nativeNeighbors">邻居数<input id="nativeNeighbors" type="number" min="2" max="200" step="1" value="15" /></label>
             <label for="nativeSeed">随机种子<input id="nativeSeed" type="number" min="0" max="2147483647" step="1" value="1" /></label>
           </div>
-          <p class="attach-map-copy">计算副本补零 → PCA → 邻居图 → UMAP。保留原始强度，不做归一化、log 或批次校正。小样本自动降低维数及邻居数；实际设置随结果保存。</p>
+          <p class="attach-map-copy">计算副本补零 → PCA → 邻居图 → UMAP；不改原矩阵，不做归一化或批次校正。小样本自动减少主成分和邻居数。</p>
+          <p id="nativeActualSettings" class="attach-map-copy" hidden></p>
         </details>
         <div class="attach-map-actions" style="margin-top:12px;">
           <button id="runNativeUmap" class="small-button" type="button" disabled>计算 UMAP</button>
@@ -48,21 +49,24 @@ FEATURE_SCRIPT = r'''
     function renderFeaturePanel(info) {
       nativeBusy = info.job?.status === 'running';
       el('nativeFeatureSummary').textContent = info.available
-        ? `${info.events.toLocaleString()} 个事件 × ${info.features.toLocaleString()} 个 feature。矩阵已保存在项目中。`
-        : (info.can_import ? '可从 LMA 事件包 ZIP 补充矩阵，仅接受与本项目相同的事件及版本。'
-          : '原项目继续使用已有坐标。原生矩阵需用 LMA 事件包 ZIP 创建独立项目，以核对同一批事件。');
+        ? `${info.events.toLocaleString()} 个事件 × ${info.features.toLocaleString()} 个 feature。`
+        : (info.can_import ? '从 LMA 事件包 ZIP 补充同一批事件的矩阵。'
+          : '此项目使用已有坐标；接入原生矩阵需用 LMA 事件包另建项目。');
       el('importNativeFeatures').disabled = nativeBusy || !info.can_import;
       el('runNativeUmap').disabled = nativeBusy || !info.available;
       el('runNativeUmap').textContent = nativeBusy ? '计算中…' : info.has_umap ? '重新计算 UMAP' : '计算 UMAP';
       el('nativeUmapView').disabled = nativeBusy || !info.has_umap;
       el('nativeUmapView').value = info.view;
       for (const id of ['nativePcs','nativeNeighbors','nativeSeed']) el(id).disabled = nativeBusy;
+      el('nativeActualSettings').hidden = !info.has_umap || !info.actual_parameters;
+      const actual = info.actual_parameters;
+      el('nativeActualSettings').textContent = info.has_umap && actual
+        ? `已保存结果：${actual.n_pcs} 个主成分，${actual.n_neighbors} 个邻居，随机种子 ${actual.random_state}。` : '';
       if (info.job?.status === 'failed') {
         el('nativeFeatureStatus').textContent = `计算失败：${info.job.message}。已有坐标保持不变。`;
       } else if (info.has_umap && info.actual_parameters && !nativeBusy) {
-        const p = info.actual_parameters;
-        el('nativeFeatureStatus').textContent = `UMAP 已保存：${p.n_pcs} 个主成分，${p.n_neighbors} 个邻居，随机种子 ${p.random_state}。关闭配置后点击顶部 UMAP 查看。`;
-      } else if (info.job?.message) el('nativeFeatureStatus').textContent = info.job.message;
+        el('nativeFeatureStatus').textContent = 'UMAP 已保存，可从顶部 UMAP 查看。';
+      } else el('nativeFeatureStatus').textContent = info.job?.message || '';
     }
 
     async function refreshFeaturePanel() {
