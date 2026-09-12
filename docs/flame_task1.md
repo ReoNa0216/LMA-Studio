@@ -63,4 +63,8 @@ madata_hrgc.obs['UMAP2'] = madata_hrgc.obsm['X_umap'][:, 1]
 
 原参考 UMAP 分支没有显式 PCA，邻居计算会依赖自动表示选择或已有 PCA；产品在独立副本显式计算，所有随机阶段均传入种子 1。`mc.pp.fill_nan_values` 的实现和原环境未交付，因此只实现用户明确给出的零填充策略，不宣称历史流程逐值复现。首轮仅 UMAP，不扩展 t-SNE/Leiden。
 
-本机联合验证使用独立 MPP 项目：22 个事件 × 5897 features，实际 21 PCs / 15 neighbors / seed 1；重开坐标一致且 22 个标签保持 unknown，原矩阵哈希不变。另一个旧项目副本的 906 个事件及持久文件在只读重开前后完全一致。证据集中于 `build/umap-qa/`；此结果不代表所有投稿项目或 macOS 已验收。Windows 用户联合 UAT、双平台 Release 完成后再更新共享交接。
+2026-09-12 本机完整真实数据回归：MPP 1,023 × 3,549、LSK 1,794 × 2,888、CAR-T-Bez 1,389 × 7,837（事件 × features），均通过 MS 提取、分析 ZIP、LMA 新建导入及原生 UMAP。实际参数均为 50 PCs / 15 neighbors / seed 1；三组重开、坐标切换、重复导入、独立重算及 CSV 坐标检查通过，矩阵值/NaN/轴/事件身份保持一致，原项目文件不变，新 LMA 标签均为 unknown。错项目矩阵导入被拒绝且项目不变。另有 4 个 HSC 和 6 个 CAR-T 旧项目副本通过现有工作流兼容检查，10 个原项目持久文件哈希不变。
+
+MPP 沿用原项目已有的 1,023 个保留事件；LSK 与 CAR-T 仅在新测试副本中以工程审计批量保留真实检出事件，用于负载检查，不能作为人工审阅或标签真值。三组首次 UMAP 约 21–27 秒；CAR-T 16.8 GB 原始 MS 的首次 LMA 建项约 13.3 分钟，重开约 7 秒。数据规模测试不证明生物学分群准确率，也不代表未取得的投稿项目或 macOS 已验收。
+
+可复用检查脚本为本仓库 `scripts/regression_feature_projects.py` 与 MS 仓库 `scripts/validate_real_features.py`；当前项目、结果和统一验证记录集中于父工作区 `studio-validation/`，入口为 `validation.json`，界面证据为 `ui-matrix.zip`。人工步骤见 MS 仓库 `docs/guided_test_zh.md`。Windows 用户联合 UAT、双平台 Release 完成后再更新共享交接。
