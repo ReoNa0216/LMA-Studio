@@ -24,7 +24,7 @@ v2 包包含 `events.parquet`、`manifest.json`、`checksums.sha256`。完整合
 
 LMA 导入保留所有事件及顺序，只有 accepted 进入标注名单。pending、rejected、unreviewed 仍留在工作表和不可变原包中。raw 严格解析仅用于曲线及原始/当前物理位置校验，导入不重新 MS calling，不走旧 CSV roster 补峰。
 
-LMA 项目配置可只读检查新版审阅包，逐事件比较新增/删除/修改及生成版本。更新创建新项目；不在原项目原位替换事件或自动迁移标注。同名 ID 的峰顶、窗口、状态变化也被识别。发布前完整校验在 sibling staging 完成，失败回滚，原项目不受影响。
+MS 事件名单、峰顶或审阅状态变化后，用新版事件包新建 LMA 项目；当前配置不提供事件更新或差异预览入口。已有项目仅允许补充同事件、同版本的矩阵，保留人工标注和时间模型。发布前完整校验在 sibling staging 完成，失败回滚，原项目不受影响。
 
 ## 旧项目与科学边界
 
@@ -44,7 +44,7 @@ MS 的 LMA 交接 ZIP 可包含原始 HRGC 矩阵和完整 v2 事件包。LMA �
 
 “计算 UMAP”在后台执行并显示进度。结果保存在项目内；重开无需重算。同时存在外部 CSV 和原生坐标时，配置可切换“导入的 CSV 坐标 / 原生 UMAP”；CSV 导出使用当前视图，未参与该坐标计算的事件坐标留空。新导入 CSV 严格使用 scan_start_time、UMAP1、UMAP2，不接受 UMAP 别名；旧保存项目的 canonical 坐标仍可读取。切换不修改事件名单、人工标注、配对或时间模型。原生视图默认按采集时间着色，也可查看人工标注，点击点仍定位同一事件。
 
-原始 float64/NaN 矩阵保持原样。计算须先确认全部前段边界；在 PCA 前按当前 MS 峰顶时间选取“事件标注起点”及之后的矩阵行，后段 QC 暂保留。这是用户确认的时间范围选择，不是自动识别 QC；全部事件继续留作校准。范围与选入/排除行数随结果保存，范围变化或旧结果缺少范围记录时提示重算，失败保留旧结果。独立副本仅 NaN→0，显式 PCA(arpack) → 邻居图(X_pca, euclidean) → 二维 UMAP。默认 PCA 50、邻居 15、种子 1；小样本分别限制到 min(事件数, feature 数)-1 和事件数-1，并显示实际参数。至少 4 个事件、2 个 feature；不默认归一化、log、缩放、删 feature 或批次校正。采集时间和人工标签均不作为距离输入。计算记录包含输入哈希、事件版本、请求/实际参数、依赖版本和坐标哈希；固定种子不代表跨平台逐位一致。
+原始 float64/NaN 矩阵保持原样。计算须先确认全部前段边界并保存项目配置；未确认和已确认未保存时，禁用按钮分别显示下一步操作，修改事件起点或参考段后也需重新保存。在 PCA 前按当前 MS 峰顶时间选取“事件标注起点”及之后的矩阵行，后段 QC 暂保留。这是用户确认的时间范围选择，不是自动识别 QC；全部事件继续留作校准。范围与选入/排除行数随结果保存，范围变化或旧结果缺少范围记录时提示重算，失败保留旧结果。独立副本仅 NaN→0，显式 PCA(arpack) → 邻居图(X_pca, euclidean) → 二维 UMAP。默认 PCA 50、邻居 15、种子 1；小样本分别限制到 min(事件数, feature 数)-1 和事件数-1，并显示实际参数。至少 4 个事件、2 个 feature；不默认归一化、log、缩放、删 feature 或批次校正。采集时间和人工标签均不作为距离输入。计算记录包含输入哈希、事件版本、请求/实际参数、依赖版本和坐标哈希；固定种子不代表跨平台逐位一致。
 
 依赖固定 Scanpy 1.11.5、AnnData 0.12.17、umap-learn 0.5.9.post2。冻结包用 PyInstaller 的源文件收集模式保留 JIT 模块位置，Numba 缓存放在应用用户目录。打包时实际计算小矩阵 UMAP，不以仅导入成功代替科学运行检查。参考：[Scanpy neighbors](https://scanpy.readthedocs.io/en/stable/api/generated/scanpy.pp.neighbors.html)、[Scanpy UMAP](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.umap.html)、[PyInstaller module collection](https://pyinstaller.org/en/latest/hooks.html)。
 

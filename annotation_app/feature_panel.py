@@ -7,7 +7,7 @@ FEATURE_PANEL = r'''
         <div class="attach-map-actions">
           <button id="importNativeFeatures" class="small-button secondary" type="button">从 ZIP 导入矩阵…</button>
         </div>
-        <p id="nativeScope" class="attach-map-copy"></p>
+        <p id="nativeScope" class="attach-map-copy" role="status" aria-live="polite"></p>
         <details style="margin-top:12px;">
           <summary>UMAP 计算设置</summary>
           <div class="policy-fields" style="margin-top:10px;">
@@ -19,7 +19,7 @@ FEATURE_PANEL = r'''
           <p id="nativeActualSettings" class="attach-map-copy" hidden></p>
         </details>
         <div class="attach-map-actions" style="margin-top:12px;">
-          <button id="runNativeUmap" class="small-button" type="button" disabled>计算 UMAP</button>
+          <button id="runNativeUmap" class="small-button" type="button" aria-describedby="nativeScope" disabled>计算 UMAP</button>
           <button id="useNativeUmap" class="small-button secondary" type="button" hidden>使用已保存 UMAP</button>
           <span id="nativeViewField" hidden><label for="nativeUmapView">坐标来源</label>
           <select id="nativeUmapView" aria-label="坐标来源" disabled>
@@ -36,6 +36,28 @@ FEATURE_SCRIPT = r'''
     let nativeBusy = false;
     let nativeRequest = 0;
     let nativeMetaPending = false;
+    let nativeInfo = null;
+    let nativeInfoProject = null;
+
+    function nativeScopeReady(info) {
+      const saved = state.meta?.project_config || {};
+      const draft = state.configProtocolDraft;
+      const segments = draft?.segments || [];
+      const confirmed = draft?.compatibility_mode
+        ? info.selection_scope.boundaries_confirmed
+        : segments.length > 0 && segments.every(row => row.boundaries_confirmed);
+      const comparable = rows => JSON.stringify((rows || []).map(row =>
+        [Number(row.start_min), Number(row.end_min), Boolean(row.boundaries_confirmed)]));
+      const unsaved = !info.selection_scope.boundaries_confirmed
+        || comparable(segments) !== comparable(saved.calibration_protocol?.segments)
+        || !el('cfgAnnotationStart').value.trim()
+        || Number(el('cfgAnnotationStart').value) !== Number(saved.annotation_start_min);
+      return {confirmed, unsaved, ready: confirmed && !unsaved};
+    }
+
+    function refreshNativePrerequisites() {
+      if (nativeInfo && nativeInfoProject === state.meta?.project_id) renderFeaturePanel(nativeInfo);
+    }
 
     async function updateFeatureMeta(project, request) {
       const response = await fetch('/api/meta');
@@ -50,17 +72,24 @@ FEATURE_SCRIPT = r'''
     }
 
     function renderFeaturePanel(info) {
+      nativeInfo = info;
+      nativeInfoProject = state.meta?.project_id;
       nativeBusy = info.job?.status === 'running';
+      const prerequisite = nativeScopeReady(info);
       el('nativeFeatureSummary').textContent = info.available
         ? `${info.events.toLocaleString()} 个事件 × ${info.features.toLocaleString()} 个 feature。`
         : (info.can_import ? '从 LMA 事件包 ZIP 补充同一批事件的矩阵。'
           : '此项目使用已有坐标；接入原生矩阵需用 LMA 事件包另建项目。');
       el('importNativeFeatures').disabled = nativeBusy || !info.can_import;
-      el('runNativeUmap').disabled = nativeBusy || !info.available || !info.selection_scope.boundaries_confirmed;
+      el('runNativeUmap').disabled = nativeBusy || state.configSaveBusy || !info.available || !prerequisite.ready;
       el('nativeViewField').hidden = !(info.base_coordinates_available && info.has_umap);
       el('useNativeUmap').hidden = !info.has_umap || info.base_coordinates_available || info.view === 'native';
       el('useNativeUmap').disabled = nativeBusy;
-      el('runNativeUmap').textContent = nativeBusy ? '计算中…' : info.has_umap ? '重新计算 UMAP' : '计算 UMAP';
+      el('runNativeUmap').textContent = nativeBusy ? '计算中…'
+        : !info.available ? '计算 UMAP'
+        : !prerequisite.confirmed ? '先确认前段边界'
+        : prerequisite.unsaved ? '先保存项目配置'
+        : info.has_umap ? '重新计算 UMAP' : '计算 UMAP';
       el('nativeUmapView').disabled = nativeBusy || !info.has_umap;
       el('nativeUmapView').value = info.view;
       for (const id of ['nativePcs','nativeNeighbors','nativeSeed']) el(id).disabled = nativeBusy;
@@ -69,10 +98,15 @@ FEATURE_SCRIPT = r'''
       el('nativeActualSettings').textContent = info.has_umap && actual
         ? `已保存结果：${actual.n_pcs} 个主成分，${actual.n_neighbors} 个邻居，随机种子 ${actual.random_state}。` : '';
       const scope = info.selection_scope;
-      el('nativeScope').textContent = scope.boundaries_confirmed
-        ? `计算 ${scope.start_ns / 60000000000} min 起的事件；此前事件不参与，后段 QC 暂保留。`
-        : '请先在配置中确认全部前段边界，再计算 UMAP。';
-      if (info.job?.status === 'failed') {
+      el('nativeScope').textContent = !info.available ? ''
+        : !prerequisite.confirmed
+        ? '先勾选上方各参考段的“边界已确认”，再点击底部“保存项目配置”。'
+        : prerequisite.unsaved
+        ? '前段设置尚未保存。请点击底部“保存项目配置”，保存后即可计算。'
+        : `计算 ${scope.start_ns / 60000000000} min 起的事件；此前事件不参与，后段 QC 暂保留。`;
+      if (!prerequisite.ready && !nativeBusy) {
+        el('nativeFeatureStatus').textContent = '';
+      } else if (info.job?.status === 'failed') {
         el('nativeFeatureStatus').textContent = `计算失败：${info.job.message}。已有坐标保持不变。`;
       } else if (info.scope_warning && !nativeBusy) {
         el('nativeFeatureStatus').textContent = info.scope_warning;
@@ -131,6 +165,10 @@ FEATURE_SCRIPT = r'''
 
     el('runNativeUmap').addEventListener('click', async () => {
       if (state.actionBusy || nativeBusy) return;
+      if (!nativeInfo || !nativeScopeReady(nativeInfo).ready) {
+        refreshNativePrerequisites();
+        return;
+      }
       const inputs = ['nativePcs','nativeNeighbors','nativeSeed'].map(el);
       if (inputs.some(input => !input.reportValidity() || !input.value)) return;
       state.actionBusy = true;
@@ -142,8 +180,8 @@ FEATURE_SCRIPT = r'''
         await refreshFeaturePanel();
       } catch (error) {
         state.actionBusy = false;
+        refreshNativePrerequisites();
         el('nativeFeatureStatus').textContent = `计算失败：${error.message}`;
-        el('runNativeUmap').disabled = false;
       }
     });
 

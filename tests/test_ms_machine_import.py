@@ -14,7 +14,7 @@ from flame_ms_core.parser import parse_ms_scan_summary
 from flame_ms_core.scientific_settings import ProjectScientificSettings
 from flame_ms_core.timebase import AnalysisRange
 from annotation_app.app import AppData, ProjectPaths, primary_pc34_events, is_manual_cell_ms_event
-from annotation_app.ms_core import preview_package_update, lma_event_table
+from annotation_app.ms_core import lma_event_table
 from test_canonical_project_storage import _new_project_request, _write_synthetic_preprocessor_outputs, _tree_snapshot
 
 
@@ -74,9 +74,6 @@ class MachineImportTest(unittest.TestCase):
             self.assertEqual(app.cell_event_map.ms_event_id.tolist(), ["EV_import_0"])
             before = _tree_snapshot(app.project.project_dir)
             reopened = AppData.load(ProjectPaths.from_args(project_dir=str(app.project.project_dir)))
-            self.assertEqual(_tree_snapshot(app.project.project_dir), before)
-            preview = preview_package_update(app.project.project_dir, app.manifest, request["ms_event_package_path"])
-            self.assertFalse(preview["requires_new_project"])
             self.assertEqual(_tree_snapshot(app.project.project_dir), before)
             exported = reopened.export_accepted_annotations_csv()["csv_text"]
             self.assertIn("EV_import_0", exported)

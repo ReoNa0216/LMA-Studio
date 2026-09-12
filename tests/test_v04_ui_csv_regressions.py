@@ -340,7 +340,7 @@ class V04UiRegressionTest(unittest.TestCase):
             "Time",
             "Y",
             "Labels",
-            "Weak peaks",
+            "LIF 弱峰",
             "Show",
             "Calibration",
             "MS Δt",

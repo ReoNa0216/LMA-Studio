@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from flame_ms_core import __version__ as CORE_VERSION
-from flame_ms_core.exchange import read_event_package, compare_event_packages
+from flame_ms_core.exchange import read_event_package
 from flame_ms_core.parser import parse_ms_scan_summary
 from flame_ms_core.scientific_settings import ProjectScientificSettings
 
@@ -122,17 +122,3 @@ def validate_import_binding(project_dir: Path, manifest: dict, events: pd.DataFr
         raise ValueError("上游事件版本已改变；不能覆盖当前项目标注，请在新项目导入")
     if list(events.event_id) != list(package.events.event_id):
         raise ValueError("MS 审阅事件顺序或身份不一致")
-
-
-def preview_package_update(project_dir: Path, manifest: dict, incoming_dir: Path) -> dict:
-    entry = manifest.get("ms_event_import")
-    if not entry:
-        raise ValueError("当前项目没有导入 LMA 事件包")
-    previous = read_event_package(project_dir / PACKAGE_PATH)
-    if previous.manifest_sha256 != entry["manifest_sha256"]:
-        raise ValueError("当前项目审阅包已被修改")
-    incoming = read_event_package(incoming_dir)
-    result = compare_event_packages(previous, incoming)
-    result["requires_new_project"] = bool(result["added"] or result["removed"] or result["changed"] or result["generation_changed"])
-    result["message"] = "上游更新需导入独立新项目；当前事件、标注和时间模型保留。" if result["requires_new_project"] else "上游事件未变化。"
-    return result

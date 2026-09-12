@@ -14005,6 +14005,12 @@ HTML = r"""<!doctype html>
       background: #f8fafc;
       color: #344054;
     }
+    #runNativeUmap:disabled {
+      background: #f2f4f7;
+      color: #667085;
+      border-color: #d0d5dd;
+      cursor: not-allowed;
+    }
     .checkbox-row {
       display: flex;
       align-items: center;
@@ -14926,7 +14932,6 @@ HTML = r"""<!doctype html>
       }
     }
     #importDualRoleHelp { grid-column: 2; }
-    #checkMsPackageUpdate { margin-top: 10px; }
     @media (max-width: 1000px) {
       .modal-backdrop {
         padding: 12px 8px;
@@ -15224,7 +15229,7 @@ HTML = r"""<!doctype html>
         </label>
         <label id="showWeakLifPeaksLabel" class="checkbox-row" style="margin:0; white-space:nowrap;" title="仅在事件标注段用于人工细胞配对；不参与自动匹配">
           <input id="showWeakLifPeaks" type="checkbox" />
-          Weak peaks
+          LIF 弱峰
         </label>
         <label class="checkbox-row" style="margin:0; white-space:nowrap;" title="贯通所有通道；点击锁定，再点竖线解除；锁定后用左右键微调">
           <input id="verticalGuideEnabled" type="checkbox" />
@@ -15456,17 +15461,6 @@ HTML = r"""<!doctype html>
         </div>
       </div>
       </details>
-      <details id="msPackageUpdatePanel" class="config-disclosure attach-map-panel" hidden>
-        <summary>检查 MS 审阅更新</summary>
-        <p>仅预览事件变化；更新后的事件需另建项目。</p>
-        <label for="msPackageUpdatePath">新版 LMA 事件包文件夹</label>
-        <div class="path-picker-row">
-          <input id="msPackageUpdatePath" type="text" />
-          <button class="small-button secondary path-picker-button" data-picker-target="msPackageUpdatePath" data-picker-kind="directory" data-picker-title="选择新版 LMA 事件包" aria-label="选择新版 LMA 事件包">选择</button>
-        </div>
-        <button id="checkMsPackageUpdate" class="small-button secondary" type="button">检查事件变化</button>
-        <p id="msPackageUpdateResult" role="status" aria-live="polite"></p>
-      </details>
       <div id="configSaveStatus" class="config-save-status" role="status" aria-live="polite"></div>
       <div class="modal-actions">
         <button id="saveConfig" class="small-button">保存项目配置</button>
@@ -15475,23 +15469,6 @@ HTML = r"""<!doctype html>
   </div>
 
   <script>
-    let msPackagePreviewRequest = 0;
-    document.getElementById('checkMsPackageUpdate').addEventListener('click', async function () {
-      const result = document.getElementById('msPackageUpdateResult');
-      const request = ++msPackagePreviewRequest;
-      const packagePath = document.getElementById('msPackageUpdatePath').value.trim();
-      const projectMeta = state.meta;
-      const stillCurrent = () => request === msPackagePreviewRequest
-        && projectMeta === state.meta
-        && packagePath === document.getElementById('msPackageUpdatePath').value.trim();
-      this.disabled = true;
-      try {
-        const response = await postJson('/api/ms-package-update-preview', {package_dir: packagePath});
-        if (!stillCurrent()) return;
-        result.textContent = `${response.message} 新增 ${response.added.length}，移除 ${response.removed.length}，变化 ${response.changed.length}，未变 ${response.unchanged.length}。`;
-      } catch (error) { if (stillCurrent()) result.textContent = `检查失败：${error.message}`; }
-      finally { if (request === msPackagePreviewRequest) this.disabled = false; }
-    });
     document.getElementById('importMsSource').addEventListener('change', function () {
       const bundle = this.value === 'bundle';
       const machine = this.value !== 'raw';
@@ -16085,11 +16062,6 @@ HTML = r"""<!doctype html>
 
     function applyLoadedProjectMeta(projectMeta) {
       el('exportHint').textContent = '';
-      msPackagePreviewRequest += 1;
-      el('checkMsPackageUpdate').disabled = false;
-      el("msPackageUpdatePanel").hidden = !projectMeta.ms_event_import;
-      el("msPackageUpdatePath").value = "";
-      el("msPackageUpdateResult").textContent = "";
       state.meta = projectMeta;
       state.current = null;
       syncBootstrapMode();
@@ -16745,7 +16717,6 @@ HTML = r"""<!doctype html>
 
     async function init() {
       state.meta = await fetchJson('/api/meta');
-      el('msPackageUpdatePanel').hidden = !state.meta.ms_event_import;
       syncBootstrapMode();
       state.start = Math.max(0, state.meta.time_min_min);
       applyStageWindowWidth();
@@ -17284,7 +17255,7 @@ HTML = r"""<!doctype html>
       const cfg = state.current?.project_config || state.meta?.project_config || {};
       if (!cfg) return;
       el('cfgQcEnd').value = fmt(cfg.qc_calibration_end_min ?? 10.5, 1);
-      el('cfgAnnotationStart').value = fmt(cfg.annotation_start_min ?? 40.0, 1);
+      el('cfgAnnotationStart').value = String(Number(cfg.annotation_start_min ?? 40.0));
       el('cfgSeedWindow').value = fmt(cfg.local_delta_seed_window_min ?? 2.5, 1);
       const detector = cfg.lif_peak_detection || state.meta?.lif_peak_detection || {};
       el('cfgLifPeakStandard').textContent = '自适应双层峰识别';
@@ -17958,6 +17929,7 @@ HTML = r"""<!doctype html>
       if (state.actionBusy) return;
       state.actionBusy = true;
       state.configSaveBusy = true;
+      refreshNativePrerequisites();
       const button = el('saveConfig');
       const closeButton = el('closeConfigProject');
       const oldText = button.textContent;
@@ -18100,6 +18072,7 @@ HTML = r"""<!doctype html>
         button.textContent = oldText;
         state.configSaveBusy = false;
         state.actionBusy = false;
+        refreshNativePrerequisites();
       }
     }
 
@@ -19089,7 +19062,7 @@ HTML = r"""<!doctype html>
       const policy = el('windowPolicy');
       if (!policy) return;
       const calibrationNote = state.stage === 'qc_calibration'
-        ? '；Calibration：橙框 candidate，深框 eligible，空心 review-only，灰点 secondary'
+        ? '；校准 MS 点：橙框=匹配候选，深框=可用于自动校准，空心=仅人工复核，灰点=峰簇次峰'
         : '';
       if (state.peakLabelMode === 'hidden') {
         policy.textContent = `峰圆点全部保留；时间数字已隐藏，悬停任意圆点可查看精确原始时间(min)${calibrationNote}`;
@@ -20505,7 +20478,9 @@ HTML = r"""<!doctype html>
         const values = state.configProtocolDraft.segments.map(row => Number(row.end_min));
         if (values.every(Number.isFinite)) el('cfgQcEnd').value = fmt(Math.max(...values), 1);
       }
+      refreshNativePrerequisites();
     });
+    el('cfgAnnotationStart').addEventListener('input', refreshNativePrerequisites);
     el('cfgPostQcMode').addEventListener('change', () => {
       const mode = el('cfgPostQcMode').value;
       const previous = state.configPostQcDraft || {};
@@ -21194,17 +21169,6 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     segments_payload,
                     annotation_start_min=annotation_start_min,
                 )
-                self.send_json({"ok": True, **result})
-                return
-            if parsed.path == "/api/ms-package-update-preview":
-                from annotation_app.ms_core import preview_package_update
-                incoming = str(payload.get("package_dir") or "").strip()
-                if not incoming:
-                    raise BadRequest("请选择新版 LMA 事件包文件夹")
-                try:
-                    result = preview_package_update(self.data.project.project_dir, self.data.manifest or {}, Path(incoming))
-                except ValueError as exc:
-                    raise BadRequest(str(exc)) from exc
                 self.send_json({"ok": True, **result})
                 return
             if parsed.path == "/api/import-project":
