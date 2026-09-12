@@ -2,6 +2,7 @@
 
 本指南保留现有工作流验收，并用于 v0.6.0 之后的 Feature / 原生 UMAP 开发候选。当前候选尚未发布或由用户签收。
 本轮 Windows 简短联合步骤见相邻 MS 仓库 `docs/guided_test_zh.md`；完整 MPP 测试副本位于父工作区 `studio-validation/MPP/`。
+2026-09-12 按用户反馈移除界面中点分隔符，包含独立预测报告；Windows dist 已重建，完整 502 项测试（2 跳过）、打包科学运行与依赖来源检查通过。MS 端原文件定位问题已修复，两个软件仍等待联合人工确认。
 版本历史由 Git tag 和 `README_RELEASE.md` 保存。任务 1 新入口与依赖见 [接入说明](flame_task1.md)。
 
 任务 1 额外验收：MS 的 LMA 事件包经原生文件选择导入；同一事件定位到原 raw 的 scan/时间；

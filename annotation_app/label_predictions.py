@@ -284,8 +284,8 @@ def render_png(evidence, path):
 def review_html(result):
     esc = lambda x: html.escape(str(x), quote=True)
     rows = result["predictions"]
-    chunks = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>LMA 独立标签预测</title><style>body{font:16px system-ui;margin:32px;color:#203249;background:#f4f6f9}main{max-width:1400px;margin:auto}svg{width:100%;background:white}table{border-collapse:collapse;width:100%;background:white}td,th{padding:10px;border-bottom:1px solid #dde2e8;text-align:left}h1{font-size:25px}code{overflow-wrap:anywhere}p{line-height:1.6}</style><main><h1>独立标签预测 · 未经人工审核</h1>',
-              f'<p>运行：{esc(result["run_id"])} · 路线：{esc(result["method"]["route"])} · 模型：{esc(result["method"]["model"])}<br>虚线表示候选支持证据。结果不进入人工 accepted 或科学标签导出。</p>']
+    chunks = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>LMA 独立标签预测</title><style>body{font:16px system-ui;margin:32px;color:#203249;background:#f4f6f9}main{max-width:1400px;margin:auto}svg{width:100%;background:white}table{border-collapse:collapse;width:100%;background:white}td,th{padding:10px;border-bottom:1px solid #dde2e8;text-align:left}h1{font-size:25px}code{overflow-wrap:anywhere}p{line-height:1.6}</style><main><h1>独立标签预测（未经人工审核）</h1>',
+              f'<p>运行：{esc(result["run_id"])}；路线：{esc(result["method"]["route"])}；模型：{esc(result["method"]["model"])}<br>虚线表示候选支持证据。结果不进入人工 accepted 或科学标签导出。</p>']
     for window in result["windows"]:
         chunks.append(render_svg(window["evidence"], rows))
     chunks.append('<table><tr><th>MS 稳定 ID</th><th>预测类别</th><th>状态</th><th>LIF 候选 ID</th><th>依据</th></tr>')
