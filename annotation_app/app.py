@@ -8966,7 +8966,7 @@ class AppData:
             cell_event_map_info=loaded_entry,
         )
 
-    def export_accepted_annotations_csv(self) -> dict[str, Any]:
+    def prepare_annotations_export(self) -> dict[str, Any]:
         timestamp = now_iso()
         export_id = f"export_{timestamp.replace(':', '').replace('-', '').replace('Z', '')}_{uuid.uuid4().hex[:8]}"
         csv_filename = export_filename_for_project(self.project.project_dir)
@@ -9068,6 +9068,17 @@ class AppData:
         csv_text = buffer.getvalue()
         csv_bytes = csv_text.encode("utf-8-sig")
         csv_sha256 = hashlib.sha256(csv_bytes).hexdigest()
+        return dict(export_id=export_id, timestamp=timestamp, filename=csv_filename,
+                    csv_text=csv_text, csv_sha256=csv_sha256, row_count=len(rows),
+                    rows=rows, filters={**filters, "skipped": skipped}, skipped=skipped)
+
+    def export_accepted_annotations_csv(self) -> dict[str, Any]:
+        prepared = self.prepare_annotations_export()
+        export_id, timestamp = prepared["export_id"], prepared["timestamp"]
+        csv_filename, csv_text = prepared["filename"], prepared["csv_text"]
+        csv_sha256 = prepared["csv_sha256"]
+        csv_bytes = csv_text.encode("utf-8-sig")
+        rows, skipped, filters = prepared["rows"], prepared["skipped"], prepared["filters"]
         export_dir = self.project.annotation_db_path.parent / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
         csv_path = unique_file_path(export_dir / csv_filename)
@@ -15049,7 +15060,7 @@ HTML = r"""<!doctype html>
       <button id="openConfigProject" class="header-secondary-button">配置</button>
       <button id="openUmap" class="header-secondary-button" data-unavailable="true" title="当前项目尚未配置事件坐标 CSV">UMAP（未配置）</button>
       <button id="shareProjectZip" class="header-secondary-button" title="打包为项目 ZIP，供 LMA Studio 继续使用">分享项目</button>
-      <button id="exportAcceptedCsv" class="header-export-button" title="导出 CSV：全部细胞事件及后段 QC；未标注为 unknown，前段 QC anchor 留在审计库">导出细胞与 QC</button>
+      <button id="exportAcceptedCsv" class="header-export-button" title="导出细胞/QC 表及带标签矩阵">导出结果</button>
     </div>
   </header>
   <p id="exportHint" class="export-status" role="status" aria-live="polite" aria-atomic="true"></p>
@@ -15303,7 +15314,6 @@ HTML = r"""<!doctype html>
         <select id="importMsSource">
           <option value="raw">共用检峰内核＋事件 CSV</option>
           <option value="bundle">LMA 事件包 ZIP（可含矩阵）</option>
-          <option value="package">LMA 事件包文件夹</option>
         </select>
         <label id="importEventSourceLabel" for="importCellEventMap">事件坐标 CSV</label>
         <div>
@@ -15393,6 +15403,21 @@ HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+  <div id="resultsExportModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="resultsExportTitle">
+    <div class="modal" style="max-width:700px;">
+      <div class="modal-head"><h2 id="resultsExportTitle" class="modal-title">导出结果</h2><button id="closeResultsExport" class="small-button secondary">关闭</button></div>
+      <p>ZIP 包含细胞与 QC 表（CSV）；未标注事件保留为 unknown。</p>
+      <label id="resultsMatrixOption" class="checkbox-row"><input id="resultsIncludeMatrix" type="checkbox" />包含带标签矩阵（H5AD）</label>
+      <p id="resultsMatrixScope" class="attach-map-copy" role="status"></p>
+      <div class="import-grid">
+        <label for="resultsExportDir">保存文件夹</label>
+        <div class="path-picker-row"><input id="resultsExportDir" type="text" readonly /><button id="chooseResultsExportDir" class="small-button secondary">选择…</button></div>
+        <label for="resultsExportName">ZIP 文件名</label><input id="resultsExportName" type="text" maxlength="180" />
+      </div>
+      <p id="resultsExportStatus" class="attach-map-copy" style="overflow-wrap:anywhere;" role="status" aria-live="polite"></p>
+      <div class="modal-actions"><button id="runResultsExport" class="small-button" disabled>导出 ZIP</button></div>
+    </div>
+  </div>
   <div id="projectConfigModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="projectConfigTitle">
     <div class="modal">
       <div class="modal-head">
@@ -15471,17 +15496,16 @@ HTML = r"""<!doctype html>
   <script>
     document.getElementById('importMsSource').addEventListener('change', function () {
       const bundle = this.value === 'bundle';
-      const machine = this.value !== 'raw';
       const input = document.getElementById('importCellEventMap');
       input.value = '';
-      input.placeholder = bundle ? '选择 MS Event Studio 导出的 LMA 事件包 ZIP' : machine ? '选择 MS Event Studio 导出的 LMA 事件包文件夹' : '选择包含 scan_start_time 的 CSV';
-      document.getElementById('importEventSourceLabel').textContent = bundle ? 'LMA 事件包 ZIP' : machine ? 'LMA 事件包文件夹' : '事件坐标 CSV';
+      input.placeholder = bundle ? '选择 MS Event Studio 导出的 LMA 事件包 ZIP' : '选择包含 scan_start_time 的 CSV';
+      document.getElementById('importEventSourceLabel').textContent = bundle ? 'LMA 事件包 ZIP' : '事件坐标 CSV';
       const picker = document.querySelector('[data-picker-target="importCellEventMap"]');
-      picker.dataset.pickerKind = machine && !bundle ? 'directory' : 'file';
+      picker.dataset.pickerKind = 'file';
       picker.dataset.pickerRole = bundle ? 'ms_results' : 'cell_event_map';
-      picker.dataset.pickerTitle = bundle ? '选择 LMA 事件包 ZIP' : machine ? '选择 LMA 事件包文件夹' : '选择单细胞事件坐标 CSV';
+      picker.dataset.pickerTitle = bundle ? '选择 LMA 事件包 ZIP' : '选择单细胞事件坐标 CSV';
       picker.setAttribute('aria-label', picker.dataset.pickerTitle);
-      document.getElementById('importEventSourceHelp').textContent = machine
+      document.getElementById('importEventSourceHelp').textContent = bundle
         ? '沿用 MS 审阅事件。ZIP 如含矩阵会一并导入，之后可计算原生 UMAP；不含矩阵也可先完成对齐标注。'
         : '必须包含 scan_start_time；UMAP1/UMAP2 可选但必须成对提供。其他列导入时忽略。';
     });
@@ -16525,6 +16549,7 @@ HTML = r"""<!doctype html>
       if (activeModal.id === 'importModal') setImportModal(false);
       if (activeModal.id === 'openProjectModal') setOpenProjectModal(false);
       if (activeModal.id === 'projectConfigModal') setProjectConfigModal(false);
+      if (activeModal.id === 'resultsExportModal' && !state.actionBusy) setModalVisibility('resultsExportModal', false);
     }
 
     function setImportModal(open) {
@@ -18496,26 +18521,62 @@ HTML = r"""<!doctype html>
       }
     }
 
+    let resultsExportProject = null;
+    let resultsExportInfo = null;
+    function updateResultsExportControls() {
+      const matrix = el('resultsIncludeMatrix').checked;
+      const ready = !matrix || resultsExportInfo?.selection_scope?.boundaries_confirmed;
+      el('runResultsExport').disabled = state.actionBusy || !ready || !el('resultsExportDir').value || !el('resultsExportName').value.trim();
+      el('resultsMatrixScope').textContent = !matrix ? '' : !ready
+        ? '请先在配置中确认前段边界并保存，再导出矩阵。'
+        : `矩阵排除 ${resultsExportInfo.selection_scope.start_ns / 60000000000} min 之前的事件；后段 QC 保留并标记，强度与缺失值不变。`;
+    }
     async function exportAcceptedCsv() {
       if (state.actionBusy) return;
       state.actionBusy = true;
-      const button = el('exportAcceptedCsv');
-      const hint = el('exportHint');
-      const oldText = button.textContent;
-      button.textContent = '导出中...';
-        hint.textContent = '导出中...';
+      resultsExportProject = state.meta.project_id;
       try {
-        const result = await postCsv('/api/export-accepted-csv', {});
-        downloadTextFile(result.filename, result.text, 'text/csv;charset=utf-8');
-        hint.textContent = '主 CSV 已导出；未标注事件为 unknown，前段 QC anchor 留在审计库';
-      } catch (err) {
-        hint.textContent = '导出失败';
-        alert(`导出失败: ${err.message}`);
-      } finally {
-        button.textContent = oldText;
-        state.actionBusy = false;
-      }
+        resultsExportInfo = await fetchJson('/api/feature-umap');
+        el('resultsMatrixOption').hidden = !resultsExportInfo.available;
+        el('resultsIncludeMatrix').checked = resultsExportInfo.available;
+        el('resultsExportDir').value = '';
+        const name = String(state.meta?.project?.project_dir || 'LMA').split(/[\\/]/).filter(Boolean).pop();
+        el('resultsExportName').value = `${name.slice(0, 60)}-分析结果.zip`;
+        el('resultsExportStatus').textContent = resultsExportInfo.view === 'native' && resultsExportInfo.scope_warning ? '旧 UMAP 范围已变化，本次不导出坐标；标签和强度照常导出。' : '请选择项目外的保存文件夹。';
+        setModalVisibility('resultsExportModal', true, 'chooseResultsExportDir');
+      } catch (error) { el('exportHint').textContent = `读取导出内容失败：${error.message}`; }
+      finally { state.actionBusy = false; updateResultsExportControls(); }
     }
+    el('closeResultsExport').addEventListener('click', () => { if (!state.actionBusy) setModalVisibility('resultsExportModal', false); });
+    el('resultsIncludeMatrix').addEventListener('change', updateResultsExportControls);
+    el('resultsExportName').addEventListener('input', updateResultsExportControls);
+    el('chooseResultsExportDir').addEventListener('click', async () => {
+      if (state.actionBusy) return;
+      state.actionBusy = true;
+      try {
+        const selected = await postJson('/api/select-path', {kind:'directory', title:'选择项目外的结果保存文件夹'});
+        if (!selected.cancelled && selected.path) el('resultsExportDir').value = selected.path;
+      } catch (error) { el('resultsExportStatus').textContent = `选择失败：${error.message}`; }
+      finally { state.actionBusy = false; updateResultsExportControls(); }
+    });
+    el('runResultsExport').addEventListener('click', async () => {
+      if (state.actionBusy || el('runResultsExport').disabled) return;
+      state.actionBusy = true;
+      for (const id of ['runResultsExport','closeResultsExport','chooseResultsExportDir','resultsExportName','resultsIncludeMatrix']) el(id).disabled = true;
+      el('runResultsExport').textContent = '正在导出…';
+      el('resultsExportStatus').textContent = '正在核对标签并生成 ZIP，请稍候…';
+      try {
+        const result = await postJson('/api/export-results', {project_id:resultsExportProject, parent_dir:el('resultsExportDir').value, filename:el('resultsExportName').value, include_matrix:el('resultsIncludeMatrix').checked});
+        el('resultsExportStatus').textContent = `已保存：${result.path}。CSV ${result.csv_rows.toLocaleString()} 行${result.matrix_rows === null ? '' : `，矩阵 ${result.matrix_rows.toLocaleString()} 行`}。${result.coordinates_current ? '' : '旧 UMAP 坐标已省略。'}`;
+        el('exportHint').textContent = `已导出 ${result.filename}`;
+      } catch (error) { el('resultsExportStatus').textContent = `导出失败：${error.message}`; }
+      finally {
+        state.actionBusy = false;
+        for (const id of ['closeResultsExport','chooseResultsExportDir','resultsExportName','resultsIncludeMatrix']) el(id).disabled = false;
+        el('runResultsExport').textContent = '导出 ZIP';
+        updateResultsExportControls();
+      }
+    });
 
     async function shareProjectZip() {
       if (state.actionBusy) return;
@@ -21119,6 +21180,14 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                 with self.data.store._lock:
                     result = share_project(self.data.project.project_dir, Path(parent_dir),
                                            database=self.data.project.annotation_db_path)
+                self.send_json({"ok": True, **result})
+                return
+            if parsed.path == "/api/export-results":
+                if not isinstance(self.data, AppData) or payload.get("project_id") != self.data.project_identity():
+                    raise BadRequest("项目已改变，请重新打开导出窗口")
+                from annotation_app.results_export import export_results
+                result = export_results(self.data, payload.get("parent_dir", ""), payload.get("filename"),
+                                        include_matrix=payload.get("include_matrix"))
                 self.send_json({"ok": True, **result})
                 return
             if parsed.path == "/api/export-accepted-csv":

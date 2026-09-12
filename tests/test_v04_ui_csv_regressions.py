@@ -123,9 +123,9 @@ class V04UiRegressionTest(unittest.TestCase):
         self.assertRegex(HTML, r"CellNumber.*batch.*其他列.*保留.*忽略")
 
     def test_export_copy_explains_full_roster_and_unknown_rows(self):
-        self.assertIn("全部细胞事件及后段 QC", HTML)
-        self.assertIn("未标注为 unknown", HTML)
-        self.assertIn("前段 QC anchor 留在审计库", HTML)
+        self.assertIn("导出细胞/QC 表及带标签矩阵", HTML)
+        self.assertIn("未标注事件保留为 unknown", HTML)
+        self.assertIn("后段 QC 保留并标记", HTML)
 
     def test_import_segment_status_uses_a_full_width_grid_row(self):
         body = javascript_function_body(

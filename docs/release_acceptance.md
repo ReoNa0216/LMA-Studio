@@ -117,13 +117,15 @@
 
 ## 主 CSV
 
-导出 `Cell/QC 主 CSV` 后确认：
+点击“导出结果”，选择项目外的保存文件夹并填写 ZIP 文件名，检查其中 `cells_and_qc.csv`：
 
 - 仍为固定的 16 列事件表；
 - 坐标表中的每个 event 恰好一行；
 - 未标注 event 使用 `Type=unknown`，人工待审关系也仍按未接受状态导出；
 - 前段 QC anchor 不混入主事件表；
 - 内部 hash、歧义 payload 和模型审计只留在 SQLite。
+
+项目有矩阵时勾选“包含带标签矩阵（H5AD）”。确认前段边界并保存后导出，核对 `labeled_matrix.h5ad`：按 obs_names 对应 CSV 的 MS_event_id，Type 一致；仅已接受人工关系提供标签，其他为 unknown；is_qc 来自后段 QC 人工关系。矩阵排除已确认起点前的行，原强度、NaN 和 feature 轴不变。原生坐标范围过期时两份输出坐标同时留空。同名 ZIP 不覆盖，取消目录选择不导出，失败不留下 ZIP 半成品；原项目不变。
 
 ## 分享项目
 

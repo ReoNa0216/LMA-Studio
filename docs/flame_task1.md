@@ -18,7 +18,7 @@ CI 首选 `FLAME_MS_CORE_WHEEL_BASE64` secret 中的锁定 wheel（仅约 25 KB 
 
 项目 ZIP 与事件包用途不同，见[项目分享](project_sharing.md)。
 
-MS Event Studio 选择“传给 LMA Studio”，生成 `ms-lma-handoff-v1` ZIP，内含正式 v2 `events/` 和可选 `features/`。LMA 新建项目选择“LMA 事件包 ZIP（可含矩阵）”，并提供原 MS 文件和 LIF 输入；无矩阵也可建项。已发布的正式 v2 文件夹仍可导入，分析 ZIP 不用于交接。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
+MS Event Studio 选择“传给 LMA Studio”，生成 `ms-lma-handoff-v1` ZIP，内含正式 v2 `events/` 和可选 `features/`。LMA 新建项目选择“LMA 事件包 ZIP（可含矩阵）”，并提供原 MS 文件和 LIF 输入；无矩阵也可建项。新建界面只保留 ZIP 入口；过去从正式 v2 文件夹建立的项目仍可打开，底层读取保留。分析 ZIP 不用于交接。CSV 审阅结果供人阅读；正式传递必须完整包，不能手改列名替代。
 
 v2 包包含 `events.parquet`、`manifest.json`、`checksums.sha256`。完整合同见内核 `docs/event-package-v2.md`。原始自动身份包含 raw SHA、方法版本和 generation；当前事件身份、修订、原始及当前 scan/时间/支持窗、审阅状态分别保留。两个 Studio 的项目 UUID 可不同。
 
@@ -37,6 +37,14 @@ v0.4.0+ 项目加载沿用已保存事件、配对、标签、模型、名单顺
 ## 验收证据
 
 当前 Windows 候选及真实数据回归见父工作区 `studio-validation/validation.json`；共享交接待用户验收和双平台 Release 完成后更新。本机原项目不等于尚未取得的正式投稿项目，不能宣称逐投稿项目验收。Windows 人工 UAT 后再安排 macOS 真机可见验收。
+
+## 带标签分析结果
+
+顶部“导出结果”统一生成可自命名的 ZIP，包含 `cells_and_qc.csv`、`export_record.json`；项目有矩阵时可同时包含 `labeled_matrix.h5ad`。这是下游分析副本，不是 MS → LMA 事件包，也不替代分享项目。已有 CSV 投影规则及内部旧导出接口保留。
+
+H5AD 按稳定事件 ID 关联当前已接受的人工标签，新增 Type、annotation_status、is_qc、LIF_channel、annotation_id 和 UMAP1/UMAP2。未标注、待审和已拒绝均保持 unknown；不使用模型预测补充人工标签。is_qc 仅来自已接受的后段 QC 关系，不从 MS 信号自动推断。
+
+导出矩阵须已确认前段边界并保存，仅保留“事件标注起点”及之后的原矩阵行，后段 QC 保留并标记。CSV 沿用完整事件表范围，因此两者行数可以不同；记录包含范围、排除数量、原矩阵哈希及产物校验。原矩阵的强度、NaN、feature 轴及项目标注不改写。若当前原生 UMAP 对应旧范围，CSV 和 H5AD 同时省略坐标，避免两份结果不一致。ZIP 在临时目录完整生成后无覆盖发布，失败不留下半成品。
 
 ## 矩阵与原生 UMAP（Windows 联合验收候选）
 
