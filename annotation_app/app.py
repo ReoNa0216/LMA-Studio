@@ -8588,6 +8588,8 @@ class AppData:
             "cell_event_map": {
                 "available": self.cell_event_map is not None,
                 "coordinates_available": self.cell_event_map_coordinates_available(),
+                "csv_coordinates_available": self.base_coordinates_available(),
+                "csv_source_name": str((self.cell_event_map_info or {}).get("source_name") or ""),
                 "row_count": int(len(self.cell_event_map)) if self.cell_event_map is not None else 0,
                 "sha256": self.cell_event_map_sha256(),
                 "source_name": "原生 UMAP" if self.feature_analysis.state["view"] == "native" else str((self.cell_event_map_info or {}).get("source_name") or ""),
@@ -8661,8 +8663,13 @@ class AppData:
         base = str((self.cell_event_map_info or {}).get("sha256") or "")
         analysis = self.feature_analysis
         if analysis.state["view"] == "native":
-            return hashlib.sha256((base + str(analysis.state["embedding"])).encode()).hexdigest()
+            return hashlib.sha256((base + str(analysis.state["embedding"]) + json.dumps(analysis.selection_scope(), sort_keys=True)).encode()).hexdigest()
         return base
+
+    def base_coordinates_available(self) -> bool:
+        return self.cell_event_map is not None and bool(
+            (self.cell_event_map_info or {}).get("coordinates_available", True)
+        )
 
     def cell_event_map_coordinates_available(self) -> bool:
         if self.cell_event_map is None:
@@ -8711,6 +8718,7 @@ class AppData:
                     "map_sha256": self.cell_event_map_sha256(),
                     "coordinates_available": self.cell_event_map_coordinates_available(),
                     "coordinate_source": self.feature_analysis.state["view"],
+                    "coordinate_warning": self.feature_analysis.scope_warning() if self.feature_analysis.state["view"] == "native" else "",
                     "channel_identity_prior": self.channel_identity_prior,
                 }
             )
@@ -8825,7 +8833,7 @@ class AppData:
             raise BadRequest(str(exc)) from exc
         if not bool(import_metadata.get("coordinates_available")):
             raise BadRequest(
-                "用于启用或切换 UMAP 的 CSV 必须同时包含 UMAP1（也可命名为 UMAP）和 UMAP2"
+                "用于启用或切换 UMAP 的 CSV 必须同时包含 UMAP1 和 UMAP2"
             )
         allowed_ids = set(canonical["ms_event_id"].astype(str))
         if replacing and self.cell_event_map is not None:
@@ -15427,23 +15435,23 @@ HTML = r"""<!doctype html>
       <details class="config-disclosure coordinate-import"><summary>导入已有坐标 CSV（可选）</summary>
       <div id="attachMapPanel" class="attach-map-panel" style="display:none;">
         <div class="attach-map-heading">
-          <p class="side-title">UMAP coordinates</p>
+          <p class="side-title">CSV 坐标</p>
           <span id="attachMapBadge" class="attach-map-badge">Not set</span>
         </div>
         <p class="attach-map-copy">
           用于外部计算的坐标；仅更新坐标视图与导出，不改标注。
         </p>
-        <label class="attach-map-label" for="attachCellEventMap">Coordinate CSV</label>
+        <label class="attach-map-label" for="attachCellEventMap">坐标 CSV</label>
         <div class="path-picker-row">
           <input id="attachCellEventMap" type="text" autocomplete="off" spellcheck="false" aria-describedby="attachMapRequirements" placeholder="选择与当前 MS 对应的 .csv" />
           <button class="small-button secondary path-picker-button" aria-label="选择 UMAP 坐标 CSV" data-picker-target="attachCellEventMap" data-picker-kind="file" data-picker-role="cell_event_map" data-picker-title="选择 UMAP 坐标 CSV">选择 CSV</button>
         </div>
         <div id="attachMapRequirements" class="attach-map-requirements">
-          启用 UMAP 需要：<code>scan_start_time</code>、<code>UMAP1</code>（也可命名为 <code>UMAP</code>）、<code>UMAP2</code>；
+          必需列：scan_start_time、UMAP1、UMAP2；
           其他列忽略。<span id="attachMapProjectName"></span>
         </div>
         <div class="attach-map-actions">
-          <button id="attachMap" type="button" class="small-button" disabled>Validate &amp; enable</button>
+          <button id="attachMap" type="button" class="small-button" disabled>校验并导入</button>
           <span id="attachMapReady" class="attach-map-ready">尚未选择文件</span>
         </div>
       </div>
@@ -16649,7 +16657,7 @@ HTML = r"""<!doctype html>
           setConfigSaveStatus(
             state.meta?.cell_event_map?.available
               ? '可在下方导入 MS 矩阵并计算原生 UMAP，也可展开已有坐标 CSV。'
-              : '当前项目尚未启用事件列表和 UMAP 坐标。请选择 CSV，再点击“Validate & enable”。',
+              : '当前项目尚未启用事件列表和 UMAP 坐标。请选择 CSV，再点击“校验并导入”。',
             'warning'
           );
           window.setTimeout(() => el('nativeFeaturePanel').scrollIntoView({block:'center'}), 0);
@@ -17931,21 +17939,19 @@ HTML = r"""<!doctype html>
       const filename = value.split(/[\\/]/).filter(Boolean).pop() || '';
       const mapInfo = state.meta?.cell_event_map || {};
       const eventMapActive = Boolean(mapInfo.available);
-      const active = Boolean(mapInfo.coordinates_available);
-      const activeSourceName = String(mapInfo.source_name || '').trim();
+      const active = Boolean(mapInfo.csv_coordinates_available);
+      const activeSourceName = String(mapInfo.csv_source_name || '').trim();
       input.title = value;
       el('attachMap').disabled = Boolean(state.actionBusy) || !value;
-      el('attachMap').textContent = active ? 'Validate & switch' : 'Validate & enable';
+      el('attachMap').textContent = active ? '校验并更新' : '校验并导入';
       el('attachMapBadge').textContent = active
-        ? `Active: ${Number(mapInfo.row_count || 0).toLocaleString()} points`
-        : (eventMapActive
-            ? `Events: ${Number(mapInfo.row_count || 0).toLocaleString()} (UMAP not set)`
-            : 'Not set');
+        ? `已导入：${Number(mapInfo.row_count || 0).toLocaleString()} 个点`
+        : '未导入 CSV 坐标';
       el('attachMapReady').textContent = value
         ? `已选择：${filename}`
         : (active
             ? `${activeSourceName ? `当前：${activeSourceName}；` : ''}选择新 CSV 可切换坐标视图`
-            : (eventMapActive ? '事件列表已启用；尚未配置二维坐标' : '尚未选择文件'));
+            : '选择包含当前事件坐标的 CSV');
     }
 
     async function saveProjectConfig() {
@@ -18077,6 +18083,8 @@ HTML = r"""<!doctype html>
           result.warning ? 'warning' : 'success'
         );
         try {
+          await updateFeatureMeta(state.meta.project_id, nativeRequest);
+          await refreshFeaturePanel();
           await loadWindow();
         } catch (refreshErr) {
           const syncWarning = result.warning ? `${result.warning} ` : '';
@@ -18735,6 +18743,7 @@ HTML = r"""<!doctype html>
         state.meta = result.meta;
         state.current = null;
         syncUmapButtonState();
+        await refreshFeaturePanel();
         await loadWindow();
         notifyStateChannel(replacing ? 'map-replaced' : 'map-attached');
         const rowCount = Number(result.meta?.cell_event_map?.row_count || 0);
@@ -18792,9 +18801,9 @@ HTML = r"""<!doctype html>
           target.focus();
           if (attachPicker) {
             const filename = result.path.split(/[\\/]/).filter(Boolean).pop() || result.path;
-            const actionLabel = state.meta?.cell_event_map?.available
-              ? 'Validate & switch'
-              : 'Validate & enable';
+            const actionLabel = state.meta?.cell_event_map?.csv_coordinates_available
+              ? '校验并更新'
+              : '校验并导入';
             setConfigSaveStatus(
               `已选择 ${filename}。点击“${actionLabel}”后才会写入项目。`
             );

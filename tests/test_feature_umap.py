@@ -100,6 +100,8 @@ class FeatureUmapTest(unittest.TestCase):
     def test_independent_native_coordinates_saved_and_base_restored(self):
         with tempfile.TemporaryDirectory() as temp:
             request, source, _ = fixture(Path(temp))
+            for segment in request["calibration_protocol"]["segments"]:
+                segment["boundaries_confirmed"] = True
             with patch('annotation_app.app.run_preprocessing_script', side_effect=MachineImportTest.lif_only):
                 app = AppData.create_project_from_raw_inputs(**request)
             base = app.cell_event_map.copy()
@@ -113,6 +115,18 @@ class FeatureUmapTest(unittest.TestCase):
             reopened = AppData.load(app.project)
             self.assertEqual(reopened.projected_cell_event_map_state()['points'][0]['UMAP2'],4.)
             saved_state = dict(reopened.feature_analysis.state)
+            old_scope = reopened.feature_analysis.selection_scope()
+            changed_scope = {**old_scope, 'start_ns': old_scope['start_ns'] + 1}
+            with patch('annotation_app.feature_umap.compute_embedding', return_value=(xy, {'actual':{}})), patch.object(reopened.feature_analysis, 'selection_scope', side_effect=[old_scope, changed_scope]):
+                with self.assertRaisesRegex(ValueError, '计算期间前段范围发生变化'):
+                    reopened.feature_analysis.calculate({})
+            self.assertEqual(reopened.feature_analysis.state, saved_state)
+            too_late = reopened.project_config()
+            too_late['annotation_start_min'] = 99
+            with patch.object(AppData, 'project_config', return_value=too_late):
+                with self.assertRaises(ValueError):
+                    reopened.feature_analysis.calculate({})
+            self.assertEqual(reopened.feature_analysis.state, saved_state)
             changed_xy = xy.copy()
             changed_xy['UMAP1'] += 100
             with patch('annotation_app.feature_umap.compute_embedding',return_value=(changed_xy,{'requested':{'random_state':2},'actual':{}})), patch.object(reopened.feature_analysis,'_save',side_effect=OSError('disk full')):
@@ -123,6 +137,48 @@ class FeatureUmapTest(unittest.TestCase):
             reopened.feature_analysis.select_view('base')
             self.assertFalse(reopened.cell_event_map_coordinates_available())
             for path,digest in protected.items(): self.assertEqual(sha256(app.project.project_dir/path),digest)
+
+    def test_front_scope_filters_before_embedding_and_preserves_roster(self):
+        with tempfile.TemporaryDirectory() as temp:
+            request, source, _ = fixture(Path(temp))
+            for segment in request["calibration_protocol"]["segments"]:
+                segment["boundaries_confirmed"] = True
+            rows = pd.read_parquet(source / 'event_rows.parquet')
+            request['annotation_start_min'] = int(rows.current_apex_time_ns.iloc[1]) / 60_000_000_000
+            with patch('annotation_app.app.run_preprocessing_script', side_effect=MachineImportTest.lif_only):
+                app = AppData.create_project_from_raw_inputs(**request)
+            protected = _tree_snapshot(app.project.project_dir)
+            ids = rows.event_id.iloc[1:].tolist()
+            def embed(matrix, requested, progress):
+                self.assertEqual(matrix.obs_names.tolist(), ids)
+                return pd.DataFrame(dict(ms_event_id=ids, UMAP1=[1.,2.], UMAP2=[3.,4.])), {'actual':{}}
+            with patch('annotation_app.feature_umap.compute_embedding', side_effect=embed):
+                app.feature_analysis.calculate({})
+            self.assertEqual(len(app.cell_event_map), 3)
+            self.assertTrue(pd.isna(app.display_event_map().UMAP1.iloc[0]))
+            self.assertEqual(app.feature_analysis.umap_record['excluded_front_events'], 1)
+            reopened = AppData.load(app.project)
+            self.assertEqual(reopened.feature_analysis.coordinates.ms_event_id.tolist(), ids)
+            self.assertEqual(reopened.feature_analysis.scope_warning(), '')
+            config = reopened.project_config()
+            config['annotation_start_min'] += 0.01
+            with patch.object(AppData, 'project_config', return_value=config):
+                self.assertIn('请重新计算', reopened.feature_analysis.scope_warning())
+            after = _tree_snapshot(app.project.project_dir)
+            for name, identity in protected.items():
+                if name != 'analysis/feature_umap/state.json':
+                    self.assertEqual(after[name], identity, name)
+
+    def test_unconfirmed_front_scope_does_not_start_embedding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            request, _, _ = fixture(Path(temp))
+            with patch('annotation_app.app.run_preprocessing_script', side_effect=MachineImportTest.lif_only):
+                app = AppData.create_project_from_raw_inputs(**request)
+            with patch('annotation_app.feature_umap.compute_embedding') as embed:
+                with self.assertRaisesRegex(ValueError, '边界尚未全部确认'):
+                    app.feature_analysis.calculate({})
+                embed.assert_not_called()
+            self.assertIsNone(app.feature_analysis.coordinates)
 
     def test_zip_paths_and_legacy_binding_fail_before_project_mutation(self):
         with tempfile.TemporaryDirectory() as temp:

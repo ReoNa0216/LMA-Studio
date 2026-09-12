@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--existing', action='store_true', help='Validate a completed test project without rebuilding raw tables')
+    parser.add_argument('--confirm-engineering-boundaries', action='store_true',
+                        help='Confirm template boundaries only in the engineering test copy; not scientific QC validation')
     args = parser.parse_args()
     root = args.output.resolve()
     if root == args.source.resolve() or args.source.resolve() in root.parents:
@@ -65,6 +67,13 @@ def main():
             local_delta_seed_window_min=manifest['annotation_config']['local_delta_seed_window_min'])
         creation_seconds = time.monotonic() - started
     assert isinstance(app, AppData)
+    if not app.project_config()['calibration_protocol']['boundaries_confirmed']:
+        if not args.confirm_engineering_boundaries:
+            raise ValueError('Confirm test-copy boundaries first, or explicitly use --confirm-engineering-boundaries')
+        calibration = copy.deepcopy(app.project_config()['calibration_protocol'])
+        for segment in calibration['segments']:
+            segment['boundaries_confirmed'] = True
+        app.update_project_config({'calibration_protocol': calibration})
     with unpack_results(Path(ms['zip'])) as package:
         app.feature_analysis.import_matrix(package)
     analysis = app.feature_analysis
@@ -80,8 +89,10 @@ def main():
     analysis.calculate({}, lambda phase: print(root.name, phase, flush=True))
     umap_seconds = time.monotonic() - started
     first = analysis.coordinates.copy()
-    assert len(first) == ms['events'] and np.isfinite(first[['UMAP1','UMAP2']]).all().all()
-    assert first.ms_event_id.tolist() == incoming.obs_names.tolist()
+    scope = analysis.selection_scope()
+    selected = attached[attached.obs.current_apex_time_ns >= scope['start_ns']].copy()
+    assert len(first) == len(selected) and np.isfinite(first[['UMAP1','UMAP2']]).all().all()
+    assert first.ms_event_id.tolist() == selected.obs_names.tolist()
     for name, digest in baseline.items():
         if name != 'analysis/feature_umap/state.json':
             assert sha256(target / name) == digest, name
@@ -103,7 +114,7 @@ def main():
         reopened.feature_analysis.import_matrix(package)
     assert reopened.projected_cell_event_map_state() == expected
     started = time.monotonic()
-    repeated, _ = compute_embedding(attached, {})
+    repeated, _ = compute_embedding(selected, {})
     repeat_seconds = time.monotonic() - started
     pd.testing.assert_frame_equal(first, repeated)
     assert tree(args.source) == source_before

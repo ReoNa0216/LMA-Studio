@@ -94,23 +94,12 @@ class CellEventMapImportTest(unittest.TestCase):
         self.assertFalse(frame.attrs["coordinates_available"])
         self.assertEqual(frame.attrs["source_coordinate_columns"], {})
 
-    def test_source_loader_accepts_explicit_umap_alias_pair(self):
+    def test_source_loader_rejects_umap_alias_for_new_imports(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = self.write_source(
-                Path(tmp),
-                [[24.1, -3.0, 4.0, "cluster-1"]],
-                ["scan_start_time", "UMAP", "UMAP2", "leiden"],
-            )
-
-            frame = read_source_coordinates(path)
-
-        self.assertEqual(frame.columns.tolist(), ["scan_start_time", "UMAP1", "UMAP2"])
-        self.assertEqual(frame[["UMAP1", "UMAP2"]].iloc[0].tolist(), [-3.0, 4.0])
-        self.assertTrue(frame.attrs["coordinates_available"])
-        self.assertEqual(
-            frame.attrs["source_coordinate_columns"],
-            {"UMAP1": "UMAP", "UMAP2": "UMAP2"},
-        )
+            path = self.write_source(Path(tmp), [[24.1, -3.0, 4.0]],
+                                     ["scan_start_time", "UMAP", "UMAP2"])
+            with self.assertRaisesRegex(CellEventMapError, "不接受 UMAP 别名"):
+                read_source_coordinates(path)
 
     def test_source_loader_rejects_partial_coordinate_pair(self):
         with tempfile.TemporaryDirectory() as tmp:

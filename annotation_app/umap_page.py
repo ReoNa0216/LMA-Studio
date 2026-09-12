@@ -172,6 +172,7 @@ UMAP_HTML = r"""<!doctype html>
       <canvas id="canvas" aria-label="单细胞事件 UMAP"></canvas>
       <div id="empty" class="empty"></div>
       <div id="tooltip" class="tooltip"></div>
+      <div id="coordinateWarning" role="status" style="pointer-events:none; position:absolute; top:12px; left:12px; max-width:calc(100% - 24px); padding:6px 10px; background:#fff7ed; color:#92400e; font-size:12px;" hidden></div>
       <div class="gesture-hint">滚轮缩放；拖动平移；单击定位事件</div>
     </section>
   </main>
@@ -575,6 +576,9 @@ UMAP_HTML = r"""<!doctype html>
         }
         projectKey = nextKey;
         payload = data;
+        const warning = document.getElementById("coordinateWarning");
+        warning.textContent = data.coordinate_warning || "";
+        warning.hidden = !data.coordinate_warning;
         if (data.coordinates_available === false) {
           points = [];
           revision = String(data.revision || '');
@@ -598,6 +602,8 @@ UMAP_HTML = r"""<!doctype html>
         points = [];
         revision = '';
         fitted = false;
+        document.getElementById('coordinateWarning').hidden = true;
+        document.getElementById('coordinateWarning').textContent = '';
         identity.textContent = '没有可用的事件 UMAP';
         legend.innerHTML = '';
         setEmpty(error.message || String(error));

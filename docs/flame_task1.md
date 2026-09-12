@@ -40,11 +40,11 @@ v0.4.0+ 项目加载沿用已保存事件、配对、标签、模型、名单顺
 
 ## 矩阵与原生 UMAP（Windows 联合验收候选）
 
-MS 的 LMA 交接 ZIP 可包含原始 HRGC 矩阵和完整 v2 事件包。LMA 新建时一起接收；已有正式 v2 项目在“配置 → 矩阵与原生 UMAP”导入同一 ZIP。必须匹配原 MS SHA256、完整上游事件版本及矩阵逐行事件 ID；不按时间近似补绑。提取时手动填写的 QC 时间段可使矩阵成为事件名单的子集；MS 不自动识别 QC。旧 CSV 项目仍可照常打开及使用原坐标，但无法证明正式事件身份时，应另建项目接入矩阵。
+MS 的 LMA 交接 ZIP 可包含原始 HRGC 矩阵和完整 v2 事件包。LMA 新建时一起接收；已有正式 v2 项目在“配置 → 矩阵与原生 UMAP → 从 ZIP 导入矩阵…”导入同一 ZIP。必须匹配原 MS SHA256、完整上游事件版本及矩阵逐行事件 ID；不按时间近似补绑。提取时手动填写的 QC 时间段可使矩阵成为事件名单的子集；MS 不自动识别 QC。旧 CSV 项目仍可照常打开及使用原坐标，但无法证明正式事件身份时，应另建项目接入矩阵。
 
-“计算 UMAP”在后台执行并显示进度。结果保存在项目内；重开无需重算。配置中可切换“原有坐标 / 原生 UMAP”，CSV 导出使用当前视图的坐标；矩阵未包含的事件坐标留空。切换不修改事件名单、人工标注、配对或时间模型。原生视图默认按采集时间着色，也可查看人工标注，点击点仍定位同一事件。
+“计算 UMAP”在后台执行并显示进度。结果保存在项目内；重开无需重算。同时存在外部 CSV 和原生坐标时，配置可切换“导入的 CSV 坐标 / 原生 UMAP”；CSV 导出使用当前视图，未参与该坐标计算的事件坐标留空。新导入 CSV 严格使用 scan_start_time、UMAP1、UMAP2，不接受 UMAP 别名；旧保存项目的 canonical 坐标仍可读取。切换不修改事件名单、人工标注、配对或时间模型。原生视图默认按采集时间着色，也可查看人工标注，点击点仍定位同一事件。
 
-原始 float64/NaN 矩阵保持原样。独立副本仅 NaN→0，显式 PCA(arpack) → 邻居图(X_pca, euclidean) → 二维 UMAP。默认 PCA 50、邻居 15、种子 1；小样本分别限制到 min(事件数, feature 数)-1 和事件数-1，并显示实际参数。至少 4 个事件、2 个 feature；不默认归一化、log、缩放、删 feature 或批次校正。采集时间和人工标签均不作为距离输入。计算记录包含输入哈希、事件版本、请求/实际参数、依赖版本和坐标哈希；固定种子不代表跨平台逐位一致。
+原始 float64/NaN 矩阵保持原样。计算须先确认全部前段边界；在 PCA 前按当前 MS 峰顶时间选取“事件标注起点”及之后的矩阵行，后段 QC 暂保留。这是用户确认的时间范围选择，不是自动识别 QC；全部事件继续留作校准。范围与选入/排除行数随结果保存，范围变化或旧结果缺少范围记录时提示重算，失败保留旧结果。独立副本仅 NaN→0，显式 PCA(arpack) → 邻居图(X_pca, euclidean) → 二维 UMAP。默认 PCA 50、邻居 15、种子 1；小样本分别限制到 min(事件数, feature 数)-1 和事件数-1，并显示实际参数。至少 4 个事件、2 个 feature；不默认归一化、log、缩放、删 feature 或批次校正。采集时间和人工标签均不作为距离输入。计算记录包含输入哈希、事件版本、请求/实际参数、依赖版本和坐标哈希；固定种子不代表跨平台逐位一致。
 
 依赖固定 Scanpy 1.11.5、AnnData 0.12.17、umap-learn 0.5.9.post2。冻结包用 PyInstaller 的源文件收集模式保留 JIT 模块位置，Numba 缓存放在应用用户目录。打包时实际计算小矩阵 UMAP，不以仅导入成功代替科学运行检查。参考：[Scanpy neighbors](https://scanpy.readthedocs.io/en/stable/api/generated/scanpy.pp.neighbors.html)、[Scanpy UMAP](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.umap.html)、[PyInstaller module collection](https://pyinstaller.org/en/latest/hooks.html)。
 
@@ -63,9 +63,11 @@ madata_hrgc.obs['UMAP2'] = madata_hrgc.obsm['X_umap'][:, 1]
 
 原参考 UMAP 分支没有显式 PCA，邻居计算会依赖自动表示选择或已有 PCA；产品在独立副本显式计算，所有随机阶段均传入种子 1。`mc.pp.fill_nan_values` 的实现和原环境未交付，因此只实现用户明确给出的零填充策略，不宣称历史流程逐值复现。首轮仅 UMAP，不扩展 t-SNE/Leiden。
 
-2026-09-12 本机完整真实数据回归：MPP 1,023 × 3,549、LSK 1,794 × 2,888、CAR-T-Bez 1,389 × 7,837（事件 × features），均通过 MS 提取、独立分析 ZIP、LMA 交接及原生 UMAP。实际参数均为 50 PCs / 15 neighbors / seed 1（在配置的“UMAP 计算设置”内查看）；三组重开、坐标切换、重复导入、独立重算及 CSV 坐标检查通过，矩阵值/NaN/轴/事件身份保持一致，原项目文件不变，新 LMA 标签均为 unknown。错项目矩阵导入被拒绝且项目不变。另有 4 个 HSC 和 6 个 CAR-T 旧项目副本通过现有工作流兼容检查，10 个原项目持久文件哈希不变。
+此前未启用前段过滤的完整真实数据回归：MPP 1,023 × 3,549、LSK 1,794 × 2,888、CAR-T-Bez 1,389 × 7,837（事件 × features），均通过 MS 提取、独立分析 ZIP、LMA 交接及原生 UMAP。实际参数均为 50 PCs / 15 neighbors / seed 1（在配置的“UMAP 计算设置”内查看）；三组重开、坐标切换、重复导入、独立重算及 CSV 坐标检查通过，矩阵值/NaN/轴/事件身份保持一致，原项目文件不变，新 LMA 标签均为 unknown。错项目矩阵导入被拒绝且项目不变。另有 4 个 HSC 和 6 个 CAR-T 旧项目副本通过现有工作流兼容检查，10 个原项目持久文件哈希不变。
 
 MPP 沿用原项目已有的 1,023 个保留事件；LSK 与 CAR-T 仅在新测试副本中以工程审计批量保留真实检出事件，用于负载检查，不能作为人工审阅或标签真值。三组首次 UMAP 约 21–27 秒；CAR-T 16.8 GB 原始 MS 的首次 LMA 建项约 13.3 分钟，重开约 7 秒。数据规模测试不证明生物学分群准确率，也不代表未取得的投稿项目或 macOS 已验收。
+
+当前范围选择另用 MPP 临时副本验证：工程配置确认边界并以 24 min 为起点，1,023 行中 815 行参与 UMAP、208 行排除；与独立子集重算逐值一致，原 H5AD 哈希不变。此计数不证明 208 行均为 QC，也不自动确认原验收项目的边界。
 
 可复用检查脚本为本仓库 `scripts/regression_feature_projects.py` 与 MS 仓库 `scripts/validate_real_features.py`；当前项目、结果和统一验证记录集中于父工作区 `studio-validation/`，入口为 `validation.json`，界面证据为 `ui-matrix.zip`。人工步骤见 MS 仓库 `docs/guided_test_zh.md`。Windows 用户联合 UAT、双平台 Release 完成后再更新共享交接。
 

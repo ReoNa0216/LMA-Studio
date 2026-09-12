@@ -265,11 +265,27 @@ class FeatureAnalysis:
         self.record = record
         return self.overview()
 
+    def selection_scope(self):
+        config = self.app.project_config()
+        return {"policy": "annotation-start-v1",
+                "start_ns": round(float(config["annotation_start_min"]) * 60_000_000_000),
+                "boundaries_confirmed": bool((config.get("calibration_protocol") or {}).get("boundaries_confirmed"))}
+
+    def scope_warning(self):
+        if self.coordinates is None:
+            return ""
+        if (self.umap_record or {}).get("selection_scope") != self.selection_scope():
+            return "已保存的原生 UMAP 未按当前前段范围计算，请重新计算。"
+        return ""
+
     def calculate(self, requested, progress=lambda message: None):
+        self.app.require_confirmed_calibration("计算 UMAP")
+        scope = self.selection_scope()
         record, matrix, _ = validate_matrix(self.matrix_path, self.app)
+        matrix = matrix[matrix.obs.current_apex_time_ns >= scope["start_ns"]].copy()
         started = time.monotonic()
         coordinates, provenance = compute_embedding(matrix, requested, progress)
-        provenance.update(matrix=self.state["matrix"], schema="lma-native-umap-v1")
+        provenance.update(matrix=self.state["matrix"], schema="lma-native-umap-v1", selection_scope=scope, selected_events=matrix.n_obs, excluded_front_events=record["events"] - matrix.n_obs)
         digest = hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
         parent = self.root / "embeddings"
         parent.mkdir(parents=True, exist_ok=True)
@@ -287,6 +303,8 @@ class FeatureAnalysis:
                 os.rename(copy, destination)
         coordinates, umap_record = self._read_coordinates(digest)
         with self.lock:
+            if self.selection_scope() != scope:
+                raise ValueError("计算期间前段范围发生变化，未启用新 UMAP，请重新计算。")
             self._save({**self.state, "embedding": digest, "view": "native"})
             self.coordinates = coordinates
             self.umap_record = umap_record
@@ -300,6 +318,12 @@ class FeatureAnalysis:
             raise ValueError("已保存 UMAP 与矩阵不一致")
         coordinates = pd.read_parquet(path)
         rows = pd.read_parquet(self.matrix_path / "event_rows.parquet")
+        scope = record.get("selection_scope")
+        if scope is not None:
+            if (scope.get("policy") != "annotation-start-v1" or scope.get("boundaries_confirmed") is not True
+                    or type(scope.get("start_ns")) is not int or scope["start_ns"] < 0):
+                raise ValueError("已保存 UMAP 的计算范围无效")
+            rows = rows.loc[rows.current_apex_time_ns >= scope["start_ns"]]
         if coordinates.ms_event_id.tolist() != rows.event_id.tolist() or not np.isfinite(coordinates[["UMAP1", "UMAP2"]]).all().all():
             raise ValueError("已保存 UMAP 的事件身份或坐标无效")
         return coordinates, record
@@ -329,6 +353,10 @@ class FeatureAnalysis:
                 "events": self.record["events"] if self.record else 0,
                 "features": self.record["features"] if self.record else 0,
                 "has_umap": self.coordinates is not None, "view": self.state["view"],
+                "base_coordinates_available": self.app.base_coordinates_available(),
+                "selection_scope": self.selection_scope(),
+                "scope_warning": self.scope_warning(),
+                "umap_events": len(self.coordinates) if self.coordinates is not None else 0,
                 "actual_parameters": (self.umap_record or {}).get("actual"),
                 "defaults": DEFAULTS}
 

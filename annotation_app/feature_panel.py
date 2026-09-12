@@ -5,8 +5,9 @@ FEATURE_PANEL = r'''
         <p id="nativeFeatureTitle" class="side-title">矩阵与原生 UMAP</p>
         <p id="nativeFeatureSummary" class="attach-map-copy">正在读取矩阵…</p>
         <div class="attach-map-actions">
-          <button id="importNativeFeatures" class="small-button secondary" type="button">补充或更新矩阵…</button>
+          <button id="importNativeFeatures" class="small-button secondary" type="button">从 ZIP 导入矩阵…</button>
         </div>
+        <p id="nativeScope" class="attach-map-copy"></p>
         <details style="margin-top:12px;">
           <summary>UMAP 计算设置</summary>
           <div class="policy-fields" style="margin-top:10px;">
@@ -19,11 +20,12 @@ FEATURE_PANEL = r'''
         </details>
         <div class="attach-map-actions" style="margin-top:12px;">
           <button id="runNativeUmap" class="small-button" type="button" disabled>计算 UMAP</button>
-          <label for="nativeUmapView">坐标来源</label>
+          <button id="useNativeUmap" class="small-button secondary" type="button" hidden>使用已保存 UMAP</button>
+          <span id="nativeViewField" hidden><label for="nativeUmapView">坐标来源</label>
           <select id="nativeUmapView" aria-label="坐标来源" disabled>
-            <option value="base">项目原有坐标</option>
+            <option value="base">导入的 CSV 坐标</option>
             <option value="native">原生 UMAP</option>
-          </select>
+          </select></span>
         </div>
         <p id="nativeFeatureStatus" class="attach-map-copy" role="status" aria-live="polite"></p>
       </section>
@@ -42,6 +44,7 @@ FEATURE_SCRIPT = r'''
       if (project !== state.meta?.project_id || meta.project_id !== project || request !== nativeRequest) return false;
       state.meta = meta;
       syncUmapButtonState();
+      updateAttachMapControls();
       notifyStateChannel('native-umap');
       return true;
     }
@@ -53,7 +56,10 @@ FEATURE_SCRIPT = r'''
         : (info.can_import ? '从 LMA 事件包 ZIP 补充同一批事件的矩阵。'
           : '此项目使用已有坐标；接入原生矩阵需用 LMA 事件包另建项目。');
       el('importNativeFeatures').disabled = nativeBusy || !info.can_import;
-      el('runNativeUmap').disabled = nativeBusy || !info.available;
+      el('runNativeUmap').disabled = nativeBusy || !info.available || !info.selection_scope.boundaries_confirmed;
+      el('nativeViewField').hidden = !(info.base_coordinates_available && info.has_umap);
+      el('useNativeUmap').hidden = !info.has_umap || info.base_coordinates_available || info.view === 'native';
+      el('useNativeUmap').disabled = nativeBusy;
       el('runNativeUmap').textContent = nativeBusy ? '计算中…' : info.has_umap ? '重新计算 UMAP' : '计算 UMAP';
       el('nativeUmapView').disabled = nativeBusy || !info.has_umap;
       el('nativeUmapView').value = info.view;
@@ -62,10 +68,16 @@ FEATURE_SCRIPT = r'''
       const actual = info.actual_parameters;
       el('nativeActualSettings').textContent = info.has_umap && actual
         ? `已保存结果：${actual.n_pcs} 个主成分，${actual.n_neighbors} 个邻居，随机种子 ${actual.random_state}。` : '';
+      const scope = info.selection_scope;
+      el('nativeScope').textContent = scope.boundaries_confirmed
+        ? `计算 ${scope.start_ns / 60000000000} min 起的事件；此前事件不参与，后段 QC 暂保留。`
+        : '请先在配置中确认全部前段边界，再计算 UMAP。';
       if (info.job?.status === 'failed') {
         el('nativeFeatureStatus').textContent = `计算失败：${info.job.message}。已有坐标保持不变。`;
+      } else if (info.scope_warning && !nativeBusy) {
+        el('nativeFeatureStatus').textContent = info.scope_warning;
       } else if (info.has_umap && info.actual_parameters && !nativeBusy) {
-        el('nativeFeatureStatus').textContent = 'UMAP 已保存，可从顶部 UMAP 查看。';
+        el('nativeFeatureStatus').textContent = `UMAP 已保存：${Number(info.umap_events).toLocaleString()} 个事件点。可从顶部 UMAP 查看。`;
       } else el('nativeFeatureStatus').textContent = info.job?.message || '';
     }
 
@@ -135,12 +147,12 @@ FEATURE_SCRIPT = r'''
       }
     });
 
-    el('nativeUmapView').addEventListener('change', async () => {
+    async function selectCoordinateView(view) {
       if (state.actionBusy || nativeBusy) return;
       state.actionBusy = true;
       const project = state.meta.project_id;
       try {
-        await postJson('/api/feature-umap/view', {project_id:state.meta.project_id, view:el('nativeUmapView').value});
+        await postJson('/api/feature-umap/view', {project_id:state.meta.project_id, view});
         nativeMetaPending = true;
         if (await updateFeatureMeta(project, nativeRequest)) nativeMetaPending = false;
         el('nativeFeatureStatus').textContent = '坐标视图已切换，标注与时间模型保持不变。';
@@ -150,5 +162,7 @@ FEATURE_SCRIPT = r'''
         if (!nativeMetaPending) state.actionBusy = false;
         await refreshFeaturePanel();
       }
-    });
+    }
+    el('nativeUmapView').addEventListener('change', () => selectCoordinateView(el('nativeUmapView').value));
+    el('useNativeUmap').addEventListener('click', () => selectCoordinateView('native'));
 '''

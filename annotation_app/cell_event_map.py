@@ -188,9 +188,8 @@ def _csv_header(path: Path) -> list[str]:
 def read_source_coordinates(path: Path) -> pd.DataFrame:
     """Load event times plus an optional, complete UMAP coordinate pair.
 
-    ``UMAP`` is accepted as an explicit alias for ``UMAP1`` only when paired
-    with ``UMAP2``.  No cluster, label, or other numeric column is guessed as a
-    coordinate.
+    Only UMAP1/UMAP2 are accepted for new imports; other numeric columns
+    are never guessed as coordinates.
     """
 
     path = path.expanduser().resolve()
@@ -215,17 +214,14 @@ def read_source_coordinates(path: Path) -> pd.DataFrame:
         raise CellEventMapError(f"UMAP 坐标列不能重复: {details}")
 
     exact_pair = coordinate_counts["UMAP1"] == 1 and coordinate_counts["UMAP2"] == 1
-    alias_pair = coordinate_counts["UMAP"] == 1 and coordinate_counts["UMAP2"] == 1
     no_coordinates = all(count == 0 for count in coordinate_counts.values())
     if exact_pair and coordinate_counts["UMAP"] == 0:
         coordinate_mapping = {"UMAP1": "UMAP1", "UMAP2": "UMAP2"}
-    elif alias_pair and coordinate_counts["UMAP1"] == 0:
-        coordinate_mapping = {"UMAP1": "UMAP", "UMAP2": "UMAP2"}
     elif no_coordinates:
         coordinate_mapping = {}
     else:
         raise CellEventMapError(
-            "UMAP1（或 UMAP）与 UMAP2 必须成对提供；"
+            "UMAP1 与 UMAP2 必须成对提供；不接受 UMAP 别名；"
             + ", ".join(
                 f"{column}={coordinate_counts[column]}"
                 for column in ("UMAP1", "UMAP", "UMAP2")
