@@ -1,4 +1,5 @@
 import csv
+from io import BytesIO
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,6 +86,31 @@ def core_events(scan: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 class Hsc2EventRosterRegressionTest(unittest.TestCase):
+    def test_shared_string_ids_and_roster_integer_ids_roundtrip_without_scientific_changes(self):
+        scan = synthetic_zero_inflated_scan()
+        events, _ = core_events(scan)
+        # The shared caller uses strings; the legacy roster helper uses ints.
+        events['scan_id'] = events['scan_id'].astype('string')
+        before = events.copy(deep=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.write_roster(Path(tmp), scan, 1004)
+            merged, canonical, metadata, _ = reconcile_event_roster_supported_ms_events(
+                source, events, scan)
+            buffer = BytesIO()
+            merged.to_parquet(buffer, index=False)
+            buffer.seek(0)
+            restored = pd.read_parquet(buffer)
+        pd.testing.assert_frame_equal(events, before)
+        pd.testing.assert_frame_equal(merged, restored)
+        pd.testing.assert_frame_equal(
+            before.reset_index(drop=True),
+            restored.loc[restored.event_id.isin(before.event_id), before.columns].reset_index(drop=True))
+        added = restored.loc[restored.event_tier.eq('roster_supported')]
+        self.assertEqual(metadata['roster_supported_event_count'], 1)
+        self.assertEqual(added.scan_id.tolist(), [str(scan.at[1004, 'scan_id'])])
+        self.assertEqual(canonical.ms_event_id.tolist(), added.event_id.tolist())
+        self.assertEqual(canonical[['UMAP1', 'UMAP2']].values.tolist(), [[1.0, -1.0]])
+
     def write_roster(self, root: Path, scan: pd.DataFrame, index: int) -> Path:
         path = root / "events.csv"
         with path.open("w", encoding="utf-8", newline="") as handle:

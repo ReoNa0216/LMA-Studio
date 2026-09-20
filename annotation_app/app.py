@@ -114,7 +114,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.7.0"
+APP_VERSION = "lma_studio_v0.7.1"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -8149,6 +8149,11 @@ def reconcile_event_roster_supported_ms_events(
             ).reset_index(drop=True)
 
     if not selected_support.empty:
+        # Shared-core scan IDs are strings; the legacy roster helper emits
+        # integers. Keep identity values intact and use the shared storage
+        # contract before concatenation (mixed objects cannot roundtrip in Arrow).
+        events["scan_id"] = events["scan_id"].astype("string")
+        selected_support["scan_id"] = selected_support["scan_id"].astype("string")
         events = pd.concat([events, selected_support], ignore_index=True, sort=False)
     events = events.sort_values(["time_min", "event_id"], kind="stable").reset_index(
         drop=True
@@ -9907,7 +9912,15 @@ class AppData:
                     pd.read_parquet(existing_outputs[3]),
                     tolerance_sec=DEFAULT_MATCH_TOLERANCE_SEC,
                 )
-                reconciled_ms_events.to_parquet(existing_outputs[2], index=False)
+                try:
+                    reconciled_ms_events.to_parquet(existing_outputs[2], index=False)
+                except Exception as exc:
+                    LOGGER.exception("Failed to save reconciled MS events during project creation")
+                    raise BadRequest(
+                        "MS 事件表保存失败；项目未创建。原始文件未改动，"
+                        "具体原因已记录到运行日志。",
+                        code="ms_event_storage_failed",
+                    ) from exc
                 if not roster_support_audit.empty:
                     roster_support_audit.to_csv(
                         project_dir
