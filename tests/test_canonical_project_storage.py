@@ -271,6 +271,36 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
 
 
 class CanonicalProjectStorageTest(unittest.TestCase):
+    def test_reconciled_event_write_failure_is_explained_logged_and_rolled_back(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            request = _new_project_request(root, 'failed-storage-project')
+            original_write = pd.DataFrame.to_parquet
+            event_writes = 0
+
+            def fail_reconciled_write(frame, path, *args, **kwargs):
+                nonlocal event_writes
+                if Path(path).name == 'ms_events.parquet':
+                    event_writes += 1
+                    if event_writes == 2:
+                        raise OSError('write failed for scan_id')
+                return original_write(frame, path, *args, **kwargs)
+
+            with mock.patch('annotation_app.app.run_preprocessing_script',
+                            side_effect=_write_synthetic_preprocessor_outputs), \
+                 mock.patch.object(pd.DataFrame, 'to_parquet', new=fail_reconciled_write), \
+                 self.assertLogs(app_module.LOGGER, level='ERROR') as logs, \
+                 self.assertRaises(BadRequest) as raised:
+                AppData.create_project_from_raw_inputs(**request)
+            self.assertEqual(raised.exception.code, 'ms_event_storage_failed')
+            public = app_module.bad_request_response_payload(raised.exception)
+            self.assertIn('MS 事件表保存失败', public['error'])
+            self.assertNotIn('重新生成预览', public['error'])
+            self.assertIn('write failed for scan_id', '\n'.join(logs.output))
+            self.assertFalse(request['project_dir'].exists())
+            self.assertFalse(list(root.glob('.*.lma-building-*')))
+            self.assertEqual(request['ms_path'].read_bytes(), b'synthetic-ms')
+
     def test_failed_event_map_import_returns_diagnostics_without_publishing_project(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
