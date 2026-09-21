@@ -13301,6 +13301,20 @@ class AppData:
             trace_parts.append(part[part["plot_time_min"].between(context_start_min, context_end_min, inclusive="both")])
         trace_window = pd.concat(trace_parts, ignore_index=True) if trace_parts else pd.DataFrame()
 
+        saved_window_annotations = self.window_annotations(
+            start_min,
+            end_min,
+            context_start_min=context_start_min,
+            context_end_min=context_end_min,
+            alignment=request_alignment,
+            time_model=request_time_model,
+        )
+        saved_relation_peak_ids = {
+            identity
+            for row in saved_window_annotations
+            for kind, identity in review_relation_resources(row)
+            if kind == "lif"
+        }
         peak_parts = []
         active_peak_detection = self.active_lif_peak_detection()
         for channel, sub in self.lif_peaks.groupby("channel", sort=False):
@@ -13317,7 +13331,10 @@ class AppData:
                     active_peak_detection
                 )
             if not bool(include_weak_lif_peaks):
-                part = automatic_lif_peak_evidence(part).copy()
+                # The weak-peak toggle only hides additional search candidates.
+                # Saved relationships must retain their visible endpoint evidence.
+                core_ids = set(automatic_lif_peak_evidence(part)["peak_id"].astype(str))
+                part = part[part["peak_id"].astype(str).isin(core_ids | saved_relation_peak_ids)].copy()
             part["raw_time_min"] = part["time_min"]
             part["raw_time_sec"] = part["time_sec"]
             part["plot_time_min"] = part["time_min"] + shift_min
@@ -13545,14 +13562,7 @@ class AppData:
         }
         annotations = [
             row
-            for row in self.window_annotations(
-                start_min,
-                end_min,
-                context_start_min=context_start_min,
-                context_end_min=context_end_min,
-                alignment=request_alignment,
-                time_model=request_time_model,
-            )
+            for row in saved_window_annotations
             if str(row.get("annotation_id")) not in represented_relation_ids
         ]
         def unique_review_counts(
@@ -18476,6 +18486,7 @@ HTML = r"""<!doctype html>
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
+        updateAcceptWindowButton();
       }
     }
 
@@ -18497,6 +18508,7 @@ HTML = r"""<!doctype html>
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
+        updateAcceptWindowButton();
       }
     }
 
@@ -18848,10 +18860,11 @@ HTML = r"""<!doctype html>
       const rows = batchAcceptableAutoCandidatesInMainWindow();
       const n = rows.length;
       if (state.actionBusy || el('acceptWindow').disabled || n === 0) return;
-      if (!confirm(`接受本屏 ${n} 条待审关系？`)) return;
       const invalidation = confirmQcEvidenceInvalidation('pending', 'accepted');
       if (invalidation === null) return;
       state.actionBusy = true;
+      updateAcceptWindowButton();
+      showInteractionHint(`正在接受 ${n} 条待审关系…`);
       try {
         const response = await postJson('/api/accept-window', {
           start_min: state.current.start_min,
@@ -18867,10 +18880,12 @@ HTML = r"""<!doctype html>
         const accepted = Number(response.result?.accepted_count || 0);
         const skipped = Number(response.result?.skipped_count || 0);
         if (accepted !== n || skipped > 0) {
-          alert(`批量审核结果：接受 ${accepted} 条，跳过 ${skipped} 条。窗口状态可能已发生变化，请按当前列表继续审核。`);
+          showInteractionHint(`已接受 ${accepted} 条，跳过 ${skipped} 条，请检查当前列表。`);
+        } else {
+          showInteractionHint(`已接受 ${accepted} 条待审关系`);
         }
       } catch (err) {
-        alert(`批量接受失败: ${err.message}`);
+        showInteractionHint(`批量接受失败：${err.message}`);
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
@@ -18986,6 +19001,7 @@ HTML = r"""<!doctype html>
         } finally {
           state.actionBusy = false;
           renderQcRefitPanel();
+          updateAcceptWindowButton();
         }
         return;
       }
@@ -19033,6 +19049,7 @@ HTML = r"""<!doctype html>
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
+        updateAcceptWindowButton();
       }
     }
 
@@ -19605,6 +19622,9 @@ HTML = r"""<!doctype html>
                 c.setAttribute('pointer-events', 'none');
               }
               signalLayer.appendChild(c);
+              // Saved connectors need endpoint coordinates even when a weak
+              // peak is not enabled as an additional manual-selection target.
+              markerPositions[`lif:${p.peak_id}`] = { x: trackXScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
               if (weakPeak && state.showWeakLifPeaks) {
                 const activateWeakPeak = () => {
                   if (state.stage !== 'event_annotation') {
@@ -19637,10 +19657,7 @@ HTML = r"""<!doctype html>
                 signalLayer.appendChild(weakHit);
               }
               if (interactive && labelIds.has(String(p.peak_id))) {
-                markerPositions[`lif:${p.peak_id}`] = { x: trackXScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
                 addTimeLabel(signalLayer, fmt(p.raw_time_min ?? p.time_min, 3), trackXScale(p.plot_time_min), yScale(peakY), top, signalBottom, x1, colorForChannel(p.channel), labelBoxes, state.peakLabelMode === 'all');
-              } else if (interactive) {
-                markerPositions[`lif:${p.peak_id}`] = { x: trackXScale(p.plot_time_min), y: yScale(peakY), channel: p.channel };
               }
             });
         } else {

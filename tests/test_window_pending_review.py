@@ -176,6 +176,78 @@ class WindowPendingReviewTest(unittest.TestCase):
                     app.accept_pending_auto_candidates_in_window(24, 1, mode, stage)
             self.assertEqual(before, app.store.db_path.read_bytes())
 
+    def test_saved_weak_endpoint_remains_visible_without_enabling_unpaired_weak_peaks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_app(Path(tmp))
+            peaks = app.lif_peaks.copy()
+            extra = peaks.loc[peaks.peak_id.eq('g1-weak')].copy()
+            extra['peak_id'] = 'unpaired-weak'
+            object.__setattr__(app, 'lif_peaks', pd.concat([peaks, extra], ignore_index=True))
+            original_peaks = app.lif_peaks.copy()
+            before = app.window(24, 1, 'aligned')
+            self.assertNotIn('g1-weak', {p['peak_id'] for p in before['lif_peaks']})
+            row = self.pending(app, 'G1', 'g1-weak', 'ms-cell-2')
+            for status in ('pending', 'accepted', 'rejected'):
+                if status != 'pending':
+                    app.review_annotation(row['annotation_id'], status)
+                window = app.window(24, 1, 'aligned')
+                ids = {p['peak_id'] for p in window['lif_peaks']}
+                self.assertIn('g1-weak', ids)
+                self.assertNotIn('unpaired-weak', ids)
+                self.assertFalse(window['display_options']['include_weak_lif_peaks'])
+                self.assertFalse(any(r.get('lif_peak_id') == 'unpaired-weak'
+                                     for r in window['cell_candidates']))
+            pd.testing.assert_frame_equal(original_peaks, app.lif_peaks)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for production UI logic")
+    def test_single_review_unlocks_batch_button_after_busy_window_refresh(self):
+        start = HTML.index('    async function reviewCandidate(')
+        review = HTML[start:HTML.index('    async function clearManualAnnotation(', start)]
+        start = HTML.index('    function updateAcceptWindowButton(')
+        update = HTML[start:HTML.index('\n    function ', start + 10)]
+        script = "\n".join([
+            "const assert = require('node:assert/strict');",
+            """
+            const rows = [{annotation_id:'a',review_status:'pending'},
+                          {annotation_id:'b',review_status:'pending'},
+                          {annotation_id:'c',review_status:'pending'}];
+            const nodes = new Map();
+            const el = id => {if (!nodes.has(id)) nodes.set(id,{}); return nodes.get(id);};
+            const state = {stage:'event_annotation',actionBusy:false,axisFineTuneShifts:null,
+                           timelineAdjustOpen:false,current:{start_min:55,end_min:56,
+                           time_mode:'aligned',time_model:{status:'frozen'}}};
+            const candidateRows = () => rows;
+            const rowId = r => r.annotation_id;
+            const batchAcceptableAutoCandidatesInMainWindow = () => rows.filter(r=>r.review_status==='pending');
+            const confirmQcEvidenceInvalidation = () => ({});
+            const showInteractionHint = () => {};
+            const notifyStateChannel = () => {};
+            const renderQcRefitPanel = () => {};
+            const alert = message => {throw Error(message);};
+            const postJson = async (url,payload) => {
+              assert.equal(url,'/api/review');
+              rows.find(r=>r.annotation_id===payload.annotation_id).review_status=payload.review_status;
+            };
+            const loadWindow = async () => {
+              updateAcceptWindowButton();
+              assert.equal(el('acceptWindow').disabled,true,'Refresh happens while saving');
+            };
+            """,
+            update, review,
+            """
+            (async () => {
+              updateAcceptWindowButton();
+              assert.equal(el('acceptWindow').disabled,false);
+              await reviewCandidate('a','rejected');
+              assert.equal(el('acceptWindow').textContent,'接受本屏待审（2）');
+              assert.equal(el('acceptWindow').disabled,false);
+              assert.equal(state.actionBusy,false);
+            })().catch(error=>{console.error(error);process.exitCode=1;});
+            """,
+        ])
+        result = subprocess.run(['node','-e',script], capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(shutil.which("node"), "Node required for production UI logic")
     def test_stage_render_keeps_batch_button_visible_and_updates_its_state(self):
         def fn(name):
