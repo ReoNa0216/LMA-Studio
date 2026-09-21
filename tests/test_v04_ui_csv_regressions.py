@@ -278,21 +278,21 @@ class V04UiRegressionTest(unittest.TestCase):
             r"createManual['\"]?\)\.textContent\s*=\s*cellMode\s*\?\s*'Save pair'\s*:\s*'Save anchor'",
         )
 
-    def test_cross_channel_ambiguities_are_hidden_by_default_and_grouped_on_request(self):
+    def test_conflicts_are_hidden_by_default_and_use_existing_review_actions(self):
         self.assertIn('id="showCrossChannelConflicts"', HTML)
         self.assertIn('id="crossChannelConflictHint"', HTML)
         self.assertIn("showCrossChannelConflicts: false", HTML)
-        self.assertIn("function pendingCrossChannelConflictGroups", HTML)
+        self.assertIn("function isPendingRelationConflict", HTML)
         self.assertIn("function visibleCellCandidates", HTML)
 
         candidates = javascript_function_body("candidateRows", "manualBelongsToStage")
-        self.assertIn("visibleCellCandidates", candidates)
+        self.assertIn("relationVisibleForReview", candidates)
         self.assertNotIn("选择此通道", HTML)
 
         render = javascript_function_body("renderCandidateList", "confirmQcEvidenceInvalidation")
-        self.assertIn("pendingCrossChannelConflictGroups", render)
-        self.assertRegex(render, r"Use\s+\$\{[^}]*lif_channel")
-        self.assertRegex(render, r"(?i)ambiguous event")
+        self.assertIn("renderCrossChannelConflictControl", render)
+        self.assertIn("冲突待处理", render)
+        self.assertNotIn("data-conflict-candidate-id", render)
 
         draw = javascript_function_body("drawCellCandidates", "drawManualAnnotations")
         self.assertIn("visibleCellCandidates", draw)

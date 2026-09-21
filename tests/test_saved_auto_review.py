@@ -25,6 +25,7 @@ class SavedAutoReviewTest(unittest.TestCase):
             "const state = {current: {time_mode: 'aligned'}, selectedCandidateId: null, showRejected: true};",
             "const manualBelongsToStage = () => true; const colorForChannel = () => '#008080';",
             "const visibleCellCandidates = () => state.current.cell_candidates || [];",
+            function('isPendingRelationConflict', 'visibleCellCandidates'),
             "const svgEl = (tag, attrs) => ({attrs}); const appendLineWithHitTarget = (svg, line) => drawn.push(line.attrs);",
             "const qcAnchorMarkerPoints = () => ({}); const appendQcConnectorPolyline = (svg, markers, row, detail, style) => drawn.push({'stroke-dasharray': style.dash});",
             function('candidateLineStyle', 'drawTrackTimeAxis'),

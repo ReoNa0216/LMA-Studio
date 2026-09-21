@@ -114,7 +114,7 @@ DEFAULT_PROJECT_DIR = ROOT
 DEFAULT_RAW_DATA_DIR = ROOT / "CAR-T_data"
 DEFAULT_ANNOTATION_DB_PATH = ROOT / "annotation_app/annotations/annotation.sqlite"
 WRITE_TOKEN = uuid.uuid4().hex
-APP_VERSION = "lma_studio_v0.7.1"
+APP_VERSION = "lma_studio_v0.7.2"
 APP_DISPLAY_NAME = "LMA Studio"
 
 
@@ -1971,21 +1971,33 @@ def qc_group_batch_accept_block_reason(
 ) -> str | None:
     if group.get("review_enabled") is False:
         return "review_disabled"
-    if group.get("source") != "auto_candidate":
-        return "not_auto_candidate"
+    if group.get("source") not in {"auto_candidate", "manual_created"}:
+        return "not_reviewable"
     if group.get("review_status") != "pending":
         return f"status_{group.get('review_status')}"
-    reason = qc_group_auto_accept_block_reason(group)
-    if reason:
-        return reason
+    # This is an explicit human review action, not automatic evidence selection.
+    # Nearby alternatives, partial anchors and residual scores are not vetoes.
+    if group.get("component_ambiguous") and group.get("source") == "auto_candidate":
+        return "ambiguous_ms_choice"
+    if group.get("projection_unavailable"):
+        return "projection_unavailable"
     if window_start_min is not None and window_end_min is not None:
-        plot_times = qc_group_plot_times(group)
-        if not plot_times or not all(
-            float(window_start_min) <= value <= float(window_end_min)
-            for value in plot_times
+        if not front_qc_group_belongs_to_window(
+            group, float(window_start_min), float(window_end_min)
         ):
             return "outside_main_window"
     return None
+
+
+def review_relation_resources(row: dict[str, Any]) -> set[tuple[str, str]]:
+    """Physical identities that cannot be assigned to two accepted relations."""
+    peaks = set(str(value) for value in qc_anchor_peak_id_map(row).values() if value)
+    if row.get("lif_peak_id"):
+        peaks.add(str(row["lif_peak_id"]))
+    keys = {("lif", peak) for peak in peaks}
+    if row.get("ms_event_id"):
+        keys.add(("ms", str(row["ms_event_id"])))
+    return keys
 
 
 def candidate_id_for_group(group: dict[str, Any]) -> str:
@@ -4206,6 +4218,55 @@ class AnnotationStore:
             "annotation_record_index",
         )
         return {"annotation_id": annotation_id, "deleted": True, "source": "manual_created"}
+
+    def accept_pending_batch(
+        self,
+        prepared: list[dict[str, Any]],
+        *,
+        expected_records: list[dict[str, Any]],
+        window_start_min: float,
+        window_end_min: float,
+        time_mode: str,
+        invalidate_qc_alignment_model: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Save the reviewed screen as one transaction, including its audit trail."""
+        accepted = []
+        timestamp = now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_records = {
+                row["annotation_id"]: self._decode_annotation_row(row)
+                for row in conn.execute("SELECT * FROM annotations")
+            }
+            if current_records != {row["annotation_id"]: row for row in expected_records}:
+                raise BadRequest("标注状态已改变，请刷新当前窗口后再批量接受")
+            if prepared and invalidate_qc_alignment_model:
+                self._invalidate_qc_alignment_model_in_conn(
+                    conn, reason="qc_calibration_review_change",
+                    annotation_id=prepared[0]["annotation_id"],
+                )
+            for item in prepared:
+                annotation_id, source, payload = item["annotation_id"], item["source"], item["payload"]
+                previous = current_records.get(annotation_id, {})
+                if previous and previous.get("review_status") != "pending":
+                    raise BadRequest("批量接受只能处理待审关系，请刷新后重试")
+                current = {
+                    **previous, **payload, "annotation_id": annotation_id,
+                    "source": source, "review_status": "accepted", "exportable": True,
+                    "updated_at": timestamp,
+                }
+                current.setdefault("created_at", timestamp)
+                self._upsert_annotation_row(conn, current)
+                self._insert_audit_row(conn, self._audit_row(
+                    annotation_id=annotation_id, source=source, review_status="accepted",
+                    payload=payload, action="window_pending_accepted", previous=previous,
+                    timestamp=timestamp, window_start_min=window_start_min,
+                    window_end_min=window_end_min, time_mode=time_mode,
+                    reason_code="human_window_review", notes=None,
+                ))
+                accepted.append(current)
+        invalidate_request_cached_reads(self, "annotation_records", "annotation_record_index")
+        return accepted
 
     def upsert_review(
         self,
@@ -11989,6 +12050,31 @@ class AppData:
             self.reset_to_automatic_qc_alignment()
         return row
 
+    def saved_review_payload(self, existing: dict[str, Any]) -> dict[str, Any]:
+        projected_existing = self.project_saved_relation(existing)
+        payload = {
+            key: value
+            for key, value in projected_existing.items()
+            if key
+            not in {
+                "annotation_id",
+                "source",
+                "review_status",
+                "exportable",
+                "created_at",
+                "updated_at",
+                "decision_time_model_version",
+                "projection_time_model_version",
+                "projection_revision_changed",
+                "projection_unavailable",
+                "needs_review",
+                "review_reason",
+                "projection_tolerance_sec",
+            }
+        }
+        payload.update(self.time_model_payload_fields())
+        return payload
+
     def review_annotation(
         self,
         annotation_id: str,
@@ -12045,27 +12131,7 @@ class AppData:
                 }
                 if annotation_id not in visible_ids:
                     raise BadRequest(f"Saved candidate_id outside active window: {annotation_id}")
-            payload = {
-                key: value
-                for key, value in projected_existing.items()
-                if key
-                not in {
-                    "annotation_id",
-                    "source",
-                    "review_status",
-                    "exportable",
-                    "created_at",
-                    "updated_at",
-                    "decision_time_model_version",
-                    "projection_time_model_version",
-                    "projection_revision_changed",
-                    "projection_unavailable",
-                    "needs_review",
-                    "review_reason",
-                    "projection_tolerance_sec",
-                }
-            }
-            payload.update(self.time_model_payload_fields())
+            payload = self.saved_review_payload(existing)
             if str(payload.get("review_stage") or "") == "qc_calibration":
                 self.require_confirmed_calibration("审核前段校准证据")
             if review_status == "accepted":
@@ -12831,6 +12897,50 @@ class AppData:
             or str(row.get("review_status")) == "accepted"
         ]
 
+    def window_review_rows(self, window: dict[str, Any], stage: str) -> list[dict[str, Any]]:
+        stages = ({"qc_calibration"} if stage == "qc_calibration"
+                  else {"qc_survey", "cell_annotation"})
+        by_id = {}
+        for key in ("alignment_groups", "post_qc_candidates", "cell_candidates", "cell_qc_anchors", "annotations"):
+            for row in window.get(key, []):
+                if self.annotation_review_stage(row) in stages:
+                    by_id[str(row["annotation_id"])] = row
+        return list(by_id.values())
+
+    def mark_window_batch_eligibility(self, window: dict[str, Any]) -> None:
+        # Score warnings do not prevent human acceptance. Only actual competing
+        # physical relations, unresolved choices and workflow locks do.
+        for stage in ("qc_calibration", "event_annotation"):
+            rows = self.window_review_rows(window, stage)
+            owners: dict[tuple[str, str], set[str]] = {}
+            existing = [row for row in self.store.records()
+                        if row.get("review_status") == "accepted"
+                        and (self.annotation_review_stage(row) == "qc_calibration") == (stage == "qc_calibration")]
+            for row in [*existing, *rows]:
+                if row.get("review_status") == "rejected":
+                    continue
+                for key in review_relation_resources(row):
+                    owners.setdefault(key, set()).add(str(row["annotation_id"]))
+            for row in rows:
+                reason = qc_group_batch_accept_block_reason(row)
+                if reason is None:
+                    if stage == "qc_calibration":
+                        inside = front_qc_group_belongs_to_window(row, window["start_min"], window["end_min"])
+                    else:
+                        lif_times = list((row.get("lif_anchor_plot_times_min") or {}).values())
+                        lif_times.append(row.get("lif_plot_time_min"))
+                        inside = saved_relation_belongs_to_window(
+                            ms_plot_time_min=row.get("ms_plot_time_min"), lif_plot_times_min=lif_times,
+                            window_start_min=window["start_min"], window_end_min=window["end_min"],
+                            context_start_min=window["context_start_min"], context_end_min=window["context_end_min"],
+                        )
+                    if not inside:
+                        reason = "outside_main_window"
+                    elif any(len(owners[key]) > 1 for key in review_relation_resources(row)):
+                        reason = "competing_relation"
+                row["batch_accept_block_reason"] = reason
+                row["batch_accept_eligible"] = reason is None
+
     def accept_pending_auto_candidates_in_window(
         self,
         start_min: float,
@@ -12838,77 +12948,77 @@ class AppData:
         time_mode: str,
         stage: str = "qc_calibration",
         clear_qc_alignment_model: bool = False,
+        annotation_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        if stage == "cell_annotation":
-            raise BadRequest("Cell candidates require individual review")
-        if stage not in {"qc_calibration", "qc_survey"}:
-            raise BadRequest("stage must be qc_calibration or qc_survey")
-        if stage == "qc_survey" and not self.frozen_time_model():
-            raise BadRequest("Freeze local time model before accepting post-calibration candidates")
+        with request_read_snapshot():
+            return self._accept_pending_window_snapshot(
+                start_min, window_min, time_mode, stage,
+                clear_qc_alignment_model, annotation_ids,
+            )
+
+    def _accept_pending_window_snapshot(
+        self, start_min, window_min, time_mode, stage,
+        clear_qc_alignment_model, annotation_ids,
+    ) -> dict[str, Any]:
+        if stage not in {"qc_calibration", "event_annotation", "cell_annotation", "qc_survey"}:
+            raise BadRequest("当前阶段不能批量接受待审关系")
+        if time_mode != "aligned":
+            raise BadRequest("请切换至对齐视图后审核关系")
+        if stage == "qc_calibration":
+            self.require_confirmed_calibration("批量审核前段校准证据")
+        elif not self.frozen_time_model():
+            raise BadRequest("请先完成后段局部校正并冻结 delta，再接受第三阶段标注")
+        if annotation_ids is not None and (
+            not isinstance(annotation_ids, list)
+            or any(not isinstance(value, str) or not value for value in annotation_ids)
+        ):
+            raise BadRequest("待审关系列表无效，请刷新窗口后重试")
+        expected_records = self.store.records()
         window = self.window(start_min=start_min, window_min=window_min, time_mode=time_mode)
-        source_key = {
-            "qc_calibration": "alignment_groups",
-            "qc_survey": "post_qc_candidates",
-        }[stage]
-        prepared: list[tuple[str, dict[str, Any]]] = []
-        accepted = []
-        skipped = []
-        for group in window.get(source_key, []):
-            block_reason = qc_group_batch_accept_block_reason(
-                group,
-                window_start_min=float(window["start_min"]),
-                window_end_min=float(window["end_min"]),
-            )
-            if block_reason:
-                skipped.append({"annotation_id": group.get("annotation_id"), "reason": block_reason})
+        rows = self.window_review_rows(window, stage)
+        if stage in {"cell_annotation", "qc_survey"}:
+            rows = [row for row in rows if self.annotation_review_stage(row) == stage]
+        selected = set(annotation_ids) if annotation_ids is not None else None
+        if selected is not None and not selected.issubset({str(row["annotation_id"]) for row in rows}):
+            raise BadRequest("待审关系已改变或不在当前窗口，请刷新后重试")
+        prepared, skipped = [], []
+        for row in rows:
+            annotation_id = str(row["annotation_id"])
+            if selected is not None and annotation_id not in selected:
                 continue
-            annotation_id = str(group["annotation_id"])
-            prepared.append(
-                (
-                    annotation_id,
-                    self.payload_from_auto_candidate_id(
-                        annotation_id,
-                        window_start_min=float(window["start_min"]),
-                        window_end_min=float(window["end_min"]),
-                    ),
+            # Previously accepted/rejected records are never part of this action.
+            if row.get("review_status") != "pending":
+                continue
+            reason = row.get("batch_accept_block_reason")
+            if reason:
+                skipped.append({"annotation_id": annotation_id, "reason": reason})
+                continue
+            existing = self.store.get(annotation_id)
+            if existing and (existing.get("source") == "manual_created"
+                             or self.annotation_review_stage(existing) in {"cell_annotation", "qc_survey"}):
+                payload = self.saved_review_payload(existing)
+            else:
+                payload = self.payload_from_auto_candidate_id(
+                    annotation_id, window_start_min=window["start_min"], window_end_min=window["end_min"],
                 )
-            )
-        invalidate_qc_alignment = bool(
-            prepared
-            and stage == "qc_calibration"
-            and self.store.qc_alignment_model()
-        )
+            self.ensure_third_stage_acceptance_allowed(payload, annotation_id=annotation_id)
+            prepared.append({"annotation_id": annotation_id, "source": row["source"], "payload": payload})
+        invalidate_qc_alignment = bool(prepared and stage == "qc_calibration" and self.store.qc_alignment_model())
         if invalidate_qc_alignment and not clear_qc_alignment_model:
-            raise BadRequest(
-                "修改 QC 校正证据会清除已应用的 QC 对齐和下游 time model；请确认后重新重算 QC 对齐"
-            )
-        try:
-            for index, (annotation_id, annotation_payload) in enumerate(prepared):
-                row = self.store.upsert_review(
-                    annotation_id=annotation_id,
-                    source="auto_candidate",
-                    review_status="accepted",
-                    payload=annotation_payload,
-                    action="auto_candidate_accepted",
-                    window_start_min=float(window["start_min"]),
-                    window_end_min=float(window["end_min"]),
-                    time_mode=str(window["time_mode"]),
-                    invalidate_qc_alignment_model=invalidate_qc_alignment and index == 0,
-                )
-                accepted.append(row)
-        finally:
-            if invalidate_qc_alignment and not self.store.qc_alignment_model():
-                self.invalidate_qc_model_request_reads()
-                self.reset_to_automatic_qc_alignment()
+            raise BadRequest("修改 QC 校正证据会清除已应用的 QC 对齐和下游 time model；请确认后重新重算 QC 对齐")
+        accepted = self.store.accept_pending_batch(
+            prepared, expected_records=expected_records,
+            window_start_min=window["start_min"], window_end_min=window["end_min"],
+            time_mode=window["time_mode"], invalidate_qc_alignment_model=invalidate_qc_alignment,
+        )
+        if invalidate_qc_alignment:
+            self.invalidate_qc_model_request_reads()
+            self.reset_to_automatic_qc_alignment()
         return {
-            "accepted_count": len(accepted),
-            "skipped_count": len(skipped),
-            "accepted_annotation_ids": [row["annotation_id"] for row in accepted],
-            "skipped": skipped,
-            "window_start_min": window["start_min"],
-            "window_end_min": window["end_min"],
-            "time_mode": window["time_mode"],
-            "stage": stage,
+            "accepted_count": len(accepted), "skipped_count": len(skipped),
+            "accepted_annotation_ids": [row["annotation_id"] for row in accepted], "skipped": skipped,
+            "window_start_min": window["start_min"], "window_end_min": window["end_min"],
+            "time_mode": window["time_mode"], "stage": stage,
         }
 
     def window_annotations(
@@ -13494,7 +13604,7 @@ class AppData:
                     third_stage_lif_peak_ids.add(str(peak_id))
             if row.get("lif_peak_id"):
                 third_stage_lif_peak_ids.add(str(row["lif_peak_id"]))
-        return {
+        result = {
             "start_min": start_min,
             "end_min": end_min,
             "window_min": window_min,
@@ -13546,6 +13656,8 @@ class AppData:
                 ),
             },
         }
+        self.mark_window_batch_eligibility(result)
+        return result
 
 
 @dataclass(frozen=True)
@@ -15184,9 +15296,9 @@ HTML = r"""<!doctype html>
         </label>
         <label id="crossChannelConflictControl" class="checkbox-row" style="display:none;">
           <input id="showCrossChannelConflicts" type="checkbox" />
-          <span id="crossChannelConflictHint">Show conflicts</span>
+          <span id="crossChannelConflictHint">显示冲突</span>
         </label>
-        <button id="acceptWindow" class="small-button" style="width:100%; margin:8px 0 2px;">接受本窗口待审自动候选</button>
+        <button id="acceptWindow" class="small-button" style="width:100%; margin:8px 0 2px;">接受本屏待审</button>
         <div id="acceptWindowHint" class="empty" style="margin:0 0 6px;">将接受 0 条</div>
         <div id="reviewHelp" class="empty" style="margin:4px 0 8px;">
           残差 = MS760 时间减去 LIF 参考峰校正后的组合时间，单位为秒；越接近 0 表示时间对齐越好。
@@ -17007,28 +17119,13 @@ HTML = r"""<!doctype html>
     }
 
     function stageCounts() {
-      if (!state.current) return { pending: 0, accepted: 0, rejected: 0 };
-      if (state.stage === 'local_calibration') {
-        return { pending: 0, accepted: 0, rejected: 0 };
-      }
-      if (state.stage === 'event_annotation') {
-        const qc = state.current.post_qc_counts || {};
-        const cell = state.current.cell_counts || {};
-        const conflictPending = (state.current.cell_candidates || [])
-          .filter(isPendingCrossChannelConflict).length;
-        const visibleCell = {
-          ...cell,
-          pending: Math.max(0, Number(cell.pending || 0) - conflictPending),
-        };
-        if (state.eventFilter === 'qc') return qc;
-        if (state.eventFilter === 'cell') return visibleCell;
-        return {
-          pending: Number(qc.pending || 0) + Number(visibleCell.pending || 0),
-          accepted: Number(qc.accepted || 0) + Number(visibleCell.accepted || 0),
-          rejected: Number(qc.rejected || 0) + Number(visibleCell.rejected || 0),
-        };
-      }
-      return state.current.annotation_counts || {};
+      const counts = { pending: 0, accepted: 0, rejected: 0 };
+      if (!state.current || state.stage === 'local_calibration') return counts;
+      candidateRows(true, true).forEach(row => {
+        if (row.review_status === 'pending' && isPendingRelationConflict(row)) return;
+        if (row.review_status in counts) counts[row.review_status] += 1;
+      });
+      return counts;
     }
 
     function extent(values) {
@@ -17088,60 +17185,33 @@ HTML = r"""<!doctype html>
       return points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xScale(p.x).toFixed(2)},${yScale(p.y).toFixed(2)}`).join(' ');
     }
 
-    function isPendingCrossChannelConflict(row) {
-      return row?.cross_channel_candidate_conflict === true
-        && String(row?.review_status || 'pending') === 'pending';
+    function isPendingRelationConflict(row) {
+      return row?.review_status === 'pending'
+        && ['competing_relation', 'ambiguous_ms_choice'].includes(row.batch_accept_block_reason);
     }
 
-    function pendingCrossChannelConflictGroups() {
-      if (state.stage !== 'event_annotation' || state.eventFilter === 'qc') return [];
-      const groups = new Map();
-      (state.current?.cell_candidates || [])
-        .filter(row => row?.cross_channel_candidate_conflict === true)
-        .forEach(row => {
-          const key = String(row.ms_event_id || '');
-          if (!key) return;
-          if (!groups.has(key)) groups.set(key, []);
-          groups.get(key).push(row);
-        });
-      return Array.from(groups.entries())
-        .filter(([, rows]) => rows.some(isPendingCrossChannelConflict))
-        .map(([msEventId, rows]) => ({
-          ms_event_id: msEventId,
-          rows: rows.sort((a, b) => (
-            Number(a.abs_residual_sec || 0) - Number(b.abs_residual_sec || 0)
-            || String(a.lif_channel || '').localeCompare(String(b.lif_channel || ''))
-          )),
-        }))
-        .sort((a, b) => Number(a.rows[0]?.ms_plot_time_min || 0) - Number(b.rows[0]?.ms_plot_time_min || 0));
+    function relationVisibleForReview(row) {
+      return !isPendingRelationConflict(row) || state.showCrossChannelConflicts;
     }
 
     function visibleCellCandidates() {
-      return (state.current?.cell_candidates || []).filter(row => (
-        !isPendingCrossChannelConflict(row) || state.showCrossChannelConflicts
-      ));
+      return (state.current?.cell_candidates || []).filter(relationVisibleForReview);
     }
 
     function renderCrossChannelConflictControl() {
-      const groups = pendingCrossChannelConflictGroups();
-      const control = el('crossChannelConflictControl');
-      const visible = groups.length > 0;
-      control.style.display = visible ? 'flex' : 'none';
-      if (!visible) return;
-      const n = groups.length;
-      el('crossChannelConflictHint').textContent = state.showCrossChannelConflicts
-        ? `Show conflicts (${n})`
-        : `${n} ambiguous event${n === 1 ? '' : 's'} hidden`;
+      const n = candidateRows(true).filter(isPendingRelationConflict).length;
+      el('crossChannelConflictControl').style.display = n ? 'flex' : 'none';
+      el('crossChannelConflictHint').textContent = `显示冲突（${n}）`;
     }
 
-    function candidateRows() {
+    function candidateRows(includeConflicts = false, includeRejected = false) {
       let rows = [];
       if (state.stage === 'local_calibration') {
         rows = [];
       } else if (state.stage === 'event_annotation') {
         rows = [
           ...(state.current?.post_qc_candidates || []),
-          ...visibleCellCandidates().filter(row => !isPendingCrossChannelConflict(row)),
+          ...(state.current?.cell_candidates || []),
           ...(state.current?.cell_qc_anchors || []),
         ].filter(eventRowMatchesFilter);
       } else {
@@ -17162,7 +17232,8 @@ HTML = r"""<!doctype html>
         byRelationId.set(id, row);
       });
       return Array.from(byRelationId.values())
-        .filter(row => state.showRejected || row.review_status !== 'rejected')
+        .filter(row => includeConflicts || relationVisibleForReview(row))
+        .filter(row => includeRejected || state.showRejected || row.review_status !== 'rejected')
         .sort((a, b) => Number(a.ms_plot_time_min || a.ms_time_min || 0) - Number(b.ms_plot_time_min || b.ms_time_min || 0));
     }
 
@@ -17197,96 +17268,27 @@ HTML = r"""<!doctype html>
       return state.eventFilter === 'all' || eventRowKind(row) === state.eventFilter;
     }
 
-    function qcCandidatesForCurrentStage() {
-      if (!state.current) return [];
-      if (state.stage !== 'qc_calibration') return [];
-      return state.current.alignment_groups || [];
-    }
-
-    function candidateInsideMainWindow(row) {
-      const start = Number(state.current?.start_min);
-      const end = Number(state.current?.end_min);
-      const anchorTimes = qcAnchorTimes(row, 'plot');
-      const values = [
-        ...qcAnchorChannels(row).map(channel => anchorTimes[channel]),
-        row.ms_plot_time_min
-      ].filter(value => value !== null && value !== undefined && value !== '').map(Number);
-      return values.length >= 2 && values.every(value => Number.isFinite(value) && value >= start && value <= end);
-    }
-
-    function candidateBatchBlockReason(row) {
-      if (row.batch_accept_block_reason !== undefined) return row.batch_accept_block_reason;
-      if (row.review_enabled === false) return 'review_disabled';
-      if (row.source !== 'auto_candidate') return 'not_auto_candidate';
-      if (row.review_status !== 'pending') return `status_${row.review_status}`;
-      if (row.axis_coherent === false) return 'axis_incoherent';
-      if (row.complete_anchor_set === false) return 'partial_anchor_set';
-      if (Number(row.conflict_count || 0) > 0) return 'conflicting_anchor_set';
-      const tolerance = Number(row.match_tolerance_sec || 4);
-      if (Math.abs(Number(row.composite_to_ms_residual_sec || 0)) > tolerance) return 'composite_residual_out_of_tolerance';
-      if (Number.isFinite(Number(row.max_abs_axis_to_ms_residual_sec))
-          && Number(row.max_abs_axis_to_ms_residual_sec) > tolerance) return 'axis_residual_out_of_tolerance';
-      if (!candidateInsideMainWindow(row)) return 'outside_main_window';
-      return null;
-    }
-
-    function batchBlockText(reason, row = {}) {
-      const tolerance = fmt(Number(row.match_tolerance_sec || 4), 1);
-      const labels = {
-        conflicting_anchor_set: '附近有多个可匹配峰',
-        partial_anchor_set: 'LIF 通道不完整',
-        axis_incoherent: '各通道时间不一致',
-        composite_residual_out_of_tolerance: `偏差超过 ${tolerance} sec`,
-        axis_residual_out_of_tolerance: `偏差超过 ${tolerance} sec`,
-        outside_main_window: '部分峰不在主窗口',
-        review_disabled: '当前阶段尚未解锁'
-      };
-      return labels[reason] || '不符合批量接受条件';
-    }
-
-    function pendingAutoCandidatesInMainWindow() {
-      return qcCandidatesForCurrentStage().filter(row => (
-        row.review_enabled !== false
-        && row.source === 'auto_candidate'
-        && row.review_status === 'pending'
-        && candidateInsideMainWindow(row)
-      ));
-    }
-
     function batchAcceptableAutoCandidatesInMainWindow() {
-      return pendingAutoCandidatesInMainWindow().filter(row => !candidateBatchBlockReason(row));
-    }
-
-    function candidateNeedsIndividualReview(row) {
-      const reason = candidateBatchBlockReason(row);
-      return row.source === 'auto_candidate'
-        && row.review_status === 'pending'
-        && Boolean(reason)
-        && reason !== 'outside_main_window';
+      return candidateRows().filter(row => row.review_status === 'pending'
+        && row.batch_accept_eligible === true && row.review_enabled !== false);
     }
 
     function updateAcceptWindowButton() {
-      const pending = pendingAutoCandidatesInMainWindow().length;
       const n = batchAcceptableAutoCandidatesInMainWindow().length;
-      const individual = Math.max(0, pending - n);
-      el('acceptWindow').textContent = `批量接受唯一匹配（${n}）`;
-      if (state.stage === 'qc_calibration' && state.axisFineTuneShifts !== null) {
-        el('acceptWindowHint').textContent = '正在预览时间轴微调；请先应用或取消预览，再审核参考峰';
-        el('acceptWindow').disabled = true;
-        return;
+      el('acceptWindow').textContent = `接受本屏待审（${n}）`;
+      let hint = '';
+      if (state.axisFineTuneShifts !== null || state.timelineAdjustOpen) {
+        hint = '请先应用或取消时间轴调整';
+      } else if (state.stage === 'local_calibration') {
+        hint = '请先完成时间校正';
+      } else if (state.stage === 'qc_calibration' && !calibrationBoundariesConfirmed()) {
+        hint = '请先确认参考段边界';
+      } else if (state.stage === 'event_annotation'
+                 && (state.current?.time_model || state.meta?.time_model || {}).status !== 'frozen') {
+        hint = '请先冻结时间模型';
       }
-      if (state.stage === 'event_annotation' || state.stage === 'local_calibration') {
-        if (state.stage === 'local_calibration') {
-          el('acceptWindowHint').textContent = '后段时间差校正只生成预览，不会写入人工标注';
-        } else {
-          el('acceptWindowHint').textContent = '事件标注阶段的 QC / 细胞候选均需逐条确认';
-        }
-        el('acceptWindow').disabled = true;
-        return;
-      }
-      const tm = state.current?.time_model || state.meta?.time_model || {};
-      el('acceptWindowHint').textContent = `待审 ${pending}：可批量 ${n}${individual ? `，需逐条 ${individual}` : ''}`;
-      el('acceptWindow').disabled = n === 0;
+      el('acceptWindow').disabled = state.actionBusy || Boolean(hint) || n === 0;
+      el('acceptWindowHint').textContent = hint || '已拒绝和冲突关系不纳入';
     }
 
     function renderConfigInputs(resetDraft = false) {
@@ -18355,11 +18357,8 @@ HTML = r"""<!doctype html>
     function renderCandidateList() {
       const box = el('candidateList');
       const rows = candidateRows();
-      const conflictGroups = state.showCrossChannelConflicts
-        ? pendingCrossChannelConflictGroups()
-        : [];
       renderCrossChannelConflictControl();
-      if (!rows.length && !conflictGroups.length) {
+      if (!rows.length) {
         box.innerHTML = '<div class="empty">当前窗口没有可显示候选。</div>';
         return;
       }
@@ -18393,7 +18392,7 @@ HTML = r"""<!doctype html>
           ? '，原状态保留'
           : ambiguousCalibrationMs
           ? ''
-          : candidateNeedsIndividualReview(row) ? '，需逐条审核' : '';
+          : isPendingRelationConflict(row) ? '，冲突待处理' : '';
         const actions = canReview ? `
               ${ambiguousCalibrationMs ? '' : `<button data-action="accepted" data-id="${escapeText(id)}">接受</button>`}
               <button data-action="rejected" data-id="${escapeText(id)}">拒绝</button>
@@ -18408,24 +18407,7 @@ HTML = r"""<!doctype html>
           </div>
         `;
       }).join('');
-      const conflictRowsHtml = conflictGroups.map(group => {
-        const selected = group.rows.some(row => rowId(row) === state.selectedCandidateId) ? ' selected' : '';
-        const first = group.rows[0] || {};
-        const alternatives = group.rows.map(row => (
-          `${channelDisplayLabel(row.lif_channel)} Δ${fmt(decisionDeviationSec(row), 3)}s`
-        )).join('；');
-        const actions = group.rows.map(row => `
-          <button data-conflict-candidate-id="${escapeText(rowId(row))}">Use ${escapeText(row.lif_channel)}</button>
-        `).join('');
-        return `
-          <div class="candidate-row conflict-group${selected}" data-conflict-event-id="${escapeText(group.ms_event_id)}">
-            <div class="row-title"><span>Ambiguous event</span><span>Review only</span></div>
-            <div class="row-sub">MS760 ${escapeText(fmt(first.ms_time_min, 3))} min<br>${escapeText(alternatives)}</div>
-            <div class="row-actions">${actions}<button data-hide-conflicts="true">Hide</button></div>
-          </div>
-        `;
-      }).join('');
-      box.innerHTML = regularRowsHtml + conflictRowsHtml;
+      box.innerHTML = regularRowsHtml;
       box.querySelectorAll('.candidate-row').forEach(node => {
         node.addEventListener('click', (ev) => {
           if (ev.target && ev.target.dataset && ev.target.dataset.action) return;
@@ -18443,21 +18425,6 @@ HTML = r"""<!doctype html>
           } else {
             await reviewCandidate(button.dataset.id, button.dataset.action);
           }
-        });
-      });
-      box.querySelectorAll('button[data-conflict-candidate-id]').forEach(button => {
-        button.addEventListener('click', async (ev) => {
-          ev.stopPropagation();
-          await reviewCandidate(button.dataset.conflictCandidateId, 'accepted');
-        });
-      });
-      box.querySelectorAll('button[data-hide-conflicts]').forEach(button => {
-        button.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          state.showCrossChannelConflicts = false;
-          el('showCrossChannelConflicts').checked = false;
-          state.selectedCandidateId = null;
-          renderCurrentState();
         });
       });
     }
@@ -18879,9 +18846,10 @@ HTML = r"""<!doctype html>
     }
 
     async function acceptWindowPendingAutoCandidates() {
-      const n = batchAcceptableAutoCandidatesInMainWindow().length;
-      if (state.actionBusy || n === 0) return;
-      if (!confirm(`接受当前主窗口内 ${n} 条唯一匹配候选？已接受、已拒绝和需逐条审核的候选不会被修改。`)) return;
+      const rows = batchAcceptableAutoCandidatesInMainWindow();
+      const n = rows.length;
+      if (state.actionBusy || el('acceptWindow').disabled || n === 0) return;
+      if (!confirm(`接受本屏 ${n} 条待审关系？`)) return;
       const invalidation = confirmQcEvidenceInvalidation('pending', 'accepted');
       if (invalidation === null) return;
       state.actionBusy = true;
@@ -18891,6 +18859,7 @@ HTML = r"""<!doctype html>
           window_min: state.current.window_min,
           time_mode: state.current.time_mode,
           stage: state.stage,
+          annotation_ids: rows.map(row => String(rowId(row))),
           ...invalidation
         });
         state.qcRefitPreview = null;
@@ -18906,6 +18875,7 @@ HTML = r"""<!doctype html>
       } finally {
         state.actionBusy = false;
         renderQcRefitPanel();
+        updateAcceptWindowButton();
       }
     }
 
@@ -19846,7 +19816,7 @@ HTML = r"""<!doctype html>
 
     function drawAlignmentGroups(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
-      (state.current.alignment_groups || []).forEach(group => {
+      (state.current.alignment_groups || []).filter(relationVisibleForReview).forEach(group => {
         if (group.review_status === 'rejected') return;
         const alternatives = Array.isArray(group.alternative_ms_event_ids)
           ? group.alternative_ms_event_ids
@@ -19868,7 +19838,7 @@ HTML = r"""<!doctype html>
 
     function drawPostQcCandidates(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
-      (state.current.post_qc_candidates || []).forEach(group => {
+      (state.current.post_qc_candidates || []).filter(relationVisibleForReview).forEach(group => {
         if (group.review_status === 'rejected' && !state.showRejected) return;
         const markerGroup = qcAnchorMarkerPoints(group, markerPositions);
         const lineStyle = candidateLineStyle(group);
@@ -19890,7 +19860,7 @@ HTML = r"""<!doctype html>
         const selected = (row.annotation_id || row.candidate_id) === state.selectedCandidateId;
         const accepted = row.review_status === 'accepted';
         const rejected = row.review_status === 'rejected';
-        const baseColor = row.cross_channel_candidate_conflict && !accepted ? '#d97706' : colorForChannel(row.lif_channel);
+        const baseColor = isPendingRelationConflict(row) ? '#d97706' : colorForChannel(row.lif_channel);
         const line = svgEl('line', {
           x1: lif.x.toFixed(2),
           y1: lif.y.toFixed(2),
@@ -19905,7 +19875,7 @@ HTML = r"""<!doctype html>
         });
         line.__detail = {
           kind: 'cell_candidate',
-          type: row.cross_channel_candidate_conflict ? '跨通道歧义候选（需人工仲裁）' : '细胞候选',
+          type: isPendingRelationConflict(row) ? '冲突待处理' : '细胞候选',
           data: row
         };
         appendLineWithHitTarget(svg, line, row, () => {
@@ -19918,7 +19888,7 @@ HTML = r"""<!doctype html>
 
     function drawManualAnnotations(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
-      (state.current.annotations || [])
+      (state.current.annotations || []).filter(relationVisibleForReview)
         .filter(row => manualBelongsToStage(row, state.stage))
         .filter(row => state.stage !== 'event_annotation' || eventRowKind(row) === 'qc')
         .forEach(row => {
@@ -19940,7 +19910,7 @@ HTML = r"""<!doctype html>
 
     function drawManualCellAnnotations(svg, markerPositions) {
       if (state.current.time_mode !== 'aligned') return;
-      (state.current.annotations || [])
+      (state.current.annotations || []).filter(relationVisibleForReview)
         .filter(row => manualBelongsToStage(row, 'cell_annotation'))
         .forEach(row => {
           if (row.review_status === 'rejected' && !state.showRejected) return;
@@ -20167,10 +20137,7 @@ HTML = r"""<!doctype html>
         lines.push(`多个可信 MS 峰：${alternatives.map(value => fmt(value, 3)).join(', ')} min`);
         lines.push('请使用 Select peaks 人工选择');
       }
-      if (row.review_status === 'pending') {
-        const reason = candidateBatchBlockReason(row);
-        if (reason && reason !== 'outside_main_window') lines.push(`需逐条审核：${batchBlockText(reason, row)}`);
-      }
+      if (isPendingRelationConflict(row)) lines.push('冲突待处理，不纳入批量接受');
       return lines.filter(Boolean);
     }
 
@@ -21178,6 +21145,7 @@ class AnnotationHandler(BaseHTTPRequestHandler):
                     time_mode=time_mode,
                     stage=stage,
                     clear_qc_alignment_model=bool(payload.get("clear_qc_alignment_model")),
+                    annotation_ids=payload.get("annotation_ids"),
                 )
                 self.send_json({"ok": True, "result": result, "summary": self.data.store.summary()})
                 return

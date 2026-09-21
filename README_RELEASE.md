@@ -1,21 +1,26 @@
-# LMA Studio v0.7.1 Release Notes
+# LMA Studio v0.7.2 Release Notes
+
+本机测试版，等待用户验收；尚未发布 GitHub Release。
+Local test build awaiting user acceptance; not yet published on GitHub.
 
 ## 中文
 
-本版修复外部事件 CSV 导入时的一处保存错误：当常规检峰结果与补充复核事件同时出现，扫描编号的数据类型不一致可能导致项目创建失败。现在合并前统一编号的存储类型。
+“接受本屏待审”现在覆盖前段校准与事件标注中的明确关系，包括自动候选和人工保存的待审关系。附近候选峰、通道不完整或偏差评分不再单独阻止这次明确的人工批量审核。
 
-- 不改变检峰阈值、峰顶、强度、事件身份、CSV 坐标或人工标签。
-- MS 事件表保存失败时显示具体阶段，并在运行日志保留原始异常；失败项目仍完整回滚。
-- 已有项目继续使用保存的数据，无需迁移或重新检峰。
+- 仅处理当前窗口和当前筛选内的待审关系，保留已接受、已拒绝及窗口外记录。
+- 真正互斥的关系默认不画普通待审线、不计入按钮数量，可从“显示冲突”展开。拒绝错误关系后，剩下的唯一关系恢复为普通待审；不会自动选择胜者或写入重复标签。
+- 标注和审计记录整批保存；失败完整回滚，审核状态中途改变时要求刷新。
+- 保留参考段确认、时间模型冻结和微调预览期间的限制。不改变检峰、候选评分、原始数据或已有标注；已有项目无需重建。
 
-验证：P39 完整原始数据建项与重开通过，369 行外部事件坐标保持不变；MPP、LSK、CAR-T-Bez 旧项目的新旧版本对照一致。Windows 本机 511 项测试中 509 通过、2 跳过，Windows/macOS 构建及打包运行检查通过。macOS 尚未进行本轮真机界面验收。
+验证：Windows 全量522项测试，520通过、2跳过；补充UI/审核回归55项通过。MPP、LSK、CAR-T-Bez、P39副本重开通过，原项目未改变；MPP/LSK副本中的受控待审关系批量接受并重开成功。等待用户Dist验收，尚未做本轮macOS构建或真机测试。
 
 ## English
 
-This release fixes project creation from an external event CSV when shared-core events and roster-supported events have different scan-ID storage types. IDs are normalized before the tables are merged.
+“Accept pending in this view” now covers explicit front-calibration and event-annotation relations, including automatic candidates and manually saved pending pairs. Nearby alternatives, incomplete channel sets and residual-score warnings no longer independently veto this explicit human review action.
 
-- Peak thresholds, apex positions, intensities, event identities, CSV coordinates and human labels are unchanged.
-- Failed MS event-table writes identify the failing stage and retain the original exception in the runtime log. Incomplete projects are rolled back.
-- Existing projects retain their saved data; no migration or re-detection is required.
+- Only pending relations in the current window and filter are accepted. Existing accepted/rejected decisions and off-screen records are preserved.
+- Mutually exclusive relations are hidden from ordinary pending connectors and counts. Expand “Show conflicts” to review them. Rejecting an incorrect relation restores the remaining unique relation to normal pending review; the application never chooses a winner or creates duplicate labels automatically.
+- Annotation and audit writes are atomic, roll back on failure, and reject stale review state.
+- Confirmed boundaries, frozen time models and unapplied-preview restrictions remain. Peak detection, candidate scoring, source data and existing decisions are unchanged; projects do not need rebuilding.
 
-Validation: full P39 raw-input project creation and reopening passed, preserving all 369 external event-coordinate rows. Saved-project comparisons for MPP, LSK and CAR-T-Bez are unchanged. Local Windows tests: 509 passed, 2 skipped out of 511; Windows/macOS builds and packaged runtime checks passed. Mac GUI acceptance has not been performed for this release.
+Validation: Windows full suite: 520 passed, 2 skipped out of 522; 55 focused UI/review checks passed. MPP, LSK, CAR-T-Bez and P39 project-copy reopening passed with original projects unchanged. Controlled pending relations in MPP/LSK copies were batch-accepted and persisted across reopening. User Dist acceptance and this release’s macOS build/GUI validation are pending.

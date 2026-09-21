@@ -320,10 +320,10 @@ class ProtocolRegressionTest(unittest.TestCase):
                 [row["candidate_id"] for row in window["alignment_groups"]],
                 [candidate_id],
             )
-            self.assertFalse(window["alignment_groups"][0]["batch_accept_eligible"])
+            self.assertTrue(window["alignment_groups"][0]["batch_accept_eligible"])
             self.assertEqual(
                 window["alignment_groups"][0]["batch_accept_block_reason"],
-                "outside_main_window",
+                None,
             )
             resolved = app.payload_from_auto_candidate_id(
                 candidate_id,
