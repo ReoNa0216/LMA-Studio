@@ -177,6 +177,72 @@ class WindowPendingReviewTest(unittest.TestCase):
             self.assertEqual(before, app.store.db_path.read_bytes())
 
     @unittest.skipUnless(shutil.which("node"), "Node required for production UI logic")
+    def test_stage_render_keeps_batch_button_visible_and_updates_its_state(self):
+        def fn(name):
+            start = HTML.index("    function " + name + "(")
+            return HTML[start:HTML.index("\n    function ", start + 15)]
+        script = "\n".join([
+            "const assert = require('node:assert/strict');",
+            """
+            const nodes = new Map();
+            const el = id => {
+              if (!nodes.has(id)) nodes.set(id, {style:{}, setAttribute(){}, parentNode:{insertBefore(){}}});
+              return nodes.get(id);
+            };
+            const document = {querySelectorAll: () => []};
+            const state = {stage:'event_annotation', manualAnnotationKind:'cell', eventFilter:'all',
+              axisFineTuneShifts:null, timelineAdjustOpen:false, actionBusy:false,
+              current:{time_model:{status:'frozen'}, project_config:{post_qc_strategy:{mode:'disabled'}}}};
+            let boundariesReady = true;
+            let pending = [{}, {}, {}];
+            const calibrationBoundariesConfirmed = () => boundariesReady;
+            const batchAcceptableAutoCandidatesInMainWindow = () => pending;
+            const renderTimelineAdjustmentPanel = () => {};
+            const qcAnchorChannels = () => ['G1', 'R1'];
+            const postQcModeLabel = mode => mode;
+            """,
+            fn("renderStagePanels"), fn("updateAcceptWindowButton"),
+            """
+            function render() { renderStagePanels(); updateAcceptWindowButton(); }
+            function checkReviewVisible() {
+              assert.equal(el('reviewPanel').style.display, 'block');
+              assert.notEqual(el('acceptWindow').style.display, 'none');
+            }
+            render();
+            checkReviewVisible();
+            assert.equal(el('acceptWindow').textContent, '接受本屏待审（3）');
+            assert.equal(el('acceptWindow').disabled, false);
+            pending = [];
+            render();
+            checkReviewVisible();
+            assert.equal(el('acceptWindow').disabled, true);
+            state.stage = 'qc_calibration'; pending = [{}];
+            render(); checkReviewVisible();
+            assert.equal(el('acceptWindow').disabled, false);
+            state.stage = 'event_annotation';
+            state.current.project_config.post_qc_strategy.mode = 'manual';
+            state.manualAnnotationKind = 'qc'; state.eventFilter = 'qc';
+            render(); checkReviewVisible();
+            assert.equal(el('acceptWindow').disabled, false);
+            state.current.time_model.status = 'draft';
+            render();
+            assert.equal(el('reviewPanel').style.display, 'none');
+            assert.equal(el('acceptWindow').disabled, true);
+            state.current.time_model.status = 'frozen';
+            render(); checkReviewVisible();
+            state.stage = 'local_calibration';
+            render();
+            assert.equal(el('reviewPanel').style.display, 'none');
+            boundariesReady = false; state.stage = 'qc_calibration';
+            render();
+            assert.equal(el('reviewPanel').style.display, 'none');
+            assert.equal(el('acceptWindow').disabled, true);
+            """,
+        ])
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for production UI logic")
     def test_ui_hides_conflicts_and_sends_only_screen_pending_ids(self):
         def fn(name):
             start = HTML.index("    function " + name + "(")

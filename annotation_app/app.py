@@ -17905,7 +17905,6 @@ HTML = r"""<!doctype html>
       el('manualShortcutHint').innerHTML = cellMode
         ? '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">A Save pair</span><span class="shortcut-line">D Save pending</span>'
         : '<span class="shortcut-line">Keys: S Select</span><span class="shortcut-line">F Save anchor</span>';
-      el('acceptWindow').style.display = eventAnnotation ? 'none' : 'block';
       document.querySelectorAll('[data-event-filter]').forEach(button => {
         button.classList.toggle('active', button.dataset.eventFilter === state.eventFilter);
         if (button.dataset.eventFilter === 'qc') {
@@ -17922,7 +17921,7 @@ HTML = r"""<!doctype html>
       });
       if (eventAnnotation) {
         el('reviewHelp').textContent = postQcEnabled
-          ? `${postQcModeLabel(postQcMode)}；质控与细胞候选都只使用事件坐标表中的事件，均需逐条确认；同一 MS 事件只能接受一个跨通道关系。`
+          ? `${postQcModeLabel(postQcMode)}；质控与细胞候选均可批量审核。有冲突时，请人工选择唯一关系。`
           : '本项目不进行后段巡检；当前只显示细胞候选。同一 MS 事件出现跨通道冲突时，必须人工选择唯一关系。';
       } else {
         const anchors = qcAnchorChannels();
