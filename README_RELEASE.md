@@ -1,21 +1,29 @@
-# LMA Studio v0.7.1 Release Notes
+# LMA Studio v0.7.2 Release Notes
+
+正式版本。Windows 用户验收于 2026-09-21 完成。
+Stable release. Windows user acceptance completed on 2026-09-21.
 
 ## 中文
 
-本版修复外部事件 CSV 导入时的一处保存错误：当常规检峰结果与补充复核事件同时出现，扫描编号的数据类型不一致可能导致项目创建失败。现在合并前统一编号的存储类型。
+“接受本屏待审”现在覆盖前段校准与事件标注中的明确关系，包括自动候选和人工保存的待审关系。附近候选峰、通道不完整或偏差评分不再单独阻止这次明确的人工批量审核。
 
-- 不改变检峰阈值、峰顶、强度、事件身份、CSV 坐标或人工标签。
-- MS 事件表保存失败时显示具体阶段，并在运行日志保留原始异常；失败项目仍完整回滚。
-- 已有项目继续使用保存的数据，无需迁移或重新检峰。
+- 仅处理当前窗口和当前筛选内的待审关系，保留已接受、已拒绝及窗口外记录。
+- 真正互斥的关系默认不画普通待审线、不计入按钮数量，可从“显示冲突”展开。拒绝错误关系后，剩下的唯一关系恢复为普通待审；不会自动选择胜者或写入重复标签。
+- 标注和审计记录整批保存；失败完整回滚，审核状态中途改变时要求刷新。
+- 单条审核完成后批量按钮恢复可用，一键接受有进度和完成提示。已保存关系所依赖的弱峰及连线不再被“LIF 弱峰”开关隐藏。
+- 保留参考段确认、时间模型冻结和微调预览期间的限制。不改变检峰、候选评分、原始数据或已有标注；已有项目无需重建。
 
-验证：P39 完整原始数据建项与重开通过，369 行外部事件坐标保持不变；MPP、LSK、CAR-T-Bez 旧项目的新旧版本对照一致。Windows 本机 511 项测试中 509 通过、2 跳过，Windows/macOS 构建及打包运行检查通过。macOS 尚未进行本轮真机界面验收。
+验证：本轮 Windows 全量 524 项测试，522 通过、2 跳过；末次按钮状态修改后 29 项定向回归通过。真实 WebView2 页面在 MPP 副本验证“三条虚线→拒绝一条→一键接受两条→重开”，其余决定不变。此前 MPP、LSK、CAR-T-Bez、P39 副本重开检查通过，原项目未改变。Windows Dist 已通过用户验收。双平台构件仅在 CI 测试、打包运行检查和 ZIP 校验均通过后发布；macOS 未进行真机界面验收。
 
 ## English
 
-This release fixes project creation from an external event CSV when shared-core events and roster-supported events have different scan-ID storage types. IDs are normalized before the tables are merged.
+“Accept pending in this view” now covers explicit front-calibration and event-annotation relations, including automatic candidates and manually saved pending pairs. Nearby alternatives, incomplete channel sets and residual-score warnings no longer independently veto this explicit human review action.
 
-- Peak thresholds, apex positions, intensities, event identities, CSV coordinates and human labels are unchanged.
-- Failed MS event-table writes identify the failing stage and retain the original exception in the runtime log. Incomplete projects are rolled back.
-- Existing projects retain their saved data; no migration or re-detection is required.
+- Only pending relations in the current window and filter are accepted. Existing accepted/rejected decisions and off-screen records are preserved.
+- Mutually exclusive relations are hidden from ordinary pending connectors and counts. Expand “Show conflicts” to review them. Rejecting an incorrect relation restores the remaining unique relation to normal pending review; the application never chooses a winner or creates duplicate labels automatically.
+- Annotation and audit writes are atomic, roll back on failure, and reject stale review state.
+- Confirmed boundaries, frozen time models and unapplied-preview restrictions remain. Peak detection, candidate scoring, source data and existing decisions are unchanged; projects do not need rebuilding.
 
-Validation: full P39 raw-input project creation and reopening passed, preserving all 369 external event-coordinate rows. Saved-project comparisons for MPP, LSK and CAR-T-Bez are unchanged. Local Windows tests: 509 passed, 2 skipped out of 511; Windows/macOS builds and packaged runtime checks passed. Mac GUI acceptance has not been performed for this release.
+The batch button becomes available again after individual review, with progress and completion feedback. Weak peaks needed by saved relations remain visible with their connectors even when additional weak candidates are hidden.
+
+Validation: Windows full suite: 522 passed, 2 skipped out of 524; 29 focused checks passed after the final button-state fix. The real WebView2 page verified three dashed relations, one rejection, batch acceptance of the remaining two, and reopening on an MPP copy; other decisions were unchanged. Earlier MPP, LSK, CAR-T-Bez and P39 reopening checks passed with source projects unchanged. The Windows Dist passed user acceptance. Both platform packages are published only after CI tests, packaged runtime checks and ZIP checksum verification pass. Physical Mac GUI acceptance has not been performed.

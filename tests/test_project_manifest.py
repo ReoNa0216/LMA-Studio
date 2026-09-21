@@ -685,7 +685,7 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertGreater(group["conflict_count"], 0)
         self.assertEqual(qc_group_auto_accept_block_reason(group), "axis_incoherent")
 
-    def test_conflicting_complete_anchor_set_is_not_batch_acceptable(self):
+    def test_score_warning_does_not_block_explicit_batch_review(self):
         group = {
             "source": "auto_candidate",
             "review_status": "pending",
@@ -693,6 +693,8 @@ class ProjectManifestTest(unittest.TestCase):
             "complete_anchor_set": True,
             "axis_coherent": True,
             "conflict_count": 3,
+            "ms_plot_time_min": 1.0,
+            "lif_anchor_plot_times_min": {"G1": 1.0},
             "composite_to_ms_residual_sec": 0.0,
             "max_abs_axis_to_ms_residual_sec": 0.1,
             "match_tolerance_sec": 4.0,
@@ -701,7 +703,7 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertEqual(qc_group_auto_accept_block_reason(group), "conflicting_anchor_set")
         self.assertEqual(
             qc_group_batch_accept_block_reason(group, window_start_min=0.0, window_end_min=2.0),
-            "conflicting_anchor_set",
+            None,
         )
 
     def test_three_channel_axis_alignment_estimates_one_shift_per_axis(self):
@@ -1188,7 +1190,7 @@ class ProjectManifestTest(unittest.TestCase):
             self.assertEqual(app.cell_label_for_channel("G2"), "Day0 cell")
             self.assertEqual(app.cell_label_for_channel("R1"), "Day3 cell")
 
-    def test_cell_candidates_cannot_be_batch_accepted(self):
+    def test_cell_batch_requires_frozen_time_model(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             app = AppData(
                 project=ProjectPaths.from_args(project_dir=tmp),
@@ -1202,7 +1204,7 @@ class ProjectManifestTest(unittest.TestCase):
                 acquisition_layout=None,
             )
 
-            with self.assertRaisesRegex(BadRequest, "individual review"):
+            with self.assertRaisesRegex(BadRequest, "冻结"):
                 app.accept_pending_auto_candidates_in_window(
                     start_min=40.0,
                     window_min=2.5,
@@ -1638,8 +1640,8 @@ class ProjectManifestTest(unittest.TestCase):
         self.assertIn('response.result?.accepted_count', HTML)
         self.assertIn('response.result?.skipped_count', HTML)
         self.assertIn('function batchAcceptableAutoCandidatesInMainWindow()', HTML)
-        self.assertIn('需逐条审核', HTML)
-        self.assertIn('附近有多个可匹配峰', HTML)
+        self.assertIn('接受本屏待审', HTML)
+        self.assertIn('显示冲突', HTML)
         self.assertNotIn('LIF G2 / Day0</div>', HTML)
         self.assertNotIn("'annotation_id', 'candidate_id', 'source', 'review_status', 'exportable'", HTML)
         self.assertIn('<option value="robust">Zoom</option>', HTML)

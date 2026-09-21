@@ -12,6 +12,8 @@ It opens its own native desktop window, lets users create or open project direct
 
 原生 UMAP：新建时选择“LMA 事件包 ZIP（可含矩阵）”，或在已有正式事件包项目的“配置 → 矩阵与原生 UMAP”导入。计算后可直接查看、按采集时间着色及定位事件，无需再准备 UMAP CSV。旧项目继续使用原坐标；详细计算及兼容边界见 [接入说明](docs/flame_task1.md)。
 
+本屏批量审核：点击“接受本屏待审”接受当前窗口及筛选下的明确关系，包含自动候选和人工待审。已拒绝、已接受记录不变；真正互斥的关系默认隐藏，不计入待审数量，可勾选“显示冲突”处理。候选评分警告不再要求逐条接受。
+
 ## Current Scope
 
 Task 1 adds a formal MS Event Studio reviewed-package input. Its accepted events
@@ -42,7 +44,7 @@ not recalculated. See [the integration and build guide](docs/flame_task1.md).
 
 ## Desktop Releases
 
-The current formal desktop release is [v0.7.1](https://github.com/ReoNa0216/LMA-Studio/releases/tag/v0.7.1). Projects created by v0.4.0-v0.4.11 with the active peak-recognition standard remain manifest-compatible and are not migrated when opened. Projects using the retired peak-recognition standard remain intentionally blocked and must be rebuilt from their original inputs.
+The current formal desktop release is [v0.7.2](https://github.com/ReoNa0216/LMA-Studio/releases/tag/v0.7.2), adding batch acceptance of pending relations in the current view without changing peak detection. Projects created by v0.4.0-v0.4.11 with the active peak-recognition standard remain manifest-compatible and are not migrated when opened. Projects using the retired peak-recognition standard remain intentionally blocked and must be rebuilt from their original inputs.
 
 Windows x64:
 
@@ -95,7 +97,7 @@ python -m unittest discover -s tests
 The macOS ARM64 build runs on an Apple Silicon host or the repository GitHub Actions workflow:
 
 ```bash
-LMA_STUDIO_VERSION=v0.7.1 bash packaging/macos/build_macos.sh
+LMA_STUDIO_VERSION=v0.7.2 bash packaging/macos/build_macos.sh
 ```
 
 Manual `workflow_dispatch` builds upload test artifacts and may explicitly publish a public prerelease candidate. Formal GitHub Release publication remains tag-triggered after both desktop release gates pass.
